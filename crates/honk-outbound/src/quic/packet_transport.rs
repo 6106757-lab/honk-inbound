@@ -127,6 +127,7 @@ impl TransportQuinnSocket {
             let recv_waker = Arc::clone(&recv_waker);
             async move {
                 let mut first_datagram = true;
+                let mut tx_seq = 0u64;
                 while let Some(queued) = outbound_rx.recv().await {
                     if queued.enqueued_at.elapsed() >= TRANSPORT_PACKET_MAX_AGE {
                         if metrics_enabled {
@@ -136,6 +137,15 @@ impl TransportQuinnSocket {
                     }
                     let first = first_datagram;
                     let data = queued.data;
+                    tx_seq += 1;
+                    if tx_seq <= 24 {
+                        tracing::debug!(
+                            seq = tx_seq,
+                            bytes = data.len(),
+                            head = %format!("{:02x?}", &data[..data.len().min(12)]),
+                            "QUIC adapter tx datagram"
+                        );
+                    }
                     let timeout = transport.send_timeout().max(Duration::from_millis(1));
                     let attempt = QuicSendAttempt::new(transport.as_ref());
                     let result = tokio::time::timeout(timeout, async {
@@ -170,6 +180,11 @@ impl TransportQuinnSocket {
                             attempt.success();
                         }
                         Err(error) => {
+                            tracing::warn!(
+                                seq = tx_seq,
+                                error = %error,
+                                "QUIC adapter tx datagram failed"
+                            );
                             if timed_out {
                                 attempt.timeout();
                             } else {
@@ -192,6 +207,7 @@ impl TransportQuinnSocket {
                         }
                     }
                 }
+                tracing::warn!(tx_datagrams = tx_seq, "QUIC adapter sender worker stopped");
             }
         };
         let allows_full_cone_replies = transport.allows_full_cone_replies();
@@ -202,6 +218,7 @@ impl TransportQuinnSocket {
                 let mut buf = vec![0u8; 65536];
                 let mut since_yield = 0;
                 let mut first_datagram = true;
+                let mut rx_seq = 0u64;
                 loop {
                     if since_yield == RECV_YIELD_EVERY {
                         since_yield = 0;
@@ -210,6 +227,11 @@ impl TransportQuinnSocket {
                     let (n, source) = match transport.recv_packet(&mut buf).await {
                         Ok(packet) => packet,
                         Err(error) => {
+                            tracing::warn!(
+                                rx_datagrams = rx_seq,
+                                error = %error,
+                                "QUIC adapter receiver worker stopped"
+                            );
                             *recv_error.lock() = Some(TransportIoError::fatal(error));
                             wake_recv(&recv_waker);
                             return;
@@ -225,6 +247,16 @@ impl TransportQuinnSocket {
                             bytes = n,
                             %source,
                             "QUIC adapter received first datagram from detour transport"
+                        );
+                    }
+                    rx_seq += 1;
+                    if rx_seq <= 24 {
+                        tracing::debug!(
+                            seq = rx_seq,
+                            bytes = n,
+                            %source,
+                            head = %format!("{:02x?}", &buf[..n.min(12)]),
+                            "QUIC adapter rx datagram"
                         );
                     }
                     if source != remote && !allows_full_cone_replies {
@@ -520,6 +552,18 @@ impl quinn::AsyncUdpSocket for TransportQuinnSocket {
                         ecn: None,
                         dst_ip: None,
                     };
+                    static DELIVERED: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let delivered =
+                        DELIVERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if delivered <= 24 {
+                        tracing::debug!(
+                            seq = delivered,
+                            len,
+                            head = %format!("{:02x?}", &data[..data.len().min(12)]),
+                            "QUIC adapter delivered datagram to quinn"
+                        );
+                    }
                     count += 1;
                 }
                 Poll::Ready(None) => {

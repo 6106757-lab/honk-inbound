@@ -104,7 +104,7 @@ pub async fn open_h3(
     let (alive, shutdown, shutdown_signal) = MasqueTunnel::liveness();
     let tun_label = tun_name.to_string();
 
-    let client = build_client_config(node)?;
+    let client = build_client_config(node, detour.is_some())?;
     // A detour cannot give us a UDP socket, but it can give us a framed UDP
     // transport pinned to the WARP endpoint. `packet_transport_endpoint` turns
     // that into a quinn `AsyncUdpSocket`, so the QUIC handshake below is the
@@ -249,8 +249,22 @@ pub async fn open_h3(
                     }
                     let datagram = encode_ip_datagram(&packet[..length]);
                     if let Err(error) = upstream_conn.send_datagram(datagram) {
-                        tracing::debug!("masque h3 datagram send failed: {error}");
-                        break;
+                        // A single oversized or unsupported DATAGRAM is one
+                        // lost IP packet on a real link, not a reason to tear
+                        // down the whole tunnel. Log the first few and keep
+                        // forwarding; the previous `break` silently killed
+                        // every fronted tunnel as soon as a large packet came.
+                        static SEND_DROPS: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        let drops = SEND_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
+                        if drops <= 3 || drops % 1000 == 0 {
+                            tracing::warn!(
+                                drops,
+                                %error,
+                                "masque h3 datagram send failed; dropping that IP packet"
+                            );
+                        }
+                        continue;
                     }
                 }
                 Err(error) => {
@@ -342,7 +356,7 @@ pub async fn open_h3(
 
 /// Assemble the QUIC TLS config WARP expects: ALPN `h3`, the device client
 /// certificate, and a public-key pin instead of PKI verification.
-fn build_client_config(node: &Node) -> anyhow::Result<ClientConfig> {
+fn build_client_config(node: &Node, fronted: bool) -> anyhow::Result<ClientConfig> {
     let config = node
         .masque()
         .ok_or_else(|| anyhow::anyhow!("masque node {} has no masque config", node.name))?;
@@ -385,6 +399,17 @@ fn build_client_config(node: &Node) -> anyhow::Result<ClientConfig> {
     transport.datagram_receive_buffer_size(Some(DATAGRAM_BUFFER_SIZE));
     transport.max_concurrent_uni_streams(VarInt::from_u32(3));
     transport.keep_alive_interval(Some(Duration::from_secs(15)));
+    if fronted {
+        // A detour carries whole UDP datagrams inside the front node's stream
+        // transport (TCP segments the stream, so 1350-byte datagrams arrive
+        // intact), but quinn cannot run path MTU discovery through an
+        // abstract socket: it stays at the 1200-byte initial MTU and rejects
+        // every 1280-byte TUN IP packet as "datagram too large". That killed
+        // the tunnel right after CONNECT-IP answered 200 OK. Pin the send MTU
+        // to the same cap the endpoint advertises instead of probing for it.
+        transport.initial_mtu(MAX_UDP_PAYLOAD_SIZE);
+        transport.mtu_discovery_config(None);
+    }
     client.transport_config(Arc::new(transport));
     Ok(client)
 }
