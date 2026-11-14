@@ -6,17 +6,24 @@
 //! [`super::http3`]) shuttle IP packets between that interface and the MASQUE
 //! stream. No TUN device, no `ip` calls, no extra capabilities.
 //!
-//! A single poll loop drives `iface.poll` and wakes whoever is waiting on a
-//! socket. The connection handles ([`TcpConnection`], [`UdpConnection`]) read
-//! and write their smoltcp socket **directly** under a short synchronous lock:
+//! A single poll loop drives the interface on smoltcp's own schedule: after
+//! each `poll()` it asks for `poll_delay()` and sleeps exactly until the next
+//! TCP timer, waking early only when ingress, a write or a socket change pokes
+//! it. There is no fixed polling interval and no timer-based fallback in the
+//! receive paths -- every waiter registers a waker before checking its
+//! condition, so a wakeup cannot be lost.
+//!
+//! The connection handles ([`TcpConnection`], [`UdpConnection`]) read and
+//! write their smoltcp socket **directly** under a short synchronous lock:
 //! there is no channel to copy into, no unbounded queue to fill, and smoltcp's
 //! own receive buffer acts as the TCP receive window, so a slow reader applies
 //! back pressure all the way to the peer.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::future::poll_fn;
 use std::io;
-use std::net::{IpAddr, IpAddr as StdIpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
 use std::sync::Arc;
@@ -25,9 +32,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::task::AtomicWaker;
-use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
+use smoltcp::iface::{Config, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::socket::tcp::{RecvError as TcpRecvError, Socket as TcpSocket, State as TcpState};
+use smoltcp::socket::tcp::{
+    CongestionControl, RecvError as TcpRecvError, Socket as TcpSocket, State as TcpState,
+};
 use smoltcp::socket::udp::{self, RecvError as UdpRecvError, Socket as UdpSocket};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint};
@@ -38,10 +47,9 @@ use crate::proxy::PacketTransport;
 
 /// TCP receive buffer, in bytes. smoltcp derives the advertised receive window
 /// and its RFC 1323 window-scale shift from this capacity (`log2(cap) - 16`),
-/// and 0.11 has no congestion control of its own: throughput is capped at
-/// roughly `window / RTT`. A 64 KiB buffer means an unscaled 64 KiB window,
-/// i.e. ~640 KiB/s on a 100 ms path. 512 KiB offers a scaled 512 KiB window
-/// (shift 3) and keeps per-connection memory bounded.
+/// so throughput is bounded by roughly `window / RTT`. A 64 KiB buffer means
+/// an unscaled 64 KiB window, i.e. ~640 KiB/s on a 100 ms path. 512 KiB offers
+/// a scaled 512 KiB window (shift 3) and keeps per-connection memory bounded.
 const TCP_RX_BUFFER: usize = 512 * 1024;
 /// TCP transmit buffer, in bytes. A peer advertising a large window must not
 /// find us limited by our own send buffer on the upload side.
@@ -52,8 +60,9 @@ const UDP_SLOTS: usize = 64;
 const UDP_PAYLOAD: usize = UDP_SLOTS * 1500;
 /// First ephemeral source port handed out to tunnel sockets.
 const FIRST_PORT: u16 = 32_768;
-/// How often the poll loop wakes on its own when nothing else pokes it.
-const POLL_TICK: Duration = Duration::from_millis(2);
+/// Upper bound on an idle wait when smoltcp reports no pending timers. Every
+/// real wakeup is event-driven; this only bounds a completely idle sleep.
+const MAX_IDLE: Duration = Duration::from_secs(60);
 
 /// The raw queues a smoltcp [`Device`] reads ingress from and writes egress to.
 ///
@@ -108,11 +117,11 @@ struct SmolRxToken {
 }
 
 impl RxToken for SmolRxToken {
-    fn consume<R, F>(mut self, f: F) -> R
+    fn consume<R, F>(self, f: F) -> R
     where
-        F: FnOnce(&mut [u8]) -> R,
+        F: FnOnce(&[u8]) -> R,
     {
-        f(&mut self.packet[..])
+        f(&self.packet[..])
     }
 }
 
@@ -144,6 +153,8 @@ impl TxToken for SmolTxToken<'_> {
 struct SocketState {
     read: AtomicWaker,
     write: AtomicWaker,
+    /// Wakes a `tcp_connect` waiter when the handshake settles.
+    connect_wake: AtomicWaker,
     /// The connection handle was dropped; the poll loop reclaims the socket.
     dropped: AtomicBool,
     /// TCP connect outcome, published by the poll loop: 0 pending,
@@ -168,8 +179,6 @@ struct Inner {
     /// mutex is enough. No guard is ever held across an `.await`.
     stack: std::sync::Mutex<Stack>,
     sockets: std::sync::Mutex<HashMap<SocketHandle, SocketEntry>>,
-    /// Wakes async waiters (connect, UDP send/recv) after each poll.
-    waiters: Notify,
     shutdown: AtomicBool,
     next_port: AtomicU16,
     queues: Arc<DeviceQueues>,
@@ -255,7 +264,6 @@ impl UserspaceDevice {
         let inner = Arc::new(Inner {
             stack: std::sync::Mutex::new(stack),
             sockets: std::sync::Mutex::new(HashMap::new()),
-            waiters: Notify::new(),
             shutdown: AtomicBool::new(false),
             next_port: AtomicU16::new(FIRST_PORT),
             queues,
@@ -281,10 +289,10 @@ impl UserspaceDevice {
                     return Ok(length);
                 }
             }
-            tokio::select! {
-                _ = self.inner.queues.carrier_recv_notify.notified() => {}
-                _ = tokio::time::sleep(POLL_TICK) => {}
-            }
+            // `notify_one` stores a permit, so a packet arriving between the
+            // pop above and this await still wakes us immediately. No timeout
+            // fallback is needed.
+            self.inner.queues.carrier_recv_notify.notified().await;
         }
     }
 
@@ -329,6 +337,7 @@ impl UserspaceDevice {
             // immediately instead of smoltcp's 10ms delayed ACK.
             socket.set_nagle_enabled(false);
             socket.set_ack_delay(None);
+            socket.set_congestion_control(CongestionControl::Cubic);
             let local = IpListenEndpoint {
                 addr: Some(source.into()),
                 port: self.inner.alloc_port(),
@@ -353,21 +362,22 @@ impl UserspaceDevice {
         self.inner.queues.poll_notify.notify_one();
 
         let outcome = tokio::time::timeout(connect_timeout, async {
-            loop {
+            // Register before checking, so a handshake settling between the
+            // check and the await cannot be missed.
+            poll_fn(|cx| {
+                state.connect_wake.register(cx.waker());
                 match state.connect.load(Ordering::Acquire) {
-                    1 => return Ok(()),
-                    2 => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::ConnectionRefused,
-                            "masque userspace tcp connect failed",
-                        ))
-                    }
-                    _ => {}
+                    0 => Poll::Pending,
+                    _ => Poll::Ready(()),
                 }
-                tokio::select! {
-                    _ = self.inner.waiters.notified() => {}
-                    _ = tokio::time::sleep(POLL_TICK) => {}
-                }
+            })
+            .await;
+            match state.connect.load(Ordering::Acquire) {
+                1 => Ok(()),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "masque userspace tcp connect failed",
+                )),
             }
         })
         .await;
@@ -457,14 +467,23 @@ impl Drop for UserspaceDevice {
     }
 }
 
-/// Drive `iface.poll`, then service every open socket, until shutdown.
+/// Drive the interface on smoltcp's own schedule until shutdown.
+///
+/// `poll()` drains ingress and egress and reports whether any socket state
+/// changed; `poll_delay()` then gives the exact time of the next TCP timer. We
+/// sleep for that long and wake early only when something pokes the queues.
+/// No guard is held across the await.
 async fn poll_loop(inner: Arc<Inner>) {
-    let mut tick = tokio::time::interval(POLL_TICK);
+    // `poll()` folds `poll_maintenance()`'s result away, so `PollResult::None`
+    // does not prove that a TCP timer left every socket unchanged. Remember
+    // why we woke: a timer expiry has to service sockets even when `poll()`
+    // reports no state change, or a writer waiting on `can_send()` could hang.
+    let mut timer_fired = false;
     loop {
         if inner.shutdown.load(Ordering::Relaxed) {
             break;
         }
-        {
+        let delay = {
             let mut stack = inner.stack.lock().unwrap();
             let mut entries = inner.sockets.lock().unwrap();
             // Destructure first: `Interface::poll` needs the device and socket
@@ -474,24 +493,33 @@ async fn poll_loop(inner: Arc<Inner>) {
                 sockets,
                 device,
             } = &mut *stack;
-            let _ = iface.poll(SmolInstant::now(), &mut *device, &mut *sockets);
-            service_sockets(sockets, &mut entries);
-        }
-        // No lock is held across this await.
-        inner.waiters.notify_waiters();
-        tokio::select! {
-            _ = tick.tick() => {}
-            _ = inner.queues.poll_notify.notified() => {}
-        }
+            let now = SmolInstant::now();
+            let result = iface.poll(now, &mut *device, &mut *sockets);
+            service_sockets(sockets, &mut entries, result, timer_fired);
+            iface.poll_delay(now, sockets)
+        };
+        // smoltcp has its own `Duration`; normalise once so the timer and the
+        // idle fallback share `std::time::Duration`.
+        let wait: Duration = delay.map(Into::into).unwrap_or(MAX_IDLE);
+        timer_fired = tokio::select! {
+            _ = tokio::time::sleep(wait) => true,
+            _ = inner.queues.poll_notify.notified() => false,
+        };
     }
 }
 
-/// Reclaim dropped sockets, publish TCP connect outcomes and wake any reader
-/// or writer whose socket changed readiness.
+/// Reclaim dropped sockets, publish TCP connect outcomes and wake readers or
+/// writers whose socket changed readiness.
+///
+/// `PollResult::None` only covers ingress/egress; timer-driven changes are
+/// folded away by `poll()`, so `timer_fired` also forces a service pass.
 fn service_sockets(
     sockets: &mut SocketSet<'static>,
     entries: &mut HashMap<SocketHandle, SocketEntry>,
+    result: PollResult,
+    timer_fired: bool,
 ) {
+    let changed = matches!(result, PollResult::SocketStateChanged) || timer_fired;
     let handles: Vec<SocketHandle> = entries.keys().copied().collect();
     for handle in handles {
         // Clone the shared bits out of the map so reclaiming an entry below
@@ -507,14 +535,24 @@ fn service_sockets(
             sockets.remove(handle);
             continue;
         }
+        // Only TCP sockets have a connect outcome to publish.
+        let pending_connect =
+            matches!(kind, SocketKind::Tcp) && state.connect.load(Ordering::Relaxed) == 0;
+        if !changed && !pending_connect {
+            continue;
+        }
         match kind {
             SocketKind::Tcp => {
                 let socket = sockets.get_mut::<TcpSocket>(handle);
-                if state.connect.load(Ordering::Relaxed) == 0 {
+                if pending_connect {
                     match socket.state() {
-                        TcpState::Established => state.connect.store(1, Ordering::Release),
+                        TcpState::Established => {
+                            state.connect.store(1, Ordering::Release);
+                            state.connect_wake.wake();
+                        }
                         TcpState::Closed | TcpState::TimeWait => {
-                            state.connect.store(2, Ordering::Release)
+                            state.connect.store(2, Ordering::Release);
+                            state.connect_wake.wake();
                         }
                         _ => {}
                     }
@@ -541,26 +579,7 @@ fn service_sockets(
 
 /// Convert a smoltcp endpoint back into a std `SocketAddr`.
 fn endpoint_to_socketaddr(endpoint: IpEndpoint) -> SocketAddr {
-    SocketAddr::new(smol_addr_to_std(endpoint.addr), endpoint.port)
-}
-
-/// Convert a smoltcp address into a std address (a free function, since a
-/// `From` impl would trip the orphan rule).
-fn smol_addr_to_std(address: IpAddress) -> StdIpAddr {
-    match address {
-        IpAddress::Ipv4(v4) => StdIpAddr::V4(Ipv4Addr::new(v4.0[0], v4.0[1], v4.0[2], v4.0[3])),
-        IpAddress::Ipv6(v6) => {
-            let o = v6.0;
-            let mut segments = [0u16; 8];
-            for (index, segment) in segments.iter_mut().enumerate() {
-                *segment = u16::from_be_bytes([o[index * 2], o[index * 2 + 1]]);
-            }
-            StdIpAddr::V6(Ipv6Addr::new(
-                segments[0], segments[1], segments[2], segments[3], segments[4], segments[5],
-                segments[6], segments[7],
-            ))
-        }
-    }
+    SocketAddr::new(endpoint.addr.into(), endpoint.port)
 }
 
 /// A TCP connection inside the userspace tunnel, bridging smoltcp to
@@ -686,11 +705,33 @@ impl Drop for UdpConnection {
 }
 
 impl UdpConnection {
-    async fn wait_for_poll(&self) {
-        tokio::select! {
-            _ = self.inner.waiters.notified() => {}
-            _ = tokio::time::sleep(POLL_TICK) => {}
-        }
+    /// Register before checking, so a packet arriving between the caller's
+    /// failed `recv()` and this wait cannot be missed. The condition lives on
+    /// the smoltcp socket itself, so there is no channel and no lost wakeup.
+    fn wait_readable(&self) -> impl std::future::Future<Output = ()> + '_ {
+        poll_fn(move |cx| {
+            self.state.read.register(cx.waker());
+            let mut stack = self.inner.stack.lock().unwrap();
+            let socket = stack.sockets.get_mut::<UdpSocket>(self.handle);
+            if socket.can_recv() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+    }
+
+    fn wait_writable(&self) -> impl std::future::Future<Output = ()> + '_ {
+        poll_fn(move |cx| {
+            self.state.write.register(cx.waker());
+            let mut stack = self.inner.stack.lock().unwrap();
+            let socket = stack.sockets.get_mut::<UdpSocket>(self.handle);
+            if socket.can_send() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
     }
 }
 
@@ -724,7 +765,7 @@ impl PacketTransport for UdpConnection {
                     return Ok(());
                 }
             }
-            self.wait_for_poll().await;
+            self.wait_writable().await;
         }
     }
 
@@ -748,7 +789,7 @@ impl PacketTransport for UdpConnection {
                     Err(UdpRecvError::Exhausted) | Err(UdpRecvError::Truncated) => {}
                 }
             }
-            self.wait_for_poll().await;
+            self.wait_readable().await;
         }
     }
 }

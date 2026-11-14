@@ -10,11 +10,21 @@
 //! * IP packets travel inside DATAGRAM capsules (HTTP/2) or QUIC DATAGRAMs
 //!   (HTTP/3).
 //!
-//! Rather than reimplementing TCP in userspace, honk exposes the tunnel as a
-//! TUN device and lets the **kernel** own TCP and UDP. A dialled socket is
-//! bound to the TUN device (`SO_BINDTODEVICE`) and to the assigned source
-//! address, so the kernel routes it through the tunnel with full BBR, window
-//! scaling and retransmit behaviour. See [`tun`] and [`bind`].
+//! Two backends carry those packets, chosen once at boot by
+//! `global.masque_tunnel_mode`:
+//!
+//! * `tun` (default) exposes the tunnel as a kernel TUN device and lets the
+//!   kernel own TCP/UDP. A dialled socket is bound to the device
+//!   (`SO_BINDTODEVICE`) and to the assigned source address, so the kernel
+//!   routes it with full BBR, window scaling and retransmit behaviour. See
+//!   [`tun`] and [`bind`].
+//! * `userspace` hands packets to an in-process smoltcp stack that owns
+//!   TCP/UDP itself — no TUN device, no `ip` calls, no extra capabilities.
+//!   See [`userspace`].
+//!
+//! Carriers, shuttles and dial paths are written against
+//! [`device::TunnelDevice`] and never branch on the backend, so the default
+//! kernel path is unchanged.
 
 pub mod bind;
 pub mod capsule;
@@ -432,7 +442,7 @@ impl PacketOutbound for MasqueHandler {
 #[async_trait]
 impl WarmableOutbound for MasqueHandler {
     /// Establish the tunnel ahead of the first flow. UDP needs nothing extra:
-    /// the kernel owns UDP exactly as it owns TCP once the interface exists.
+    /// whichever backend owns the packet device owns UDP too.
     async fn warm(
         &self,
         runtime: Arc<NodeRuntime>,

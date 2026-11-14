@@ -164,7 +164,7 @@ impl MasqueTunnel {
                         }
                     }
                     Err(error) => {
-                        tracing::debug!("masque TUN read failed: {error}");
+                        tracing::debug!("masque packet device read failed: {error}");
                         break;
                     }
                 }
@@ -222,7 +222,7 @@ impl MasqueTunnel {
                                 );
                             }
                             if let Err(error) = downstream.send_packet(&payload).await {
-                                tracing::debug!("masque TUN write failed: {error}");
+                                tracing::debug!("masque packet device write failed: {error}");
                                 let _ = downstream_shutdown.send(true);
                                 return;
                             }

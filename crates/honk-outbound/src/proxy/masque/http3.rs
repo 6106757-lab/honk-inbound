@@ -197,7 +197,7 @@ pub async fn open_h3(
                     }
                 }
                 Err(error) => {
-                    tracing::debug!("masque TUN read failed: {error}");
+                    tracing::debug!("masque packet device read failed: {error}");
                     break;
                 }
             }
@@ -241,7 +241,7 @@ pub async fn open_h3(
                 );
             }
             if let Err(error) = downstream_tun.send_packet(&packet).await {
-                tracing::debug!("masque TUN write failed: {error}");
+                tracing::debug!("masque packet device write failed: {error}");
                 let _ = downstream_shutdown.send(true);
                 return;
             }
