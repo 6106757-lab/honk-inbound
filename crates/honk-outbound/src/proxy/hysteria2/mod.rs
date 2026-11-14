@@ -220,6 +220,21 @@ impl Hy2ConnState {
 const MAX_TCP_RESPONSE_BUFFER: usize =
     1 + 8 + MAX_MESSAGE_LENGTH as usize + 8 + MAX_PADDING_LENGTH as usize;
 
+/// Opaque keepalive for the client that opened a stream's QUIC connection.
+///
+/// A detoured dial builds a one-off client whose `State` owns the packet
+/// endpoint and its adapter workers. Without a claim from the stream, that
+/// client is dropped as soon as `dial_runtime_detoured` returns, tearing down
+/// the endpoint while the stream is still doing I/O.
+#[derive(Clone)]
+struct ClientKeepalive(#[allow(dead_code)] Arc<Hy2Client>);
+
+impl std::fmt::Debug for ClientKeepalive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ClientKeepalive")
+    }
+}
+
 #[derive(Debug)]
 struct Hy2TcpStream {
     inner: crate::quic::QuicBiStream,
@@ -227,16 +242,18 @@ struct Hy2TcpStream {
     response: Vec<u8>,
     body_offset: Option<usize>,
     observer: Option<crate::runtime::flow_observation::FlowObserver>,
+    _client: Option<ClientKeepalive>,
 }
 
 impl Hy2TcpStream {
-    fn new(inner: crate::quic::QuicBiStream, addr: &str) -> Self {
+    fn new(inner: crate::quic::QuicBiStream, addr: &str, client: Arc<Hy2Client>) -> Self {
         Self {
             inner,
             request: Some(encode_tcp_request(addr).into()),
             response: Vec::new(),
             body_offset: None,
             observer: crate::runtime::flow_observation::current(),
+            _client: Some(ClientKeepalive(client)),
         }
     }
 
@@ -727,7 +744,7 @@ impl Hysteria2Handler {
             "Hysteria2",
         )
         .await?;
-        let stream = Hy2TcpStream::new(stream, &addr);
+        let stream = Hy2TcpStream::new(stream, &addr, client);
         Ok(ProxyStream {
             stream: Box::new(stream),
             target_addr: target,

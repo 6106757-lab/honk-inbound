@@ -223,15 +223,22 @@ pub(crate) fn new_owned_quic_endpoint(
     })
 }
 
-/// Lease a QUIC endpoint this module did not build to the current owner, so
-/// generation shutdown reaps it like any other.
+/// Wrap a QUIC endpoint whose lifetime is already owned elsewhere.
 ///
-/// A node riding a detour runs its QUIC over a packet transport another node
-/// handed back; the endpoint exists before there is anything to build.
-pub(crate) fn adopt_owned_quic_endpoint(
-    endpoint: quinn::Endpoint,
-) -> std::io::Result<RuntimeEndpoint> {
-    new_owned_quic_endpoint(|| Ok(endpoint.clone()))
+/// A detoured node runs QUIC over a `PacketTransportEndpoint`: that value owns
+/// the adapter workers and its own driver `TaskOwner`, is kept alive by the
+/// client's `State::detour_endpoint`, and is closed by
+/// `PacketTransportEndpoint::close` / `QuicClient::force_close`. Leasing the
+/// same endpoint to the ambient owner here was both redundant and harmful:
+/// `TaskOwner::abort` closes every registered endpoint regardless of lease
+/// liveness, so the end of a short-lived probe scope closed the detour
+/// endpoint and quinn then returned `EndpointStopping` on every later connect.
+pub(crate) fn wrap_detour_quic_endpoint(endpoint: quinn::Endpoint) -> RuntimeEndpoint {
+    RuntimeEndpoint {
+        endpoint,
+        #[cfg(feature = "owned-tasks")]
+        _lease: None,
+    }
 }
 
 #[cfg(feature = "owned-tasks")]

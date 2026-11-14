@@ -52,7 +52,10 @@ const ALPN_H3_WIRE: &[u8] = b"\x02h3";
 
 /// UDP payload size advertised to the edge. WARP endpoints carry 1280-byte IP
 /// packets plus QUIC/H3 overhead, so quinn's conservative 1252 default would
-/// cap path MTU growth below the tunnel MTU.
+/// cap path MTU growth below the tunnel MTU and could not carry a whole TUN
+/// packet. A detour re-frames each datagram inside the front node's stream
+/// transport, but that framing does not enlarge the UDP datagram itself (TCP
+/// segments the stream), so the same cap applies on both paths.
 const MAX_UDP_PAYLOAD_SIZE: u16 = 1350;
 
 /// DATAGRAM receive buffer. quinn advertises this as
@@ -145,14 +148,35 @@ pub async fn open_h3(
     let connecting = quinn_endpoint
         .connect_with(client, endpoint, &sni)
         .map_err(|error| anyhow::anyhow!("masque node {}: QUIC connect failed: {error}", node.name))?;
-    let connection = tokio::time::timeout(connect_timeout, connecting)
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "masque node {}: QUIC handshake to {endpoint} timed out after {connect_timeout:?}",
+    // quinn only ever reports a generic timeout / endpoint stopping here, but
+    // the adapter workers know the datagram-level cause (send queue closed,
+    // transport rejection, receive error). Surface it while the packet
+    // endpoint is still alive, otherwise every fronted failure looks alike.
+    let connection = match tokio::time::timeout(connect_timeout, connecting).await {
+        Ok(Ok(connection)) => connection,
+        Ok(Err(error)) => {
+            let cause = packet_endpoint
+                .as_ref()
+                .and_then(|packet| packet.terminal_error())
+                .map(|cause| format!("; transport error: {cause}"))
+                .unwrap_or_default();
+            anyhow::bail!(
+                "masque node {}: QUIC handshake to {endpoint} failed: {error}{cause}",
                 node.name
-            )
-        })??;
+            );
+        }
+        Err(_) => {
+            let cause = packet_endpoint
+                .as_ref()
+                .and_then(|packet| packet.terminal_error())
+                .map(|cause| format!("; transport error: {cause}"))
+                .unwrap_or_default();
+            anyhow::bail!(
+                "masque node {}: QUIC handshake to {endpoint} timed out after {connect_timeout:?}{cause}",
+                node.name
+            );
+        }
+    };
     tracing::debug!(
         "masque: QUIC to {endpoint} established (sni {sni}) on {tun_name}"
     );

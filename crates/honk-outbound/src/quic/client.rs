@@ -18,6 +18,13 @@ use super::{
     State, TrackedConnection,
 };
 
+/// UDP payload cap advertised by QUIC endpoints carried over a detour.
+/// Peers answer a 1200-byte Initial with a 1280-byte handshake flight, which
+/// the conservative 1252 default forces the adapter to drop. Matches
+/// `proxy::masque::http3::MAX_UDP_PAYLOAD_SIZE` so every fronted QUIC path
+/// agrees; a detour's UDP-over-stream framing does not shrink the datagram.
+const DETOUR_UDP_PAYLOAD_SIZE: u16 = 1350;
+
 impl<C> State<C> {
     fn prune_connections(&mut self) {
         self.connections.retain(|tracked| {
@@ -452,10 +459,13 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
     /// built on it, so both are returned: dropping the packet endpoint stops
     /// the adapter workers the socket reads and writes through.
     ///
-    /// The endpoint carries the safe 1252-byte payload cap rather than the
-    /// protocol's advertised MTU: a detour adds framing of its own, and an
-    /// oversized datagram that the path silently drops costs more than the
-    /// bytes a larger one would save.
+    /// The endpoint advertises [`DETOUR_UDP_PAYLOAD_SIZE`] rather than the
+    /// conservative 1252-byte default. A detour hands back whole UDP
+    /// datagrams inside the front node's *stream* transport (the stream is
+    /// segmented by TCP, so the datagram itself is not shrunk), and real
+    /// peers answer a 1200-byte Initial with a 1280-byte handshake flight.
+    /// At 1252 the adapter has to drop that reply and the handshake stalls
+    /// until its deadline. 1350 matches the cap MASQUE h3 detours already use.
     async fn detour_handshake(
         &self,
         detour: &crate::proxy::detour::DetourPath,
@@ -484,14 +494,32 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
             None => transport,
         };
         let packet = Arc::new(
-            crate::quic::packet_transport_endpoint(transport, server_addr)
-                .with_context(|| format!("QUIC endpoint over the detour to {server_addr}"))?,
+            crate::quic::packet_transport_endpoint_with_mtu(
+                transport,
+                server_addr,
+                DETOUR_UDP_PAYLOAD_SIZE,
+            )
+            .with_context(|| format!("QUIC endpoint over the detour to {server_addr}"))?,
         );
-        let endpoint = crate::runtime::adopt_owned_quic_endpoint(packet.endpoint().clone())
-            .with_context(|| format!("lease the detour endpoint to {server_addr}"))?;
-        let conn = self
+        // The packet endpoint owns its drivers and is closed by `force_close`;
+        // leasing it to the ambient probe owner would let that scope's abort
+        // close the endpoint while quinn is still connecting.
+        let endpoint = crate::runtime::wrap_detour_quic_endpoint(packet.endpoint().clone());
+        // quinn reports `EndpointStopping` / a bare timeout when the adapter
+        // workers die, hiding the datagram-level cause. Attach it here the
+        // same way `quic_handshake_probe` does, while `packet` is alive.
+        let conn = match self
             .handshake(packet.endpoint(), server_addr, connect_timeout)
-            .await?;
+            .await
+        {
+            Ok(conn) => conn,
+            Err(error) => {
+                return Err(match packet.terminal_error() {
+                    Some(cause) => error.context(format!("QUIC transport error: {cause}")),
+                    None => error,
+                });
+            }
+        };
         Ok((packet, conn, endpoint, server_addr.is_ipv6()))
     }
 

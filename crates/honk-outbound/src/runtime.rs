@@ -18,9 +18,10 @@ mod tasks;
 pub use tasks::TaskOwner;
 pub use tasks::TaskScope;
 pub(crate) use tasks::{
-    RuntimeEndpoint, SharedTask, adopt_owned_quic_endpoint, new_owned_quic_endpoint,
-    spawn_joinable, spawn_owned,
+    RuntimeEndpoint, SharedTask, new_owned_quic_endpoint, spawn_joinable, spawn_owned,
+    wrap_detour_quic_endpoint,
 };
+
 #[cfg(any(feature = "rprx", test))]
 mod vless;
 
