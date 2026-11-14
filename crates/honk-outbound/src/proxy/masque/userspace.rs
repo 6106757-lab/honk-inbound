@@ -316,6 +316,13 @@ impl UserspaceDevice {
                 smoltcp::storage::RingBuffer::new(vec![0u8; SOCKET_BUFFER]),
                 smoltcp::storage::RingBuffer::new(vec![0u8; SOCKET_BUFFER]),
             );
+            // `bind::new_socket` sets TCP_NODELAY on every kernel-backend
+            // tunnel socket. smoltcp enables Nagle by default, which combined
+            // with a peer's delayed ACK stalls small request/response exchanges
+            // for 40-200ms. Keep both backends on the same footing, and ACK
+            // immediately instead of smoltcp's 10ms delayed ACK.
+            socket.set_nagle_enabled(false);
+            socket.set_ack_delay(None);
             let local = IpListenEndpoint {
                 addr: Some(source.into()),
                 port: self.inner.alloc_port(),
