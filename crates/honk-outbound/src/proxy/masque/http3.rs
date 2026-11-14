@@ -69,10 +69,9 @@ const CONNECT_FLOW_ID: u64 = 0;
 
 /// Open a WARP connect-ip tunnel over HTTP/3.
 ///
-/// `endpoint` is already resolved by the caller. WARP's QUIC carrier has no
-/// detour support yet: a QUIC endpoint needs a UDP socket, while `DetourPath`
-/// hands out a TCP stream, so the caller rejects a detoured h3 node instead of
-/// silently dialling direct.
+/// `endpoint` is already resolved by the caller. On a detour, QUIC rides the
+/// framed UDP transport the front node hands back, adapted into a quinn
+/// endpoint; without one it binds a socket of its own as before.
 pub async fn open_h3(
     node: &Node,
     endpoint: SocketAddr,
@@ -82,6 +81,7 @@ pub async fn open_h3(
     preferred: &[IpAddr],
     slot: usize,
     backend: TunnelBackend,
+    detour: Option<&crate::proxy::detour::DetourPath>,
 ) -> anyhow::Result<MasqueTunnel> {
     let config = node
         .masque()
@@ -102,8 +102,41 @@ pub async fn open_h3(
     let tun_label = tun_name.to_string();
 
     let client = build_client_config(node)?;
-    let quinn_endpoint =
-        crate::quic::client_endpoint_with_mtu(endpoint.is_ipv6(), MAX_UDP_PAYLOAD_SIZE)?;
+    // A detour cannot give us a UDP socket, but it can give us a framed UDP
+    // transport pinned to the WARP endpoint. `packet_transport_endpoint` turns
+    // that into a quinn `AsyncUdpSocket`, so the QUIC handshake below is the
+    // same whichever path the node takes out.
+    let (quinn_endpoint, packet_endpoint) = match detour {
+        Some(path) => {
+            let transport = path
+                .connect_udp(endpoint, Some(node.host()), connect_timeout)
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "masque node {}: detour could not carry UDP to {endpoint}: {error}",
+                        node.name
+                    )
+                })?;
+            let packet = Arc::new(
+                crate::quic::packet_transport_endpoint_with_mtu(
+                    transport,
+                    endpoint,
+                    MAX_UDP_PAYLOAD_SIZE,
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "masque node {}: QUIC endpoint over the detour to {endpoint}: {error}",
+                        node.name
+                    )
+                })?,
+            );
+            (packet.endpoint().clone(), Some(packet))
+        }
+        None => (
+            crate::quic::client_endpoint_with_mtu(endpoint.is_ipv6(), MAX_UDP_PAYLOAD_SIZE)?,
+            None,
+        ),
+    };
     let sni = config
         .tls
         .sni
@@ -258,6 +291,9 @@ pub async fn open_h3(
     let mut park_signal = shutdown_signal.clone();
     tokio::spawn(async move {
         let _endpoint = quinn_endpoint;
+        // Dropping the packet endpoint stops the adapter workers that move
+        // QUIC datagrams through the detour; it has to outlive the tunnel.
+        let _packet_endpoint = packet_endpoint;
         let _sender = sender;
         let _request_stream = request_stream;
         let driver_closed = async {

@@ -103,6 +103,7 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
             config,
             endpoint_factory: None,
             detour: None,
+            detour_transform: None,
             mtu: 1252,
             flow_control_profiles: Arc::new(AdaptiveFlowProfiles::default()),
             task_scope: crate::runtime::TaskScope::capture(),
@@ -135,6 +136,17 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
     /// [`Self::with_endpoint_factory`], and it takes precedence over it.
     pub(crate) fn with_detour(mut self, detour: Option<Arc<DetourPath>>) -> Self {
         self.detour = detour;
+        self
+    }
+
+    /// Apply a protocol-specific wrapper to the UDP transport a detour hands
+    /// back. Only used on detoured dials; a direct dial builds its own socket
+    /// and needs no wrapper.
+    pub(crate) fn with_detour_transform(
+        mut self,
+        transform: Option<super::DetourTransportTransform>,
+    ) -> Self {
+        self.detour_transform = transform;
         self
     }
 
@@ -467,6 +479,10 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
             )
             .await
             .with_context(|| format!("detour could not carry UDP to {server_addr}"))?;
+        let transport = match &self.detour_transform {
+            Some(transform) => transform(transport),
+            None => transport,
+        };
         let packet = Arc::new(
             crate::quic::packet_transport_endpoint(transport, server_addr)
                 .with_context(|| format!("QUIC endpoint over the detour to {server_addr}"))?,

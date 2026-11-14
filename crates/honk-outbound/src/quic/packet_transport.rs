@@ -560,7 +560,22 @@ pub fn packet_transport_endpoint(
     transport: Arc<dyn PacketTransport>,
     remote: SocketAddr,
 ) -> io::Result<PacketTransportEndpoint> {
-    packet_transport_endpoint_with_metrics(transport, remote, false, None)
+    build_packet_transport_endpoint(transport, remote, 1252, false, None)
+}
+
+/// Create a packet-backed endpoint advertising `mtu` as its QUIC UDP payload
+/// cap instead of the conservative 1252-byte default.
+///
+/// A MASQUE connect-ip tunnel carries whole 1280-byte IP packets, and a detour
+/// adds framing of its own. The 1252-byte default would silently black-hole
+/// those datagrams, so fronted tunnels ask for the same cap a direct h3 path
+/// gets. `endpoint_config_with_mtu` clamps the value to quinn's legal range.
+pub fn packet_transport_endpoint_with_mtu(
+    transport: Arc<dyn PacketTransport>,
+    remote: SocketAddr,
+    mtu: u16,
+) -> io::Result<PacketTransportEndpoint> {
+    build_packet_transport_endpoint(transport, remote, mtu, false, None)
 }
 
 /// Create a packet-backed endpoint whose adapter pressure counters belong to a
@@ -572,6 +587,16 @@ pub fn packet_transport_endpoint_with_metrics(
     metrics_enabled: bool,
     owner: Option<&Arc<crate::runtime::TaskOwner>>,
 ) -> io::Result<PacketTransportEndpoint> {
+    build_packet_transport_endpoint(transport, remote, 1252, metrics_enabled, owner)
+}
+
+fn build_packet_transport_endpoint(
+    transport: Arc<dyn PacketTransport>,
+    remote: SocketAddr,
+    mtu: u16,
+    metrics_enabled: bool,
+    owner: Option<&Arc<crate::runtime::TaskOwner>>,
+) -> io::Result<PacketTransportEndpoint> {
     if transport.relay_addr() != remote {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -580,7 +605,7 @@ pub fn packet_transport_endpoint_with_metrics(
     }
     let drivers = Arc::new(crate::runtime::TaskOwner::production());
     let runtime = OwnedTaskRuntime::new(&drivers, owner)?;
-    let config = endpoint_config_with_mtu(1252)?;
+    let config = endpoint_config_with_mtu(mtu)?;
     let (socket, sender, receiver) =
         TransportQuinnSocket::prepare(transport, remote, metrics_enabled);
     let endpoint = Endpoint::new_with_abstract_socket(config, None, socket.clone(), runtime)?;

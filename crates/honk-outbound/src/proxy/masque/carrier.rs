@@ -47,9 +47,10 @@ pub async fn open_tunnel(
 
 /// QUIC + WARP TLS + HTTP/3 CONNECT-IP.
 ///
-/// A detour supplies a TCP stream, but QUIC needs a UDP socket, so a detoured
-/// h3 node cannot reuse the h2 detour path. Reject it explicitly rather than
-/// silently dialling direct and bypassing the front node.
+/// A detour carries QUIC over the framed UDP transport its front node hands
+/// back (`DetourPath::connect_udp`), not over a TCP stream. That transport is
+/// adapted into a quinn endpoint in `http3::open_h3`, so a fronted h3 node
+/// takes the same path as every other detoured QUIC protocol.
 async fn open_quic(
     node: &Node,
     connect_timeout: Duration,
@@ -57,20 +58,10 @@ async fn open_quic(
     slot: usize,
     backend: TunnelBackend,
 ) -> anyhow::Result<MasqueTunnel> {
-    if detour.is_some() {
-        anyhow::bail!(
-            "masque node {}: `network: quic` does not support a detour yet; \
-             use `network: h2` for detoured MASQUE nodes",
-            node.name
-        );
-    }
-    if let Some(name) = node.detour_name() {
-        anyhow::bail!(
-            "masque node {}: `network: quic` does not support detour {name:?} yet; \
-             use `network: h2` for detoured MASQUE nodes",
-            node.name
-        );
-    }
+    // A node that names a detour must ride it. `ensure_bound` also refuses a
+    // named-but-unbound detour, which would otherwise dial the direct path and
+    // quietly bypass the front node.
+    crate::proxy::detour::ensure_bound(node, detour)?;
     let config = node
         .masque()
         .ok_or_else(|| anyhow::anyhow!("masque node {} has no masque config", node.name))?;
@@ -92,6 +83,7 @@ async fn open_quic(
         &preferred,
         slot,
         backend,
+        detour,
     )
     .await
 }

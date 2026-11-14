@@ -603,15 +603,16 @@ impl Hysteria2Handler {
                 ))
             })
             .transpose()?;
-        // Salamander and port hopping are properties of the socket this client
-        // dials on: obfuscation wraps the UDP datagrams on the wire and hopping
-        // rotates their destination port. A detour owns that socket, so neither
-        // survives the trip — the server would see plain QUIC arriving from the
-        // detour node, which is not what the configuration asked for.
+        // Salamander is a datagram transform, so on a fronted path it is
+        // applied to the detour's framed UDP transport instead of a socket
+        // (see `SalamanderPacketTransport`). Port hopping rotates the
+        // *destination port* of each packet; a detour's transport is pinned to
+        // the one target it was dialled for, so that one still needs a socket
+        // of its own.
         anyhow::ensure!(
-            detour.is_none() || (obfs.is_none() && hop.is_none()),
-            "Hysteria2 node {}: obfs and port hopping need a socket of their own, \
-             so they cannot ride a detour",
+            detour.is_none() || hop.is_none(),
+            "Hysteria2 node {}: port hopping needs a socket of its own to rotate \
+             the destination port, so it cannot ride a detour",
             node.name
         );
         let server_name = hy2
@@ -647,18 +648,18 @@ impl Hysteria2Handler {
             },
         )
         .await?;
+        let obfs_key: Option<Arc<[u8]>> = obfs.map(|p| Arc::from(p.as_bytes()));
         let quic = QuicClient::new(node.host().to_string(), node.port, server_name, config)
             .with_flow_control_profiles(profiles)
-            .with_detour(detour.cloned());
+            .with_detour(detour.cloned())
+            .with_detour_transform(obfs_key.clone().map(salamander_transport_transform));
         let mtu = hy2.quic.mtu.unwrap_or(1252);
         let quic = quic.with_max_udp_payload_size(mtu);
-        let quic = match (obfs, hop) {
+        // `endpoint_factory` only builds the direct socket. A detour dial wins
+        // over it and obtains the same obfuscation from the transform above.
+        let quic = match (obfs_key, hop) {
             (None, None) => quic,
-            (obfs, hop) => quic.with_endpoint_factory(hy2_endpoint_factory(
-                obfs.map(|p| Arc::from(p.as_bytes())),
-                hop,
-                mtu,
-            )),
+            (obfs, hop) => quic.with_endpoint_factory(hy2_endpoint_factory(obfs, hop, mtu)),
         };
         Ok(Arc::new(Hy2Client {
             quic,

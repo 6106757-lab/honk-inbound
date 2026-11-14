@@ -524,6 +524,10 @@ pub struct QuicClient<C> {
     /// because a node that names a path out is not reaching the server on its
     /// own socket at all.
     detour: Option<Arc<crate::proxy::detour::DetourPath>>,
+    /// Wraps the framed UDP transport a detour returns before QUIC is built on
+    /// it. Hysteria2 uses this to keep Salamander obfuscation on fronted paths,
+    /// where there is no socket to attach the obfuscating `AsyncUdpSocket` to.
+    detour_transform: Option<DetourTransportTransform>,
     /// Advertised `max_udp_payload_size` cap for the default endpoint (see
     /// [`client_endpoint`] for the safe 1252 default).
     mtu: u16,
@@ -561,6 +565,14 @@ mod label_tests {
 mod packet_transport;
 
 pub use packet_transport::{
-    PacketTransportEndpoint, packet_transport_endpoint, packet_transport_endpoint_with_metrics,
+    PacketTransportEndpoint, packet_transport_endpoint,
+    packet_transport_endpoint_with_metrics, packet_transport_endpoint_with_mtu,
     quic_handshake_probe,
 };
+
+/// Wrap a detour's framed UDP transport before QUIC is built on it.
+pub(crate) type DetourTransportTransform = Arc<
+    dyn Fn(Arc<dyn crate::proxy::PacketTransport>) -> Arc<dyn crate::proxy::PacketTransport>
+        + Send
+        + Sync,
+>;
