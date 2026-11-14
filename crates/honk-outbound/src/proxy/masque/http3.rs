@@ -36,7 +36,7 @@ use quinn::{ClientConfig, TransportConfig, VarInt};
 use crate::quic::boring::{BoringQuicClientConfig, BoringQuicOptions};
 
 use super::capsule::{put_varint, read_varint};
-use super::tun::TunDevice;
+use super::device::{TunnelBackend, TunnelDevice};
 use super::tunnel::{LivenessGuard, MasqueTunnel};
 use super::warp::{self, DEFAULT_SNI};
 
@@ -81,6 +81,7 @@ pub async fn open_h3(
     tun_name: &str,
     preferred: &[IpAddr],
     slot: usize,
+    backend: TunnelBackend,
 ) -> anyhow::Result<MasqueTunnel> {
     let config = node
         .masque()
@@ -158,11 +159,10 @@ pub async fn open_h3(
         );
     }
 
-    let tun = Arc::new(TunDevice::create(tun_name)?);
-    tun.configure(preferred, mtu, slot)?;
+    let device = TunnelDevice::create(backend, tun_name, preferred, mtu, slot)?;
 
     // TUN -> endpoint. Each IP packet becomes one QUIC DATAGRAM.
-    let upstream_tun = tun.clone();
+    let upstream_tun = device.clone();
     let upstream_conn = connection.clone();
     let upstream_alive = LivenessGuard::new(Arc::clone(&alive));
     let upstream_shutdown = shutdown.clone();
@@ -174,7 +174,7 @@ pub async fn open_h3(
         let mut packets = 0usize;
         loop {
             let outcome = {
-                let read = upstream_tun.recv(&mut packet);
+                let read = upstream_tun.recv_packet(&mut packet);
                 tokio::pin!(read);
                 tokio::select! {
                     result = &mut read => result,
@@ -207,7 +207,7 @@ pub async fn open_h3(
 
     // Endpoint -> TUN. QUIC DATAGRAMs arrive whole, so unlike the HTTP/2
     // carrier there is no stream buffer and no flow control to release.
-    let downstream_tun = tun.clone();
+    let downstream_tun = device.clone();
     let downstream_conn = connection.clone();
     let downstream_alive = LivenessGuard::new(Arc::clone(&alive));
     let downstream_shutdown = shutdown.clone();
@@ -240,7 +240,7 @@ pub async fn open_h3(
                     packet.len()
                 );
             }
-            if let Err(error) = downstream_tun.send(&packet).await {
+            if let Err(error) = downstream_tun.send_packet(&packet).await {
                 tracing::debug!("masque TUN write failed: {error}");
                 let _ = downstream_shutdown.send(true);
                 return;
@@ -273,7 +273,7 @@ pub async fn open_h3(
     });
 
     Ok(MasqueTunnel::new(
-        tun,
+        device,
         preferred.to_vec(),
         alive,
         shutdown,
