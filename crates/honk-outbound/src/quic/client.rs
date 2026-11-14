@@ -14,8 +14,8 @@ use crate::transport_quality::TransportQuality;
 use super::endpoint::{clamp_quic_payload_size, client_endpoint_with_mtu};
 use super::metrics::{QuicClientConnectionMonitor, spawn_quic_client_connection_monitor};
 use super::{
-    AdaptiveFlowProfiles, FRONTED_UDP_PAYLOAD_SIZE, PacketTransportEndpoint,
-    QUIC_SAMPLE_INTERVAL, QuicClient, QuicConnState, State, TrackedConnection,
+    AdaptiveFlowProfiles, DialEndpoint, FRONTED_UDP_PAYLOAD_SIZE, QUIC_SAMPLE_INTERVAL,
+    QuicClient, QuicConnState, State, TrackedConnection,
 };
 
 impl<C> State<C> {
@@ -108,8 +108,7 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
             flow_control_profiles: Arc::new(AdaptiveFlowProfiles::default()),
             task_scope: crate::runtime::TaskScope::capture(),
             state: Arc::new(Mutex::new(State {
-                endpoint: None,
-                detour_endpoint: None,
+                dial_endpoint: None,
                 conn: None,
                 connections: Vec::new(),
                 next_connection_id: 1,
@@ -279,13 +278,11 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
         // A detour is dialled to one address and hands back a transport pinned
         // to it, so it replaces the address race rather than joining it: there
         // is no set of local paths to try, just the one the detour carries.
-        let (conn, endpoint, ipv6, detour) = match self.detour.as_deref() {
+        let (conn, dial_endpoint, ipv6) = match self.detour.as_deref() {
             Some(path) => {
                 let server_addr = *addrs.first().expect("address list checked non-empty");
-                let (packet, conn, endpoint, ipv6) = self
-                    .detour_handshake(path, server_addr, selection.as_ref(), connect_timeout)
-                    .await?;
-                (conn, endpoint, ipv6, Some(packet))
+                self.detour_handshake(path, server_addr, selection.as_ref(), connect_timeout)
+                    .await?
             }
             None => {
                 let raced = crate::address_race::race_resolved_addrs(&addrs, |server_addr| {
@@ -319,11 +316,10 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
                     Some(result) => result?,
                     None => anyhow::bail!("resolve {host}: no addresses"),
                 };
-                (conn, endpoint, ipv6, None)
+                (conn, DialEndpoint::Direct(endpoint), ipv6)
             }
         };
-        state.detour_endpoint = detour;
-        state.endpoint = Some(endpoint.clone());
+        state.dial_endpoint = Some(dial_endpoint.clone());
         let mut close_guard = ConnectionCloseGuard::new(conn.clone());
         let ctx = match setup(conn.clone()).await {
             Ok(ctx) => ctx,
@@ -351,14 +347,12 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
             owner.clone(),
             state.quality.clone(),
         ));
-        // The detour's adapter workers have to live as long as any connection
+        // The endpoint's driver tasks have to live as long as any connection
         // that reads through them, so a tracked connection takes its own claim.
-        let detour_keepalive = state.detour_endpoint.clone();
         state.connections.push(TrackedConnection {
             id,
             connection: conn.clone(),
-            _endpoint: endpoint.clone(),
-            _detour: detour_keepalive,
+            _dial_endpoint: dial_endpoint.clone(),
             state: owner.clone(),
             monitor: Arc::clone(&monitor),
         });
@@ -449,8 +443,9 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
     /// `server_addr`.
     ///
     /// The transport is pinned to that one address and owned by the endpoint
-    /// built on it, so both are returned: dropping the packet endpoint stops
-    /// the adapter workers the socket reads and writes through.
+    /// built on it. [`DialEndpoint::Fronted`] keeps that owner — and the
+    /// adapter workers the socket reads and writes through — alive for as long
+    /// as any connection uses it, and gives `force_close` one teardown path.
     ///
     /// The endpoint advertises [`FRONTED_UDP_PAYLOAD_SIZE`] rather than the
     /// conservative 1252-byte default. A detour hands back whole UDP
@@ -465,12 +460,7 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
         server_addr: SocketAddr,
         selection: Option<&crate::runtime::flow_observation::LookupSelection>,
         connect_timeout: Duration,
-    ) -> anyhow::Result<(
-        Arc<PacketTransportEndpoint>,
-        Connection,
-        crate::runtime::RuntimeEndpoint,
-        bool,
-    )> {
+    ) -> anyhow::Result<(Connection, DialEndpoint, bool)> {
         if let Some(selection) = selection {
             selection.selected_ip(server_addr.ip());
         }
@@ -481,7 +471,7 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
                 connect_timeout,
             )
             .await
-            .with_context(|| format!("detour could not carry UDP to {server_addr}"))?;
+            .with_context(|| crate::proxy::detour::udp_carry_context(server_addr))?;
         let transport = match &self.detour_transform {
             Some(transform) => transform(transport),
             None => transport,
@@ -492,12 +482,8 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
                 server_addr,
                 FRONTED_UDP_PAYLOAD_SIZE,
             )
-            .with_context(|| format!("QUIC endpoint over the detour to {server_addr}"))?,
+            .with_context(|| crate::proxy::detour::quic_endpoint_context(server_addr))?,
         );
-        // The packet endpoint owns its drivers and is closed by `force_close`;
-        // leasing it to the ambient probe owner would let that scope's abort
-        // close the endpoint while quinn is still connecting.
-        let endpoint = crate::runtime::wrap_detour_quic_endpoint(packet.endpoint().clone());
         // quinn reports `EndpointStopping` / a bare timeout when the adapter
         // workers die, hiding the datagram-level cause. Attach it here the
         // same way `quic_handshake_probe` does, while `packet` is alive.
@@ -508,12 +494,13 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
             Ok(conn) => conn,
             Err(error) => {
                 return Err(match packet.terminal_error() {
-                    Some(cause) => error.context(format!("QUIC transport error: {cause}")),
+                    Some(cause) => error
+                        .context(crate::proxy::detour::transport_error_context(cause)),
                     None => error,
                 });
             }
         };
-        Ok((packet, conn, endpoint, server_addr.is_ipv6()))
+        Ok((conn, DialEndpoint::Fronted(packet), server_addr.is_ipv6()))
     }
 
     /// Drop the cached connection if it is `conn`, forcing the next
@@ -534,8 +521,7 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
     pub async fn release_cached(&self) {
         let mut state = self.state.lock().await;
         state.conn = None;
-        state.endpoint = None;
-        state.detour_endpoint = None;
+        state.dial_endpoint = None;
         state.prune_connections();
     }
 
@@ -544,7 +530,7 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
     /// in-flight dial's single-flight section so its late connection is also
     /// closed; a try-lock skip would leak that connection and endpoint driver.
     pub async fn force_close(&self) {
-        let (endpoint, detour) = {
+        let dial_endpoint = {
             let mut state = self.state.lock().await;
             state.closed = true;
             state.conn = None;
@@ -553,22 +539,20 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
                     .connection
                     .close(VarInt::from_u32(0), b"generation shutdown");
             }
-            (state.endpoint.take(), state.detour_endpoint.take())
+            state.dial_endpoint.take()
         };
-        // A fronted endpoint is owned by `PacketTransportEndpoint`: closing it
-        // through the `RuntimeEndpoint` view as well closed the same quinn
-        // endpoint twice. Direct endpoints have no such owner.
-        match (endpoint, detour) {
-            // `close` reports whether the adapter drivers joined cleanly; at a
-            // zero grace it only signals quinn, so the flag is intentionally
-            // discarded. Dropping the last `Arc` stops the workers.
-            (_, Some(detour)) => {
-                let _ = detour.close(Duration::ZERO).await;
+        // One owner, one teardown: a fronted endpoint belongs to the
+        // `PacketTransportEndpoint`, a direct one to its `RuntimeEndpoint`.
+        match dial_endpoint {
+            Some(DialEndpoint::Fronted(packet)) => {
+                // `close` reports whether the adapter drivers joined cleanly;
+                // at zero grace it only signals quinn, so discard the flag.
+                let _ = packet.close(Duration::ZERO).await;
             }
-            (Some(endpoint), None) => {
+            Some(DialEndpoint::Direct(endpoint)) => {
                 endpoint.close(VarInt::from_u32(0), b"generation shutdown")
             }
-            (None, None) => {}
+            None => {}
         }
     }
 }

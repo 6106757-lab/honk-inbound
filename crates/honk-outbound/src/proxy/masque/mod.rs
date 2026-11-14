@@ -106,10 +106,11 @@ pub struct MasqueRuntime {
 struct TunnelSlot {
     slot: usize,
     tunnel: Arc<tunnel::MasqueTunnel>,
-    /// The front node the carrier was opened over. A group can switch its
-    /// member while the tunnel is still alive; the cache must then rebuild
-    /// instead of handing every new flow the old front's connection.
-    carrier: Option<uuid::Uuid>,
+    /// The front members the carrier was opened over, on both networks. A
+    /// group can switch its TCP or UDP member while the tunnel is still alive;
+    /// the cache must then rebuild instead of handing every new flow the old
+    /// front's connection.
+    carrier: Option<crate::proxy::detour::CarrierSignature>,
 }
 
 impl Default for MasqueRuntime {
@@ -162,7 +163,7 @@ impl MasqueRuntime {
         detour: Option<&crate::proxy::detour::DetourPath>,
     ) -> anyhow::Result<Arc<tunnel::MasqueTunnel>> {
         let key = detour.map(|path| path.key());
-        let carrier = detour.and_then(|path| path.carrier_id());
+        let carrier = detour.map(|path| path.carrier_signature());
         let mut guard = self.tunnels.lock().await;
         // Reclaim dead tunnels even when their path is never dialled again:
         // their TUN devices and default routes live in the kernel, not in this

@@ -223,23 +223,6 @@ pub(crate) fn new_owned_quic_endpoint(
     })
 }
 
-/// Wrap a QUIC endpoint whose lifetime is already owned elsewhere.
-///
-/// A detoured node runs QUIC over a `PacketTransportEndpoint`: that value owns
-/// the adapter workers and its own driver `TaskOwner`, is kept alive by the
-/// client's `State::detour_endpoint`, and is closed by
-/// `PacketTransportEndpoint::close` / `QuicClient::force_close`. This wrapper
-/// is therefore a pure borrow view: it deliberately does **not** register the
-/// endpoint with the ambient `TaskOwner`, whose `abort()` would otherwise close
-/// it while quinn is still connecting.
-pub(crate) fn wrap_detour_quic_endpoint(endpoint: quinn::Endpoint) -> RuntimeEndpoint {
-    RuntimeEndpoint {
-        endpoint,
-        #[cfg(feature = "owned-tasks")]
-        _lease: None,
-    }
-}
-
 #[cfg(feature = "owned-tasks")]
 pub(super) fn capture_owner() -> Option<std::sync::Weak<TaskOwner>> {
     OWNER.try_with(Clone::clone).ok().flatten()

@@ -191,6 +191,31 @@ pub(crate) fn group_detour(
     None
 }
 
+/// Resolve the detour for one dial, trying the routing group first and the
+/// selection chain's owning group second.
+///
+/// When a candidate came through a group's `final:` fallback the routing group
+/// (e.g. `Final`) names no `detour:` of its own and is not linked to the
+/// fallback group by a member edge, so looking the detour up by that name
+/// returns nothing. The chain records the real owning group as its
+/// second-to-last element; falling back to it keeps the front — and anything
+/// it inherits — applied to the dial. TCP and UDP dials used to spell this
+/// `.or_else` out independently.
+pub(crate) fn group_detour_for_chain(
+    config: &honk_config::Config,
+    proxies: &Arc<ProxyRegistry>,
+    generation: &Arc<OutboundRuntimeRegistry>,
+    manager: &Arc<GroupManager>,
+    group_name: &str,
+    owning_group: Option<&str>,
+    rider: NodeProtocol,
+) -> Option<Arc<DetourPath>> {
+    group_detour(config, proxies, generation, manager, group_name, rider).or_else(|| {
+        owning_group
+            .and_then(|via| group_detour(config, proxies, generation, manager, via, rider))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     //! Chain verification over loopback.

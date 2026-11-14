@@ -474,28 +474,54 @@ pub(crate) mod defrag;
 #[cfg(test)]
 mod path_health_tests;
 
+/// The endpoint a dial built, held in the form that actually owns its driver
+/// tasks.
+///
+/// A fronted dial's quinn endpoint belongs to `PacketTransportEndpoint`; the
+/// `RuntimeEndpoint` view is only a borrow. `State` used to hold both (and a
+/// clone on every tracked connection), which let `force_close` close the same
+/// quinn endpoint twice. One value now carries both the keepalive claim and
+/// the single teardown path.
+#[derive(Clone)]
+pub(crate) enum DialEndpoint {
+    Direct(crate::runtime::RuntimeEndpoint),
+    Fronted(Arc<PacketTransportEndpoint>),
+}
+
+/// Build a private QUIC client for a dial that must ride a group detour.
+///
+/// A QUIC connection carries every flow that shares it, and a cached client
+/// was opened over the path its own caller named. Reusing it here would send
+/// the flow out of somebody else's front, so each detoured dial builds a
+/// client over the named detour instead. Hysteria2, TUIC and Juicity share
+/// this template; each supplies its own `dial` step.
+macro_rules! fronted_quic_dial {
+    ($handler:expr, $runtime:expr, $detour:expr, |$client:ident| $dial:expr) => {{
+        let profiles = Some($runtime.quic_flow_control_profiles()?);
+        let $client = $handler
+            .build_client($runtime.node.as_ref(), profiles, Some($detour))
+            .await?;
+        $dial
+    }};
+}
+pub(crate) use fronted_quic_dial;
+
 struct TrackedConnection<C> {
     id: u64,
     connection: Connection,
-    _endpoint: crate::runtime::RuntimeEndpoint,
-    /// The packet-transport endpoint that carries this connection when the node
-    /// rides a detour. Its worker tasks read and write the socket the
-    /// connection runs on, so they have to outlive it.
-    _detour: Option<Arc<PacketTransportEndpoint>>,
+    /// Keeps the endpoint's driver tasks alive for as long as any connection
+    /// reads through them.
+    _dial_endpoint: DialEndpoint,
     state: Weak<C>,
     monitor: Arc<QuicClientConnectionMonitor>,
 }
 
 struct State<C> {
-    /// Endpoint of the most recent dial that completed its handshake (cleared by
-    /// [`QuicClient::release_cached`]). Once that connection has closed, holding it
-    /// keeps its port bound while the next dial binds, so that dial gets a different
-    /// port; [`QuicClient::force_close`] also closes it.
-    endpoint: Option<crate::runtime::RuntimeEndpoint>,
-    /// The packet-transport endpoint of the most recent detour dial. Tracked
-    /// connections hold their own clone, so clearing this only ends the
-    /// client's own claim on it.
-    detour_endpoint: Option<Arc<PacketTransportEndpoint>>,
+    /// Endpoint of the most recent dial that completed its handshake (cleared
+    /// by [`QuicClient::release_cached`]). Holding it keeps its port bound
+    /// while the next dial binds, so a redial gets a different port;
+    /// [`QuicClient::force_close`] closes exactly this value.
+    dial_endpoint: Option<DialEndpoint>,
     conn: Option<(Connection, Arc<C>)>,
     connections: Vec<TrackedConnection<C>>,
     next_connection_id: u64,

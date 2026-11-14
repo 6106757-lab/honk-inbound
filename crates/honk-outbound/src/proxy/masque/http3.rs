@@ -118,8 +118,9 @@ pub async fn open_h3(
                 .await
                 .map_err(|error| {
                     anyhow::anyhow!(
-                        "masque node {}: detour could not carry UDP to {endpoint}: {error}",
-                        node.name
+                        "masque node {}: {}: {error}",
+                        node.name,
+                        crate::proxy::detour::udp_carry_context(endpoint)
                     )
                 })?;
             let packet = Arc::new(
@@ -130,8 +131,9 @@ pub async fn open_h3(
                 )
                 .map_err(|error| {
                     anyhow::anyhow!(
-                        "masque node {}: QUIC endpoint over the detour to {endpoint}: {error}",
-                        node.name
+                        "masque node {}: {}: {error}",
+                        node.name,
+                        crate::proxy::detour::quic_endpoint_context(endpoint)
                     )
                 })?,
             );
