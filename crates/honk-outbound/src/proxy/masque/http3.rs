@@ -230,7 +230,7 @@ pub async fn open_h3(
                     break;
                 }
             };
-            let Some(packet) = decode_ip_datagram(&datagram) else {
+            let Some(packet) = decode_ip_datagram(datagram) else {
                 continue;
             };
             packets += 1;
@@ -342,8 +342,8 @@ fn encode_ip_datagram(packet: &[u8]) -> Bytes {
 /// Unwrap one HTTP/3 DATAGRAM, checking both identifiers before handing the
 /// remaining bytes to the TUN device. Datagrams for another flow or context
 /// are dropped, not treated as IP packets.
-fn decode_ip_datagram(datagram: &[u8]) -> Option<Bytes> {
-    let mut cursor: &[u8] = datagram;
+fn decode_ip_datagram(datagram: Bytes) -> Option<Bytes> {
+    let mut cursor: &[u8] = &datagram;
     let flow_id = read_varint(&mut cursor)?;
     if flow_id != CONNECT_FLOW_ID {
         tracing::trace!("masque h3: dropping datagram for flow {flow_id}");
@@ -357,7 +357,11 @@ fn decode_ip_datagram(datagram: &[u8]) -> Option<Bytes> {
     if cursor.is_empty() {
         return None;
     }
-    Some(Bytes::copy_from_slice(cursor))
+    // quinn already hands us a refcounted buffer. Slice the two IDs off the
+    // front instead of copying the whole IP packet a second time on the
+    // downstream path of every datagram.
+    let header_len = datagram.len() - cursor.len();
+    Some(datagram.slice(header_len..))
 }
 
 #[cfg(test)]
@@ -370,7 +374,10 @@ mod tests {
         let encoded = encode_ip_datagram(&packet);
         // flow id 0, context id 0, then the packet verbatim.
         assert_eq!(&encoded[..2], b"\x00\x00");
-        assert_eq!(decode_ip_datagram(&encoded).unwrap().as_ref(), packet.as_slice());
+        assert_eq!(
+            decode_ip_datagram(encoded.clone()).unwrap().as_ref(),
+            packet.as_slice()
+        );
     }
 
     #[test]
@@ -388,20 +395,20 @@ mod tests {
         put_varint(&mut wrong_flow, 1);
         put_varint(&mut wrong_flow, 0);
         wrong_flow.extend_from_slice(b"\x45\x00");
-        assert!(decode_ip_datagram(&wrong_flow).is_none());
+        assert!(decode_ip_datagram(wrong_flow.freeze()).is_none());
 
         let mut wrong_context = BytesMut::new();
         put_varint(&mut wrong_context, 0);
         put_varint(&mut wrong_context, 7);
         wrong_context.extend_from_slice(b"\x45\x00");
-        assert!(decode_ip_datagram(&wrong_context).is_none());
+        assert!(decode_ip_datagram(wrong_context.freeze()).is_none());
     }
 
     #[test]
     fn truncated_datagrams_are_dropped() {
-        assert!(decode_ip_datagram(b"").is_none());
-        assert!(decode_ip_datagram(b"\x00").is_none());
-        assert!(decode_ip_datagram(b"\x00\x00").is_none());
+        assert!(decode_ip_datagram(Bytes::from_static(b"")).is_none());
+        assert!(decode_ip_datagram(Bytes::from_static(b"\x00")).is_none());
+        assert!(decode_ip_datagram(Bytes::from_static(b"\x00\x00")).is_none());
     }
 
     #[test]
