@@ -36,10 +36,16 @@ use tokio::sync::Notify;
 
 use crate::proxy::PacketTransport;
 
-/// TCP receive/transmit buffer size, in bytes. This is also the TCP receive
-/// window: it is the whole point of reading sockets directly rather than
-/// draining them into a channel.
-const SOCKET_BUFFER: usize = 64 * 1024;
+/// TCP receive buffer, in bytes. smoltcp derives the advertised receive window
+/// and its RFC 1323 window-scale shift from this capacity (`log2(cap) - 16`),
+/// and 0.11 has no congestion control of its own: throughput is capped at
+/// roughly `window / RTT`. A 64 KiB buffer means an unscaled 64 KiB window,
+/// i.e. ~640 KiB/s on a 100 ms path. 512 KiB offers a scaled 512 KiB window
+/// (shift 3) and keeps per-connection memory bounded.
+const TCP_RX_BUFFER: usize = 512 * 1024;
+/// TCP transmit buffer, in bytes. A peer advertising a large window must not
+/// find us limited by our own send buffer on the upload side.
+const TCP_TX_BUFFER: usize = 256 * 1024;
 /// Number of UDP datagram slots the receive/transmit buffers hold.
 const UDP_SLOTS: usize = 64;
 /// UDP payload storage, in bytes (`UDP_SLOTS` packets of ~1.5 KiB).
@@ -313,8 +319,8 @@ impl UserspaceDevice {
         let handle = {
             let mut stack = self.inner.stack.lock().unwrap();
             let mut socket = TcpSocket::new(
-                smoltcp::storage::RingBuffer::new(vec![0u8; SOCKET_BUFFER]),
-                smoltcp::storage::RingBuffer::new(vec![0u8; SOCKET_BUFFER]),
+                smoltcp::storage::RingBuffer::new(vec![0u8; TCP_RX_BUFFER]),
+                smoltcp::storage::RingBuffer::new(vec![0u8; TCP_TX_BUFFER]),
             );
             // `bind::new_socket` sets TCP_NODELAY on every kernel-backend
             // tunnel socket. smoltcp enables Nagle by default, which combined
