@@ -17,10 +17,16 @@ use std::sync::Arc;
 
 /// Bind every node that names a detour to the path it names.
 ///
-/// A detour is bound in exactly one place and read from exactly one, so no
-/// protocol can end up taking it twice. Unknown names, and a MASQUE node whose
-/// detour is another MASQUE node, are reported and skipped rather than failing
-/// the generation: one unreachable node should not take down the rest.
+/// A node-level detour is bound once here and read from `NodeRuntime::detour()`.
+/// A **group-level** detour is different: it is built fresh on each dial by
+/// [`group_detour`] and passed to the protocol handler, and when present it
+/// **wins over** the node's own `dialer-proxy` (the dial path returns early).
+/// Both eventually feed the same `DetourPath` resolution, but they are two
+/// mechanisms with that precedence, not one binding read twice.
+///
+/// Unknown names, and a MASQUE node whose detour is another MASQUE node, are
+/// reported and skipped rather than failing the generation: one unreachable
+/// node should not take down the rest.
 ///
 /// The name may be a node or a group. A group is resolved on each dial, so the
 /// front follows the group's current choice instead of whichever node happened

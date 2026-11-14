@@ -279,12 +279,22 @@ impl TransportQuinnSocket {
                         continue;
                     }
                     if n > buf.len() {
-                        *recv_error.lock() = Some(TransportIoError::fatal(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "PacketTransport returned a datagram larger than its receive buffer",
-                        )));
-                        wake_recv(&recv_waker);
-                        return;
+                        // Mirror `poll_recv`: a real UDP socket drops one
+                        // oversized datagram and stays usable. Failing here
+                        // instead killed quinn's driver and surfaced as a
+                        // misleading `EndpointStopping`.
+                        static OVERSIZED_RX: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        let dropped =
+                            OVERSIZED_RX.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if dropped <= 3 {
+                            tracing::warn!(
+                                datagram_len = n,
+                                buffer_len = buf.len(),
+                                "QUIC adapter dropped oversized transport datagram"
+                            );
+                        }
+                        continue;
                     }
                     // A full queue drops the datagram (UDP semantics); the
                     // transport read must never backpressure or allocate for a drop.
@@ -657,25 +667,17 @@ impl PacketTransportEndpoint {
     }
 }
 
-/// Create a [`PacketTransportEndpoint`] pinned to `remote` with the safe
-/// 1252-byte UDP payload cap. Metrics are disabled because this constructor is
-/// also used by temporary health probes.
-pub fn packet_transport_endpoint(
-    transport: Arc<dyn PacketTransport>,
-    remote: SocketAddr,
-) -> io::Result<PacketTransportEndpoint> {
-    build_packet_transport_endpoint(transport, remote, 1252, false, None)
-}
-
 /// Create a packet-backed endpoint advertising `mtu` as its QUIC UDP payload
-/// cap instead of the conservative 1252-byte default.
+/// cap instead of the conservative 1252-byte direct-socket default.
 ///
-/// A MASQUE connect-ip tunnel sends one whole 1280-byte IP packet per QUIC
-/// DATAGRAM; with QUIC/H3 overhead that needs about 1350 bytes, so the 1252
-/// default cannot carry a full TUN packet. Direct and fronted h3 tunnels use
-/// the same cap: a detour frames the datagram inside the front node's stream
-/// transport, which does not enlarge the datagram itself (TCP segments the
-/// stream). `endpoint_config_with_mtu` clamps to quinn's legal range.
+/// Every fronted QUIC path uses [`crate::quic::FRONTED_UDP_PAYLOAD_SIZE`]:
+/// Hysteria2 / TUIC / Juicity detour dials (via `QuicClient::detour_handshake`)
+/// and both direct and fronted MASQUE h3 tunnels. A MASQUE connect-ip tunnel
+/// sends one whole 1280-byte IP packet per QUIC DATAGRAM, which needs about
+/// 1350 bytes with QUIC/H3 overhead. A detour frames that datagram inside the
+/// front node's stream transport; TCP segments the stream, so the datagram is
+/// neither enlarged nor shrunk. `endpoint_config_with_mtu` clamps to quinn's
+/// legal range.
 pub fn packet_transport_endpoint_with_mtu(
     transport: Arc<dyn PacketTransport>,
     remote: SocketAddr,

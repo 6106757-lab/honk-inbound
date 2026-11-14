@@ -56,7 +56,9 @@ const ALPN_H3_WIRE: &[u8] = b"\x02h3";
 /// packet. A detour re-frames each datagram inside the front node's stream
 /// transport, but that framing does not enlarge the UDP datagram itself (TCP
 /// segments the stream), so the same cap applies on both paths.
-const MAX_UDP_PAYLOAD_SIZE: u16 = 1350;
+/// Alias of the shared fronted cap, so every QUIC-over-detour path
+/// (Hysteria2, TUIC, Juicity, MASQUE h3) is guaranteed to agree.
+const MAX_UDP_PAYLOAD_SIZE: u16 = crate::quic::FRONTED_UDP_PAYLOAD_SIZE;
 
 /// DATAGRAM receive buffer. quinn advertises this as
 /// `max_datagram_frame_size`, capped at `u16::MAX`.
@@ -105,10 +107,10 @@ pub async fn open_h3(
     let tun_label = tun_name.to_string();
 
     let client = build_client_config(node, detour.is_some())?;
-    // A detour cannot give us a UDP socket, but it can give us a framed UDP
-    // transport pinned to the WARP endpoint. `packet_transport_endpoint` turns
-    // that into a quinn `AsyncUdpSocket`, so the QUIC handshake below is the
-    // same whichever path the node takes out.
+    // A detour cannot give us a real UDP socket, but it can give us a framed
+    // UDP transport pinned to the WARP endpoint.
+    // `packet_transport_endpoint_with_mtu` adapts that into a quinn
+    // `AsyncUdpSocket`, so the QUIC handshake below is the same on both paths.
     let (quinn_endpoint, packet_endpoint) = match detour {
         Some(path) => {
             let transport = path
@@ -248,23 +250,33 @@ pub async fn open_h3(
                         );
                     }
                     let datagram = encode_ip_datagram(&packet[..length]);
-                    if let Err(error) = upstream_conn.send_datagram(datagram) {
-                        // A single oversized or unsupported DATAGRAM is one
-                        // lost IP packet on a real link, not a reason to tear
-                        // down the whole tunnel. Log the first few and keep
-                        // forwarding; the previous `break` silently killed
-                        // every fronted tunnel as soon as a large packet came.
-                        static SEND_DROPS: std::sync::atomic::AtomicU64 =
-                            std::sync::atomic::AtomicU64::new(0);
-                        let drops = SEND_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
-                        if drops <= 3 || drops % 1000 == 0 {
-                            tracing::warn!(
-                                drops,
-                                %error,
-                                "masque h3 datagram send failed; dropping that IP packet"
-                            );
+                    match upstream_conn.send_datagram(datagram) {
+                        Ok(()) => {}
+                        Err(quinn::SendDatagramError::TooLarge) => {
+                            // One IP packet does not fit the current path MTU.
+                            // A real link drops that packet and keeps going;
+                            // the old unconditional `break` killed every
+                            // fronted tunnel on its first large packet.
+                            static SEND_DROPS: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            let drops = SEND_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
+                            if drops <= 3 || drops % 1000 == 0 {
+                                tracing::warn!(
+                                    drops,
+                                    "masque h3 dropped an oversized IP datagram"
+                                );
+                            }
+                            continue;
                         }
-                        continue;
+                        Err(error) => {
+                            // UnsupportedByPeer / Disabled / ConnectionLost
+                            // mean no IP packet can ever be carried again.
+                            tracing::warn!(
+                                %error,
+                                "masque h3 datagram transport failed; stopping tunnel"
+                            );
+                            break;
+                        }
                     }
                 }
                 Err(error) => {

@@ -7,7 +7,7 @@
 //!                     [`super::http3`].
 
 use honk_config::node::Node;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::time::Duration;
 
 use super::device::TunnelBackend;
@@ -15,7 +15,8 @@ use super::http3;
 use super::tunnel::MasqueTunnel;
 use super::warp::WarpIdentity;
 use crate::proxy::AsyncReadWrite;
-use crate::proxy::detour::DetourPath;
+use crate::proxy::detour::{DetourPath, resolve_endpoint};
+use crate::proxy::transport::endpoint_address;
 
 /// Default tunnel MTU. IPv6 requires >= 1280 and every MASQUE endpoint we
 /// know advertises WARP-sized packets, so 1280 is the safe floor.
@@ -96,14 +97,15 @@ async fn open_h2(
     slot: usize,
     backend: TunnelBackend,
 ) -> anyhow::Result<MasqueTunnel> {
+    // Same binding contract as the h3 path: reject a named-but-unbound
+    // detour instead of silently dialling direct.
+    crate::proxy::detour::ensure_bound(node, detour)?;
     let config = node
         .masque()
         .ok_or_else(|| anyhow::anyhow!("masque node {} has no masque config", node.name))?;
     let address = endpoint_address(node);
-    // The caller's detour wins over the node's, and it counts even when the
-    // node names none. Matching `(None, _)` here used to dial direct, which
-    // quietly dropped a detour a group had asked for — the one outcome this
-    // is meant to make impossible.
+    // A group-level detour takes precedence over the node's own
+    // `dialer-proxy`; `ensure_bound` only guards the unbound case.
     let tcp = match detour {
         Some(dialer) => {
             let endpoint = resolve_endpoint(&address).await?;
@@ -117,14 +119,8 @@ async fn open_h2(
                     )
                 })?
         }
-        None => match node.detour_name() {
-            Some(name) => anyhow::bail!(
-                "masque node {}: detour {name:?} is not bound in this generation",
-                node.name
-            ),
-            None => Box::new(crate::util::connect_outbound(&address, connect_timeout).await?)
-                as Box<dyn AsyncReadWrite>,
-        },
+        None => Box::new(crate::util::connect_outbound(&address, connect_timeout).await?)
+            as Box<dyn AsyncReadWrite>,
     };
     let identity = WarpIdentity::build(node)?;
     let tls = identity.connect(tcp, connect_timeout).await?;
@@ -142,36 +138,6 @@ async fn open_h2(
          (mtu {mtu}, addresses {preferred:?})"
     );
     MasqueTunnel::open_h2(io, mtu, &tun_name, &preferred, slot, backend).await
-}
-
-/// Resolve the endpoint literal to an address a detour can dial.
-///
-/// Server hostnames resolve through the bootstrap resolver, the same path
-/// direct server dials take; libc NSS resolution is deliberately not used.
-async fn resolve_endpoint(address: &str) -> anyhow::Result<SocketAddr> {
-    let (host, port) = address
-        .rsplit_once(':')
-        .ok_or_else(|| anyhow::anyhow!("masque endpoint {address} is not a host:port pair"))?;
-    let port: u16 = port
-        .parse()
-        .map_err(|_| anyhow::anyhow!("masque endpoint {address} has a bad port"))?;
-    let resolution = Box::pin(crate::bootstrap::resolve(host));
-    let ip = resolution
-        .await?
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("masque endpoint {address} resolved to nothing"))?;
-    Ok(SocketAddr::new(ip, port))
-}
-
-/// The node's `host:port`, bracketed when the endpoint is an IPv6 literal.
-fn endpoint_address(node: &Node) -> String {
-    let host = node.host();
-    if host.contains(':') {
-        format!("[{host}]:{}", node.port)
-    } else {
-        format!("{host}:{}", node.port)
-    }
 }
 
 /// The addresses the node expects the tunnel to carry, from its `ip` and

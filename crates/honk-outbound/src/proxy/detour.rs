@@ -7,6 +7,10 @@
 //! [`DetourPath`]. A group is the one part that cannot be resolved that early,
 //! and it is resolved again on every dial instead.
 //!
+//! There are two callers: a node's own `dialer-proxy` is bound once per
+//! generation, while a group's `detour` is resolved into a fresh path on each
+//! dial and takes precedence over the node's binding.
+//!
 //! A dial through it yields the same byte stream a socket would, and for UDP
 //! the same framed transport, so the protocol above does not have to know
 //! which path it is on.

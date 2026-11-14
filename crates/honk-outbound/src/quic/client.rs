@@ -14,16 +14,9 @@ use crate::transport_quality::TransportQuality;
 use super::endpoint::{clamp_quic_payload_size, client_endpoint_with_mtu};
 use super::metrics::{QuicClientConnectionMonitor, spawn_quic_client_connection_monitor};
 use super::{
-    AdaptiveFlowProfiles, PacketTransportEndpoint, QUIC_SAMPLE_INTERVAL, QuicClient, QuicConnState,
-    State, TrackedConnection,
+    AdaptiveFlowProfiles, FRONTED_UDP_PAYLOAD_SIZE, PacketTransportEndpoint,
+    QUIC_SAMPLE_INTERVAL, QuicClient, QuicConnState, State, TrackedConnection,
 };
-
-/// UDP payload cap advertised by QUIC endpoints carried over a detour.
-/// Peers answer a 1200-byte Initial with a 1280-byte handshake flight, which
-/// the conservative 1252 default forces the adapter to drop. Matches
-/// `proxy::masque::http3::MAX_UDP_PAYLOAD_SIZE` so every fronted QUIC path
-/// agrees; a detour's UDP-over-stream framing does not shrink the datagram.
-const DETOUR_UDP_PAYLOAD_SIZE: u16 = 1350;
 
 impl<C> State<C> {
     fn prune_connections(&mut self) {
@@ -459,7 +452,7 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
     /// built on it, so both are returned: dropping the packet endpoint stops
     /// the adapter workers the socket reads and writes through.
     ///
-    /// The endpoint advertises [`DETOUR_UDP_PAYLOAD_SIZE`] rather than the
+    /// The endpoint advertises [`FRONTED_UDP_PAYLOAD_SIZE`] rather than the
     /// conservative 1252-byte default. A detour hands back whole UDP
     /// datagrams inside the front node's *stream* transport (the stream is
     /// segmented by TCP, so the datagram itself is not shrunk), and real
@@ -497,7 +490,7 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
             crate::quic::packet_transport_endpoint_with_mtu(
                 transport,
                 server_addr,
-                DETOUR_UDP_PAYLOAD_SIZE,
+                FRONTED_UDP_PAYLOAD_SIZE,
             )
             .with_context(|| format!("QUIC endpoint over the detour to {server_addr}"))?,
         );
@@ -562,11 +555,20 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
             }
             (state.endpoint.take(), state.detour_endpoint.take())
         };
-        if let Some(endpoint) = endpoint {
-            endpoint.close(VarInt::from_u32(0), b"generation shutdown");
-        }
-        if let Some(detour) = detour {
-            detour.close(Duration::ZERO).await;
+        // A fronted endpoint is owned by `PacketTransportEndpoint`: closing it
+        // through the `RuntimeEndpoint` view as well closed the same quinn
+        // endpoint twice. Direct endpoints have no such owner.
+        match (endpoint, detour) {
+            // `close` reports whether the adapter drivers joined cleanly; at a
+            // zero grace it only signals quinn, so the flag is intentionally
+            // discarded. Dropping the last `Arc` stops the workers.
+            (_, Some(detour)) => {
+                let _ = detour.close(Duration::ZERO).await;
+            }
+            (Some(endpoint), None) => {
+                endpoint.close(VarInt::from_u32(0), b"generation shutdown")
+            }
+            (None, None) => {}
         }
     }
 }

@@ -1,6 +1,7 @@
 //! Shared QUIC client plumbing for QUIC-based proxy protocols.
 //!
-//! Used by the TUIC v5, Juicity, and Hysteria2 outbounds.
+//! Used by the TUIC v5, Juicity, Hysteria2 and MASQUE (HTTP/3) outbounds,
+//! including the packet-transport adapter that carries QUIC over a detour.
 
 use std::collections::HashMap;
 use std::io;
@@ -77,6 +78,17 @@ enum BbrVariant {
 /// Hysteria2 paths it delivered the same upload rate as BBRv3 while losing
 /// over half of what it sent, so BBRv3 is the default and `v1` stays a fallback.
 const DEFAULT_BBR: BbrVariant = BbrVariant::V3;
+
+/// QUIC UDP payload cap for connections carried over a detour.
+///
+/// A detour hands back whole UDP datagrams inside the front node's stream
+/// transport; TCP segments that stream, so the datagram itself is not shrunk.
+/// Peers answer a 1200-byte Initial with a 1280-byte handshake flight, and a
+/// MASQUE connect-ip tunnel needs room for one whole 1280-byte TUN IP packet,
+/// so the conservative 1252-byte direct-socket default is too small here.
+/// quinn cannot run path MTU discovery through the abstract socket a detour
+/// provides, so fronted configs also pin this value as `initial_mtu`.
+pub(crate) const FRONTED_UDP_PAYLOAD_SIZE: u16 = 1350;
 
 /// `HONK_QUIC_BBR=v1|v3`, read once; any other value warns and keeps the default.
 static BBR_VARIANT: LazyLock<BbrVariant> = LazyLock::new(|| match std::env::var("HONK_QUIC_BBR") {
@@ -565,9 +577,8 @@ mod label_tests {
 mod packet_transport;
 
 pub use packet_transport::{
-    PacketTransportEndpoint, packet_transport_endpoint,
-    packet_transport_endpoint_with_metrics, packet_transport_endpoint_with_mtu,
-    quic_handshake_probe,
+    PacketTransportEndpoint, packet_transport_endpoint_with_metrics,
+    packet_transport_endpoint_with_mtu, quic_handshake_probe,
 };
 
 /// Wrap a detour's framed UDP transport before QUIC is built on it.
