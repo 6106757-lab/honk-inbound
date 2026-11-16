@@ -556,6 +556,85 @@ mod tests {
         honk_config::config::Config::builtin_direct_node()
     }
 
+    /// A SOCKS5 node dialing the fake server at `server`.
+    fn socks5_node(name: &str, server: SocketAddr) -> Node {
+        Node {
+            name: name.to_string(),
+            host: server.ip().to_string(),
+            address: server.ip().to_string(),
+            port: server.port(),
+            outbound: honk_config::node::OutboundConfig::Socks5(Default::default()),
+            ..Default::default()
+        }
+    }
+
+    /// Minimal SOCKS5 server: no-auth greeting, then a CONNECT it proxies
+    /// through to the requested address, so a SOCKS5 front can carry a dial
+    /// to a loopback listener in tests.
+    async fn spawn_fake_socks5() -> SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut greeting = [0u8; 2];
+                    if stream.read_exact(&mut greeting).await.is_err() {
+                        return;
+                    }
+                    let mut methods = vec![0u8; greeting[1] as usize];
+                    if stream.read_exact(&mut methods).await.is_err() {
+                        return;
+                    }
+                    if stream.write_all(&[5, 0]).await.is_err() {
+                        return;
+                    }
+                    let mut head = [0u8; 4];
+                    if stream.read_exact(&mut head).await.is_err() {
+                        return;
+                    }
+                    let target = match head[3] {
+                        1 => {
+                            let mut buf = [0u8; 6];
+                            if stream.read_exact(&mut buf).await.is_err() {
+                                return;
+                            }
+                            SocketAddr::new(
+                                IpAddr::V4(Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3])),
+                                u16::from_be_bytes([buf[4], buf[5]]),
+                            )
+                        }
+                        _ => return,
+                    };
+                    match TcpStream::connect(target).await {
+                        Ok(mut upstream) => {
+                            if stream
+                                .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            let _ =
+                                tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
+                        }
+                        Err(_) => {
+                            let _ = stream
+                                .write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0])
+                                .await;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
     /// Resolution returns every address in answer order: the dial race needs
     /// the whole set, not just the first answer.
     #[tokio::test]
@@ -632,5 +711,86 @@ mod tests {
             .expect("detour dial reaches the live address although the first resolved one refuses");
         carrier.write_all(b"ping").await.unwrap();
         assert_eq!(accepted.await.unwrap(), *b"ping");
+    }
+
+    /// One raced dial is one group selection: a LoadBalance front must be
+    /// picked once for the whole race, not once per attempted address.
+    /// Picking per attempt burns two round-robin turns for one dial, and the
+    /// attempts can ride different fronts.
+    #[tokio::test]
+    async fn detour_group_front_is_selected_once_per_raced_dial() {
+        use honk_config::node::{Group, GroupPolicy};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        if crate::bootstrap::run_global_test_in_child(
+            "proxy::detour::tests::detour_group_front_is_selected_once_per_raced_dial",
+        ) {
+            return;
+        }
+        let dead = Ipv4Addr::new(127, 0, 0, 2);
+        let live = Ipv4Addr::new(127, 0, 0, 1);
+        let stub = spawn_tcp_dns_stub(dead, live).await;
+        crate::bootstrap::set_global(crate::bootstrap::BootstrapResolver::parse(&format!(
+            "tcp://{stub}"
+        )));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4];
+            stream.read_exact(&mut buf).await.unwrap();
+            buf
+        });
+
+        // Two SOCKS5 fronts in a LoadBalance group: the round-robin cursor
+        // is the observable for how many selections one dial consumed.
+        // A Direct front cannot be duplicated — the runtime registry only
+        // accepts the one builtin `direct` node — so the fronts are SOCKS5
+        // nodes, each served by its own fake server that proxies CONNECTs
+        // through. The servers must listen on different ports: a node's
+        // derived id covers protocol, host and port, so two fronts on one
+        // server would be the same node.
+        let socks_a = spawn_fake_socks5().await;
+        let socks_b = spawn_fake_socks5().await;
+        let mut front_a = socks5_node("socks-a", socks_a);
+        front_a.id = front_a.derive_id();
+        let mut front_b = socks5_node("socks-b", socks_b);
+        front_b.id = front_b.derive_id();
+        let fronts = [front_a, front_b];
+        let group = Group {
+            name: "front".into(),
+            policy: GroupPolicy::LoadBalance,
+            nodes: fronts.iter().map(|node| node.id).collect(),
+            tolerance: 50,
+            ..Default::default()
+        };
+        let manager = Arc::new(GroupManager::new(std::slice::from_ref(&group), &fronts));
+        let generation = Arc::new(OutboundRuntimeRegistry::build(&fronts).unwrap());
+        let mut back = node_named("back");
+        back.host = "back.invalid".to_string();
+        back.address = format!("back.invalid:{port}");
+        back.port = port;
+        back.detour = Some("front".into());
+        back.id = back.derive_id();
+        let path = DetourPath::to_group(
+            Arc::new(ProxyRegistry::default_resolver().unwrap()),
+            Arc::clone(&generation),
+            "front",
+            Arc::clone(&manager),
+            back.protocol(),
+        );
+
+        let dialed = connect_server(&back, Some(&path), Duration::from_secs(5)).await;
+        crate::bootstrap::set_global(None);
+        let mut carrier = dialed.expect(
+            "detour dial through a group front reaches the live address although the first resolved one refuses",
+        );
+        carrier.write_all(b"ping").await.unwrap();
+        assert_eq!(accepted.await.unwrap(), *b"ping");
+        // The race tried two addresses but the group was selected once: the
+        // next pick is the second member, not the first one again.
+        assert_eq!(manager.select_node("front").unwrap().name, "socks-b");
     }
 }
