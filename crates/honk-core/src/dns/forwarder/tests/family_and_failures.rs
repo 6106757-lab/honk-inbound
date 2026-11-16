@@ -305,7 +305,7 @@ async fn preferred_family_packet_rejection_is_terminal_but_offline_falls_back() 
 /// SERVFAIL — the two have opposite client semantics — and it is not cached,
 /// so the second query re-asks upstream.
 #[tokio::test]
-async fn test_negative_cache_returns_nxdomain_not_servfail() {
+async fn nxdomain_is_not_cached_and_keeps_rcode() {
     let query = make_a_query();
     let nx = make_nxdomain_response(&query, 30, 20);
     let mock = Arc::new(MockUpstream::new(nx));
@@ -386,7 +386,7 @@ async fn cache_disabled_nxdomain_preserves_shared_positive() {
 /// An NXDOMAIN under a different upstream scope does not disturb a shared
 /// positive: the failure is not cached, so the positive keeps serving.
 #[tokio::test]
-async fn nxdomain_with_soa_preserves_shared_positive() {
+async fn nxdomain_in_other_scope_leaves_shared_positive() {
     let query = make_a_query();
     let cache = test_cache();
     let positive = Arc::new(MockUpstream::new(make_a_response([192, 0, 2, 1], 600)));
@@ -456,7 +456,7 @@ async fn cache_disabled_zero_ttl_positive_preserves_shared_positive() {
 /// A SERVFAIL stays SERVFAIL (rcode 2) on later queries, which re-ask
 /// upstream because failures are not cached.
 #[tokio::test]
-async fn test_negative_cache_keeps_servfail_rcode() {
+async fn servfail_is_not_cached_and_keeps_rcode() {
     let mut sf = make_a_response([93, 184, 216, 34], 1);
     sf[3] = 0x82; // QR + RA + SERVFAIL
     let mock = Arc::new(MockUpstream::new(sf));
@@ -472,7 +472,7 @@ async fn test_negative_cache_keeps_servfail_rcode() {
 }
 
 #[tokio::test]
-async fn cached_negative_keeps_source_aware_preferred_family_projection() {
+async fn negative_response_keeps_source_aware_preferred_family_projection() {
     use honk_config::dns::{DnsCond, DnsRequestAction, DnsRequestRouting, DnsRequestRule};
 
     struct NegativePreferenceUpstream {
