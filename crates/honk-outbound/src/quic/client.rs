@@ -281,11 +281,21 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
         // winner came back on.
         let (conn, dial_endpoint, ipv6) = match self.detour.as_deref() {
             Some(path) => {
+                // Resolve the front once for the whole race: a group front
+                // selected per attempt would burn one round-robin turn per
+                // address tried, and the attempts could ride different fronts.
+                let carrier = path.resolve(crate::alive::ProbeDomain::DataUdp)?;
                 let raced = crate::address_race::race_resolved_addrs(&addrs, |server_addr| {
                     let selection = selection.as_ref();
                     async move {
-                        self.detour_handshake(path, server_addr, selection, connect_timeout)
-                            .await
+                        self.detour_handshake(
+                            path,
+                            carrier,
+                            server_addr,
+                            selection,
+                            connect_timeout,
+                        )
+                        .await
                     }
                 })
                 .await;
@@ -467,6 +477,7 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
     async fn detour_handshake(
         &self,
         detour: &crate::proxy::detour::DetourPath,
+        carrier: uuid::Uuid,
         server_addr: SocketAddr,
         selection: Option<&crate::runtime::flow_observation::LookupSelection>,
         connect_timeout: Duration,
@@ -475,7 +486,8 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
             selection.selected_ip(server_addr.ip());
         }
         let transport = detour
-            .connect_udp(
+            .connect_udp_via(
+                carrier,
                 server_addr,
                 Some(self.server_host.as_str()),
                 connect_timeout,

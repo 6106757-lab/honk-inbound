@@ -227,7 +227,11 @@ impl DetourPath {
     }
 
     /// The node that carries this dial, for this network.
-    fn resolve(&self, domain: ProbeDomain) -> anyhow::Result<uuid::Uuid> {
+    ///
+    /// A group is selected once per dial, not once per attempted address:
+    /// callers racing addresses resolve first and dial every attempt
+    /// through the node that came back, so one dial is one selection.
+    pub(crate) fn resolve(&self, domain: ProbeDomain) -> anyhow::Result<uuid::Uuid> {
         match &self.target {
             DetourTarget::Node(node_id) => Ok(*node_id),
             DetourTarget::Group { name, manager } => {
@@ -261,6 +265,16 @@ impl DetourPath {
         timeout: Duration,
     ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
         let node_id = self.resolve(ProbeDomain::Tcp)?;
+        self.connect_via(node_id, target, timeout).await
+    }
+
+    /// Open a stream to `target` through the already-resolved front node.
+    pub(crate) async fn connect_via(
+        &self,
+        node_id: uuid::Uuid,
+        target: SocketAddr,
+        timeout: Duration,
+    ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
         let stream = self
             .proxies
             .dial_runtime(Arc::clone(&self.generation), node_id, target, None, timeout)
@@ -273,15 +287,20 @@ impl DetourPath {
     /// The winning address comes back with the stream: a caller that has to
     /// re-dial the same peer (REALITY) must reuse it, not resolve again and
     /// risk landing on a different first answer.
+    ///
+    /// The front is resolved once for the whole race: a group front selected
+    /// per attempt would burn one round-robin turn per address tried, and
+    /// the attempts could ride different fronts.
     pub(crate) async fn connect_raced(
         &self,
         endpoints: &[SocketAddr],
         timeout: Duration,
     ) -> anyhow::Result<(Box<dyn AsyncReadWrite>, SocketAddr)> {
+        let node_id = self.resolve(ProbeDomain::Tcp)?;
         crate::address_race::race_resolved_addrs(endpoints, |endpoint| {
             let this = self;
             async move {
-                this.connect(endpoint, timeout)
+                this.connect_via(node_id, endpoint, timeout)
                     .await
                     .map(|stream| (stream, endpoint))
             }
@@ -298,6 +317,20 @@ impl DetourPath {
         timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         let node_id = self.resolve(ProbeDomain::DataUdp)?;
+        self.connect_udp_via(node_id, target, target_domain, timeout)
+            .await
+    }
+
+    /// Open a framed UDP transport to `target` through the already-resolved
+    /// front node. Callers racing addresses resolve the front once and hand
+    /// it here, so one dial is one group selection.
+    pub(crate) async fn connect_udp_via(
+        &self,
+        node_id: uuid::Uuid,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         self.proxies
             .dial_udp_transport_runtime(
                 Arc::clone(&self.generation),
@@ -620,13 +653,10 @@ mod tests {
                             {
                                 return;
                             }
-                            let _ =
-                                tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
+                            let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
                         }
                         Err(_) => {
-                            let _ = stream
-                                .write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0])
-                                .await;
+                            let _ = stream.write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0]).await;
                         }
                     }
                 });

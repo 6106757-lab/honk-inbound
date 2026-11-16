@@ -332,8 +332,16 @@ async fn race_quic_connection(
     connect_timeout: Duration,
     detour: Option<&crate::proxy::detour::DetourPath>,
 ) -> anyhow::Result<(EstablishedQuic, SocketAddr)> {
+    // Resolve the front once for the whole race: a group front selected per
+    // attempt would burn one round-robin turn per address tried, and the
+    // attempts could ride different fronts.
+    let carrier = match detour {
+        Some(path) => Some(path.resolve(crate::alive::ProbeDomain::DataUdp)?),
+        None => None,
+    };
     crate::address_race::race_resolved_addrs(endpoints, |endpoint| async move {
-        let established = quic_connection_to(node, endpoint, sni, connect_timeout, detour).await?;
+        let established =
+            quic_connection_to(node, endpoint, sni, connect_timeout, detour, carrier).await?;
         Ok((established, endpoint))
     })
     .await
@@ -343,22 +351,27 @@ async fn race_quic_connection(
 /// One QUIC handshake to one endpoint: the transport (a detour's framed UDP
 /// transport, or a socket of our own), adapted into a quinn endpoint, then
 /// the handshake itself with the same timeout a direct QUIC dial uses.
+///
+/// `carrier` is the front `race_quic_connection` resolved for this dial,
+/// present exactly when `detour` is: the handshake reuses it instead of
+/// selecting a group front again per attempted address.
 async fn quic_connection_to(
     node: &Node,
     endpoint: SocketAddr,
     sni: &str,
     connect_timeout: Duration,
     detour: Option<&crate::proxy::detour::DetourPath>,
+    carrier: Option<uuid::Uuid>,
 ) -> anyhow::Result<EstablishedQuic> {
     let client = build_client_config(node, detour.is_some())?;
     // A detour cannot give us a real UDP socket, but it can give us a framed
     // UDP transport pinned to the WARP endpoint.
     // `packet_transport_endpoint_with_mtu` adapts that into a quinn
     // `AsyncUdpSocket`, so the QUIC handshake below is the same on both paths.
-    let (quinn_endpoint, packet_endpoint) = match detour {
-        Some(path) => {
+    let (quinn_endpoint, packet_endpoint) = match (detour, carrier) {
+        (Some(path), Some(carrier)) => {
             let transport = path
-                .connect_udp(endpoint, Some(node.host()), connect_timeout)
+                .connect_udp_via(carrier, endpoint, Some(node.host()), connect_timeout)
                 .await
                 .map_err(|error| {
                     anyhow::anyhow!(
@@ -383,9 +396,12 @@ async fn quic_connection_to(
             );
             (packet.endpoint().clone(), Some(packet))
         }
-        None => (
+        (None, None) => (
             crate::quic::client_endpoint_with_mtu(endpoint.is_ipv6(), MAX_UDP_PAYLOAD_SIZE)?,
             None,
+        ),
+        _ => unreachable!(
+            "race_quic_connection resolves the carrier exactly when a detour is present"
         ),
     };
     let connecting = quinn_endpoint
