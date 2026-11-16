@@ -14,8 +14,8 @@ use crate::transport_quality::TransportQuality;
 use super::endpoint::{clamp_quic_payload_size, client_endpoint_with_mtu};
 use super::metrics::{QuicClientConnectionMonitor, spawn_quic_client_connection_monitor};
 use super::{
-    AdaptiveFlowProfiles, DialEndpoint, FRONTED_UDP_PAYLOAD_SIZE, QUIC_SAMPLE_INTERVAL,
-    QuicClient, QuicConnState, State, TrackedConnection,
+    AdaptiveFlowProfiles, DialEndpoint, FRONTED_UDP_PAYLOAD_SIZE, QUIC_SAMPLE_INTERVAL, QuicClient,
+    QuicConnState, State, TrackedConnection,
 };
 
 impl<C> State<C> {
@@ -275,14 +275,24 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
             anyhow::bail!("resolve {host}: no addresses");
         }
 
-        // A detour is dialled to one address and hands back a transport pinned
-        // to it, so it replaces the address race rather than joining it: there
-        // is no set of local paths to try, just the one the detour carries.
+        // A detour hands back a transport pinned to one address, but the
+        // address is still a choice: race the handshake across every resolved
+        // address the way the direct path does, and keep the transport the
+        // winner came back on.
         let (conn, dial_endpoint, ipv6) = match self.detour.as_deref() {
             Some(path) => {
-                let server_addr = *addrs.first().expect("address list checked non-empty");
-                self.detour_handshake(path, server_addr, selection.as_ref(), connect_timeout)
-                    .await?
+                let raced = crate::address_race::race_resolved_addrs(&addrs, |server_addr| {
+                    let selection = selection.as_ref();
+                    async move {
+                        self.detour_handshake(path, server_addr, selection, connect_timeout)
+                            .await
+                    }
+                })
+                .await;
+                match raced {
+                    Some(result) => result?,
+                    None => anyhow::bail!("resolve {host}: no addresses"),
+                }
             }
             None => {
                 let raced = crate::address_race::race_resolved_addrs(&addrs, |server_addr| {
@@ -494,8 +504,9 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
             Ok(conn) => conn,
             Err(error) => {
                 return Err(match packet.terminal_error() {
-                    Some(cause) => error
-                        .context(crate::proxy::detour::transport_error_context(cause)),
+                    Some(cause) => {
+                        error.context(crate::proxy::detour::transport_error_context(cause))
+                    }
                     None => error,
                 });
             }
