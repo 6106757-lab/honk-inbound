@@ -134,7 +134,7 @@ pub struct DnsForwarder {
     pub(crate) strategy: DnsStrategy,
     hosts: Option<Arc<hosts::HostsFile>>,
     hosts_fingerprint: [u8; 32],
-    /// When false, skip positive/negative cache lookups and inserts
+    /// When false, skip positive cache lookups and inserts
     /// (`dns.optimistic_cache` / `cache.enabled`).
     pub(crate) cache_enabled: bool,
     /// Fixed positive-cache TTL in seconds (`dns.optimistic_cache_ttl` /
@@ -691,8 +691,7 @@ use message::new_asis_socket_with_mark;
 pub use message::{build_dns_query, extract_answer_ips, parse_dns_question};
 pub(crate) use response::{is_filtered_qtype, make_empty_response};
 pub(crate) use ttl::{
-    extract_min_ttl, extract_min_ttl_including_zero, extract_soa_negative_ttl, rewrite_answer_ttls,
-    traversal_strings,
+    extract_min_ttl, extract_min_ttl_including_zero, rewrite_answer_ttls, traversal_strings,
 };
 
 /// DNS health probe query: one A question for google.com with a random

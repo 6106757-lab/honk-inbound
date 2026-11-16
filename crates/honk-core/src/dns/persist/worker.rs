@@ -36,6 +36,10 @@ mod restore {
                 counters.stale.fetch_add(1, Ordering::Relaxed);
             }
             Ok(entry) => {
+                if !is_restorable(&entry.response) {
+                    counters.skipped_empty.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
                 let remaining = entry.expire_at_unix.saturating_sub(now);
                 let Ok(ttl) = u32::try_from(remaining) else {
                     counters.corrupt.fetch_add(1, Ordering::Relaxed);
@@ -66,6 +70,33 @@ mod restore {
             tracing::warn!(%error, "DNS persistence restore query failed");
         }
         restored
+    }
+
+    /// Whether a persisted response is a normal resolution worth restoring:
+    /// a NOERROR answer that carries an address of the queried family (an A
+    /// query needs IPv4, an AAAA query needs IPv6), or any answer records at
+    /// all for other query types. Rows written by older versions may hold
+    /// empty answers; they are skipped, not deleted.
+    fn is_restorable(response: &[u8]) -> bool {
+        let Some((_, qtype)) = crate::dns::forwarder::parse_dns_question(response) else {
+            return false;
+        };
+        if response.get(3).copied().unwrap_or_default() & 0x0f != 0 {
+            return false;
+        }
+        if response.get(6..8) == Some(&[0, 0]) {
+            return false;
+        }
+        match qtype {
+            1 | 28 => crate::dns::forwarder::extract_answer_ips(response)
+                .iter()
+                .any(|ip| match qtype {
+                    1 => ip.is_ipv4(),
+                    28 => ip.is_ipv6(),
+                    _ => unreachable!(),
+                }),
+            _ => true,
+        }
     }
 }
 

@@ -38,26 +38,16 @@ pub(super) fn bench_typed_key_build(c: &mut Criterion) {
 pub(super) fn bench_warmed_forwarder_hits(c: &mut Criterion) {
     let runtime = Runtime::new().expect("benchmark runtime");
     let positive_pool = Arc::new(fixtures::LoopbackPool::immediate());
-    let negative_pool = Arc::new(fixtures::LoopbackPool::nxdomain());
     let positive = fixtures::forwarder(Arc::clone(&positive_pool), true);
-    let negative = fixtures::forwarder(Arc::clone(&negative_pool), true);
     let positive_query = build_dns_query("positive.example", 1);
-    let negative_query = build_dns_query("negative.example", 1);
     runtime.block_on(async {
         positive
             .resolve_outcome(&positive_query)
             .await
             .expect("warm positive");
-        negative
-            .resolve_outcome(&negative_query)
-            .await
-            .expect("warm negative");
     });
 
-    for (label, forwarder, query) in [
-        ("POSITIVE", Arc::clone(&positive), positive_query.as_slice()),
-        ("NXDOMAIN", Arc::clone(&negative), negative_query.as_slice()),
-    ] {
+    for (label, forwarder, query) in [("POSITIVE", Arc::clone(&positive), positive_query.as_slice())] {
         let region = Region::new(GLOBAL);
         runtime.block_on(async {
             for _ in 0..1_000 {
@@ -88,26 +78,11 @@ pub(super) fn bench_warmed_forwarder_hits(c: &mut Criterion) {
             );
         });
     });
-    group.bench_function("nxdomain_hit", |b| {
-        b.to_async(&runtime).iter(|| async {
-            black_box(
-                negative
-                    .resolve_outcome(black_box(&negative_query))
-                    .await
-                    .expect("negative hit"),
-            );
-        });
-    });
     group.finish();
     assert_eq!(
         positive_pool.calls(),
         1,
         "positive workload must stay cached"
-    );
-    assert_eq!(
-        negative_pool.calls(),
-        1,
-        "NXDOMAIN workload must stay cached"
     );
 }
 
