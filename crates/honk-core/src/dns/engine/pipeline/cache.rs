@@ -6,8 +6,7 @@ use super::super::effective_expiry;
 use super::ExecutionContext;
 use crate::dns::cache::{CacheKey, ExactLookup, OperationKind};
 use crate::dns::forwarder::{
-    CacheAccess, DnsForwardError, ResolveMode, extract_min_ttl_including_zero,
-    rewrite_answer_ttls,
+    CacheAccess, DnsForwardError, ResolveMode, extract_min_ttl_including_zero, rewrite_answer_ttls,
 };
 use crate::dns::outcome::{DnsOutcome, EffectiveExpiry, OutcomeStatus, Provenance, ResponseClass};
 #[cfg(feature = "native-api")]
@@ -166,14 +165,5 @@ fn is_cacheable_resolution(qtype: u16, wire: &[u8], class: ResponseClass) -> boo
     if wire.get(3).copied().unwrap_or_default() & 0x0f != 0 {
         return false;
     }
-    match qtype {
-        1 | 28 => crate::dns::forwarder::extract_answer_ips(wire)
-            .iter()
-            .any(|ip| match qtype {
-                1 => ip.is_ipv4(),
-                28 => ip.is_ipv6(),
-                _ => unreachable!(),
-            }),
-        _ => true,
-    }
+    crate::dns::forwarder::answer_has_family_address(qtype, wire)
 }

@@ -87,16 +87,7 @@ mod restore {
         if response.get(6..8) == Some(&[0, 0]) {
             return false;
         }
-        match qtype {
-            1 | 28 => crate::dns::forwarder::extract_answer_ips(response)
-                .iter()
-                .any(|ip| match qtype {
-                    1 => ip.is_ipv4(),
-                    28 => ip.is_ipv6(),
-                    _ => unreachable!(),
-                }),
-            _ => true,
-        }
+        crate::dns::forwarder::answer_has_family_address(qtype, response)
     }
 }
 

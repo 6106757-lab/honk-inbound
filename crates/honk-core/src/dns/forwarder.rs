@@ -469,6 +469,23 @@ mod message {
     pub fn extract_answer_ips(data: &[u8]) -> Vec<IpAddr> {
         crate::dns::wire::extract_ips_from_dns_response(data)
     }
+
+    /// Whether a non-empty answer carries an address of the family an A or
+    /// AAAA query asks for. Other query types always pass: callers only
+    /// invoke this for answers already known to be non-empty (a `Positive`
+    /// response, or `ANCOUNT > 0`), so a CNAME-only answer to an address
+    /// query is the only thing filtered here. Shared by the live cache gate
+    /// and the persistence restore filter so the two cannot drift apart.
+    pub fn answer_has_family_address(qtype: u16, data: &[u8]) -> bool {
+        match qtype {
+            1 | 28 => extract_answer_ips(data).iter().any(|ip| match qtype {
+                1 => ip.is_ipv4(),
+                28 => ip.is_ipv6(),
+                _ => unreachable!(),
+            }),
+            _ => true,
+        }
+    }
 }
 mod prefetch;
 mod resolution;
@@ -688,7 +705,9 @@ mod ttl;
 
 #[cfg(test)]
 use message::new_asis_socket_with_mark;
-pub use message::{build_dns_query, extract_answer_ips, parse_dns_question};
+pub use message::{
+    answer_has_family_address, build_dns_query, extract_answer_ips, parse_dns_question,
+};
 pub(crate) use response::{is_filtered_qtype, make_empty_response};
 pub(crate) use ttl::{
     extract_min_ttl, extract_min_ttl_including_zero, rewrite_answer_ttls, traversal_strings,
