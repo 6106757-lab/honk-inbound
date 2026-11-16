@@ -15,7 +15,7 @@ use super::http3;
 use super::tunnel::MasqueTunnel;
 use super::warp::WarpIdentity;
 use crate::proxy::AsyncReadWrite;
-use crate::proxy::detour::{DetourPath, resolve_endpoint};
+use crate::proxy::detour::{DetourPath, resolve_endpoints};
 use crate::proxy::transport::endpoint_address;
 
 /// Default tunnel MTU. IPv6 requires >= 1280 and every MASQUE endpoint we
@@ -67,7 +67,7 @@ async fn open_quic(
         .masque()
         .ok_or_else(|| anyhow::anyhow!("masque node {} has no masque config", node.name))?;
     let address = endpoint_address(node);
-    let endpoint = resolve_endpoint(&address).await?;
+    let endpoints = resolve_endpoints(&address).await?;
     let mtu = config.mtu.map(u32::from).unwrap_or(DEFAULT_MTU);
     let tun_name = tun_name(node, slot);
     let preferred = tunnel_addresses(node);
@@ -77,7 +77,7 @@ async fn open_quic(
     );
     http3::open_h3(
         node,
-        endpoint,
+        &endpoints,
         connect_timeout,
         mtu,
         &tun_name,
@@ -108,16 +108,17 @@ async fn open_h2(
     // `dialer-proxy`; `ensure_bound` only guards the unbound case.
     let tcp = match detour {
         Some(dialer) => {
-            let endpoint = resolve_endpoint(&address).await?;
-            dialer
-                .connect(endpoint, connect_timeout)
+            let endpoints = resolve_endpoints(&address).await?;
+            let (stream, _) = dialer
+                .connect_raced(&endpoints, connect_timeout)
                 .await
                 .map_err(|error| {
                     anyhow::anyhow!(
                         "masque node {}: detour could not reach {address}: {error}",
                         node.name
                     )
-                })?
+                })?;
+            stream
         }
         None => Box::new(crate::util::connect_outbound(&address, connect_timeout).await?)
             as Box<dyn AsyncReadWrite>,

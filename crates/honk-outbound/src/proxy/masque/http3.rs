@@ -74,12 +74,13 @@ const CONNECT_FLOW_ID: u64 = 0;
 
 /// Open a WARP connect-ip tunnel over HTTP/3.
 ///
-/// `endpoint` is already resolved by the caller. On a detour, QUIC rides the
-/// framed UDP transport the front node hands back, adapted into a quinn
-/// endpoint; without one it binds a socket of its own as before.
+/// `endpoints` are already resolved by the caller, in answer order; the QUIC
+/// connection is raced across them. On a detour, QUIC rides the framed UDP
+/// transport the front node hands back, adapted into a quinn endpoint;
+/// without one it binds a socket of its own as before.
 pub async fn open_h3(
     node: &Node,
-    endpoint: SocketAddr,
+    endpoints: &[SocketAddr],
     connect_timeout: Duration,
     mtu: u32,
     tun_name: &str,
@@ -106,84 +107,17 @@ pub async fn open_h3(
     let (alive, shutdown, shutdown_signal) = MasqueTunnel::liveness();
     let tun_label = tun_name.to_string();
 
-    let client = build_client_config(node, detour.is_some())?;
-    // A detour cannot give us a real UDP socket, but it can give us a framed
-    // UDP transport pinned to the WARP endpoint.
-    // `packet_transport_endpoint_with_mtu` adapts that into a quinn
-    // `AsyncUdpSocket`, so the QUIC handshake below is the same on both paths.
-    let (quinn_endpoint, packet_endpoint) = match detour {
-        Some(path) => {
-            let transport = path
-                .connect_udp(endpoint, Some(node.host()), connect_timeout)
-                .await
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "masque node {}: {}: {error}",
-                        node.name,
-                        crate::proxy::detour::udp_carry_context(endpoint)
-                    )
-                })?;
-            let packet = Arc::new(
-                crate::quic::packet_transport_endpoint_with_mtu(
-                    transport,
-                    endpoint,
-                    MAX_UDP_PAYLOAD_SIZE,
-                )
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "masque node {}: {}: {error}",
-                        node.name,
-                        crate::proxy::detour::quic_endpoint_context(endpoint)
-                    )
-                })?,
-            );
-            (packet.endpoint().clone(), Some(packet))
-        }
-        None => (
-            crate::quic::client_endpoint_with_mtu(endpoint.is_ipv6(), MAX_UDP_PAYLOAD_SIZE)?,
-            None,
-        ),
-    };
     let sni = config
         .tls
         .sni
         .clone()
         .unwrap_or_else(|| DEFAULT_SNI.to_string());
-    let connecting = quinn_endpoint
-        .connect_with(client, endpoint, &sni)
-        .map_err(|error| anyhow::anyhow!("masque node {}: QUIC connect failed: {error}", node.name))?;
-    // quinn only ever reports a generic timeout / endpoint stopping here, but
-    // the adapter workers know the datagram-level cause (send queue closed,
-    // transport rejection, receive error). Surface it while the packet
-    // endpoint is still alive, otherwise every fronted failure looks alike.
-    let connection = match tokio::time::timeout(connect_timeout, connecting).await {
-        Ok(Ok(connection)) => connection,
-        Ok(Err(error)) => {
-            let cause = packet_endpoint
-                .as_ref()
-                .and_then(|packet| packet.terminal_error())
-                .map(|cause| format!("; transport error: {cause}"))
-                .unwrap_or_default();
-            anyhow::bail!(
-                "masque node {}: QUIC handshake to {endpoint} failed: {error}{cause}",
-                node.name
-            );
-        }
-        Err(_) => {
-            let cause = packet_endpoint
-                .as_ref()
-                .and_then(|packet| packet.terminal_error())
-                .map(|cause| format!("; transport error: {cause}"))
-                .unwrap_or_default();
-            anyhow::bail!(
-                "masque node {}: QUIC handshake to {endpoint} timed out after {connect_timeout:?}{cause}",
-                node.name
-            );
-        }
-    };
-    tracing::debug!(
-        "masque: QUIC to {endpoint} established (sni {sni}) on {tun_name}"
-    );
+    let (established, endpoint) =
+        race_quic_connection(node, endpoints, &sni, connect_timeout, detour).await?;
+    let connection = established.connection;
+    let quinn_endpoint = established.endpoint;
+    let packet_endpoint = established.packet;
+    tracing::debug!("masque: QUIC to {endpoint} established (sni {sni}) on {tun_name}");
 
     // WARP's edge does not advertise SETTINGS_ENABLE_CONNECT_PROTOCOL, so the
     // client has to enable both settings itself and not gate on the peer's.
@@ -194,7 +128,10 @@ pub async fn open_h3(
         .build(H3QuinnConnection::new(connection.clone()))
         .await
         .map_err(|error| {
-            anyhow::anyhow!("masque node {}: HTTP/3 handshake failed: {error}", node.name)
+            anyhow::anyhow!(
+                "masque node {}: HTTP/3 handshake failed: {error}",
+                node.name
+            )
         })?;
 
     let mut request = http::Request::builder()
@@ -206,10 +143,16 @@ pub async fn open_h3(
     // h3 reads the `:protocol` pseudo-header from the request's extensions.
     request.extensions_mut().insert(WARP_PROTOCOL);
     let mut request_stream = sender.send_request(request).await.map_err(|error| {
-        anyhow::anyhow!("masque node {}: CONNECT-IP request failed: {error}", node.name)
+        anyhow::anyhow!(
+            "masque node {}: CONNECT-IP request failed: {error}",
+            node.name
+        )
     })?;
     let response = request_stream.recv_response().await.map_err(|error| {
-        anyhow::anyhow!("masque node {}: CONNECT-IP response failed: {error}", node.name)
+        anyhow::anyhow!(
+            "masque node {}: CONNECT-IP response failed: {error}",
+            node.name
+        )
     })?;
     let status = response.status();
     tracing::debug!("masque: connect-ip on {tun_name} answered {status} over h3");
@@ -263,10 +206,7 @@ pub async fn open_h3(
                                 std::sync::atomic::AtomicU64::new(0);
                             let drops = SEND_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
                             if drops <= 3 || drops % 1000 == 0 {
-                                tracing::warn!(
-                                    drops,
-                                    "masque h3 dropped an oversized IP datagram"
-                                );
+                                tracing::warn!(drops, "masque h3 dropped an oversized IP datagram");
                             }
                             continue;
                         }
@@ -370,6 +310,124 @@ pub async fn open_h3(
 
 /// Assemble the QUIC TLS config WARP expects: ALPN `h3`, the device client
 /// certificate, and a public-key pin instead of PKI verification.
+/// A QUIC connection to one WARP endpoint, plus the endpoint owners that
+/// must outlive the tunnel built on it: dropping the quinn endpoint closes
+/// the connection, and dropping the packet endpoint stops the adapter
+/// workers that move datagrams through the detour.
+struct EstablishedQuic {
+    connection: quinn::Connection,
+    endpoint: quinn::Endpoint,
+    packet: Option<Arc<crate::quic::PacketTransportEndpoint>>,
+}
+
+/// Establish the QUIC connection to the first of `endpoints` that answers,
+/// racing them the way a direct dial races resolved addresses. The handshake
+/// is the raced step: the TUN device and the h3 CONNECT are built once, on
+/// the winner, so a losing attempt can never create a second device under
+/// the same tunnel name.
+async fn race_quic_connection(
+    node: &Node,
+    endpoints: &[SocketAddr],
+    sni: &str,
+    connect_timeout: Duration,
+    detour: Option<&crate::proxy::detour::DetourPath>,
+) -> anyhow::Result<(EstablishedQuic, SocketAddr)> {
+    crate::address_race::race_resolved_addrs(endpoints, |endpoint| async move {
+        let established = quic_connection_to(node, endpoint, sni, connect_timeout, detour).await?;
+        Ok((established, endpoint))
+    })
+    .await
+    .ok_or_else(|| anyhow::anyhow!("masque node {}: no resolved address to dial", node.name))?
+}
+
+/// One QUIC handshake to one endpoint: the transport (a detour's framed UDP
+/// transport, or a socket of our own), adapted into a quinn endpoint, then
+/// the handshake itself with the same timeout a direct QUIC dial uses.
+async fn quic_connection_to(
+    node: &Node,
+    endpoint: SocketAddr,
+    sni: &str,
+    connect_timeout: Duration,
+    detour: Option<&crate::proxy::detour::DetourPath>,
+) -> anyhow::Result<EstablishedQuic> {
+    let client = build_client_config(node, detour.is_some())?;
+    // A detour cannot give us a real UDP socket, but it can give us a framed
+    // UDP transport pinned to the WARP endpoint.
+    // `packet_transport_endpoint_with_mtu` adapts that into a quinn
+    // `AsyncUdpSocket`, so the QUIC handshake below is the same on both paths.
+    let (quinn_endpoint, packet_endpoint) = match detour {
+        Some(path) => {
+            let transport = path
+                .connect_udp(endpoint, Some(node.host()), connect_timeout)
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "masque node {}: {}: {error}",
+                        node.name,
+                        crate::proxy::detour::udp_carry_context(endpoint)
+                    )
+                })?;
+            let packet = Arc::new(
+                crate::quic::packet_transport_endpoint_with_mtu(
+                    transport,
+                    endpoint,
+                    MAX_UDP_PAYLOAD_SIZE,
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "masque node {}: {}: {error}",
+                        node.name,
+                        crate::proxy::detour::quic_endpoint_context(endpoint)
+                    )
+                })?,
+            );
+            (packet.endpoint().clone(), Some(packet))
+        }
+        None => (
+            crate::quic::client_endpoint_with_mtu(endpoint.is_ipv6(), MAX_UDP_PAYLOAD_SIZE)?,
+            None,
+        ),
+    };
+    let connecting = quinn_endpoint
+        .connect_with(client, endpoint, sni)
+        .map_err(|error| {
+            anyhow::anyhow!("masque node {}: QUIC connect failed: {error}", node.name)
+        })?;
+    // quinn only ever reports a generic timeout / endpoint stopping here, but
+    // the adapter workers know the datagram-level cause (send queue closed,
+    // transport rejection, receive error). Surface it while the packet
+    // endpoint is still alive, otherwise every fronted failure looks alike.
+    match tokio::time::timeout(connect_timeout, connecting).await {
+        Ok(Ok(connection)) => Ok(EstablishedQuic {
+            connection,
+            endpoint: quinn_endpoint,
+            packet: packet_endpoint,
+        }),
+        Ok(Err(error)) => {
+            let cause = packet_endpoint
+                .as_ref()
+                .and_then(|packet| packet.terminal_error())
+                .map(|cause| format!("; transport error: {cause}"))
+                .unwrap_or_default();
+            anyhow::bail!(
+                "masque node {}: QUIC handshake to {endpoint} failed: {error}{cause}",
+                node.name
+            );
+        }
+        Err(_) => {
+            let cause = packet_endpoint
+                .as_ref()
+                .and_then(|packet| packet.terminal_error())
+                .map(|cause| format!("; transport error: {cause}"))
+                .unwrap_or_default();
+            anyhow::bail!(
+                "masque node {}: QUIC handshake to {endpoint} timed out after {connect_timeout:?}{cause}",
+                node.name
+            );
+        }
+    }
+}
+
 fn build_client_config(node: &Node, fronted: bool) -> anyhow::Result<ClientConfig> {
     let config = node
         .masque()
@@ -384,7 +442,10 @@ fn build_client_config(node: &Node, fronted: bool) -> anyhow::Result<ClientConfi
     let device = PKey::private_key_from_der(&warp::decode_base64(private_key, "private-key")?)?;
     let certificate = warp::self_signed(&device)?;
     let pinned = match config.endpoint_public_key.as_deref() {
-        Some(key) => Some(PKey::public_key_from_der(&warp::decode_base64(key, "public-key")?)?),
+        Some(key) => Some(PKey::public_key_from_der(&warp::decode_base64(
+            key,
+            "public-key",
+        )?)?),
         None => {
             tracing::warn!(
                 "masque node {}: no public-key, so the QUIC endpoint is not pinned",

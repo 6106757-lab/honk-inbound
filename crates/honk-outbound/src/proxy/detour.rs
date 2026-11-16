@@ -76,7 +76,7 @@ fn peek_carrier(manager: &GroupManager, name: &str, domain: ProbeDomain) -> Opti
         .map(|node| node.id)
 }
 
-/// Resolve a `host:port` pair to an address a detour can dial.
+/// Resolve a `host:port` pair to every address a detour can dial, in answer order.
 ///
 /// The detour is dialled by address, so the name has to be resolved here
 /// rather than inside the detour node: only this end knows which host the
@@ -86,7 +86,11 @@ fn peek_carrier(manager: &GroupManager, name: &str, domain: ProbeDomain) -> Opti
 /// direct server dial takes (`connect_marked`): libc NSS resolution is
 /// deliberately not used anywhere in the control plane, and a detoured
 /// node's hostname must not resolve differently from an undetoured one.
-pub async fn resolve_endpoint(address: &str) -> anyhow::Result<SocketAddr> {
+///
+/// Every address comes back so the caller can race them the way a direct dial
+/// does: betting the whole dial on the first answer strands the node when
+/// that one address is dead while a later one answers.
+pub async fn resolve_endpoints(address: &str) -> anyhow::Result<Vec<SocketAddr>> {
     let (host, port) = address
         .rsplit_once(':')
         .ok_or_else(|| anyhow::anyhow!("endpoint {address} is not a host:port pair"))?;
@@ -98,12 +102,14 @@ pub async fn resolve_endpoint(address: &str) -> anyhow::Result<SocketAddr> {
     // compiler computes nested future layouts (same trick `connect_marked`
     // uses for its flow-observed resolution).
     let resolution = Box::pin(crate::bootstrap::resolve(host));
-    let ip = resolution
-        .await?
+    let ips = resolution.await?;
+    if ips.is_empty() {
+        anyhow::bail!("endpoint {address} resolved to nothing");
+    }
+    Ok(ips
         .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("endpoint {address} resolved to nothing"))?;
-    Ok(SocketAddr::new(ip, port))
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect())
 }
 
 /// What the operator named: one node, or a group that picks one.
@@ -262,6 +268,28 @@ impl DetourPath {
         Ok(stream.stream)
     }
 
+    /// Open a stream through the detour to the first of `endpoints` that
+    /// answers, racing them the way a direct dial races resolved addresses.
+    /// The winning address comes back with the stream: a caller that has to
+    /// re-dial the same peer (REALITY) must reuse it, not resolve again and
+    /// risk landing on a different first answer.
+    pub(crate) async fn connect_raced(
+        &self,
+        endpoints: &[SocketAddr],
+        timeout: Duration,
+    ) -> anyhow::Result<(Box<dyn AsyncReadWrite>, SocketAddr)> {
+        crate::address_race::race_resolved_addrs(endpoints, |endpoint| {
+            let this = self;
+            async move {
+                this.connect(endpoint, timeout)
+                    .await
+                    .map(|stream| (stream, endpoint))
+            }
+        })
+        .await
+        .ok_or_else(|| anyhow::anyhow!("no resolved address to dial"))?
+    }
+
     /// Open a framed UDP transport to `target` through the detour node.
     pub async fn connect_udp(
         &self,
@@ -302,9 +330,9 @@ pub(crate) async fn connect_server(
             crate::util::connect_outbound(&address, connect_timeout).await?,
         ));
     };
-    let endpoint = resolve_endpoint(&address).await?;
-    let stream = path
-        .connect(endpoint, connect_timeout)
+    let endpoints = resolve_endpoints(&address).await?;
+    let (stream, _) = path
+        .connect_raced(&endpoints, connect_timeout)
         .await
         .map_err(|error| {
             anyhow::anyhow!(
@@ -526,6 +554,32 @@ mod tests {
     /// name `direct`, the builtin id, no host or address.
     fn direct_node() -> Node {
         honk_config::config::Config::builtin_direct_node()
+    }
+
+    /// Resolution returns every address in answer order: the dial race needs
+    /// the whole set, not just the first answer.
+    #[tokio::test]
+    async fn resolve_endpoints_returns_every_address_in_answer_order() {
+        if crate::bootstrap::run_global_test_in_child(
+            "proxy::detour::tests::resolve_endpoints_returns_every_address_in_answer_order",
+        ) {
+            return;
+        }
+        let dead = Ipv4Addr::new(127, 0, 0, 2);
+        let live = Ipv4Addr::new(127, 0, 0, 1);
+        let stub = spawn_tcp_dns_stub(dead, live).await;
+        crate::bootstrap::set_global(crate::bootstrap::BootstrapResolver::parse(&format!(
+            "tcp://{stub}"
+        )));
+        let endpoints = resolve_endpoints("back.invalid:8443").await.unwrap();
+        crate::bootstrap::set_global(None);
+        assert_eq!(
+            endpoints,
+            vec![
+                SocketAddr::new(dead.into(), 8443),
+                SocketAddr::new(live.into(), 8443),
+            ]
+        );
     }
 
     /// A detour dial must reach a server whose first resolved address refuses
