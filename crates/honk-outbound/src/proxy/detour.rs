@@ -318,6 +318,7 @@ pub(crate) async fn connect_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
 
     fn node_named(name: &str) -> Node {
         Node {
@@ -450,5 +451,132 @@ mod tests {
             .set_selector_choice("fronts", "front-b", crate::group::SelectorNetworks::Both)
             .unwrap();
         assert_eq!(path.carrier_signature().tcp, Some(second));
+    }
+
+    /// Fake DNS wire reply: echo the query, answer with `ips` in the queried family.
+    fn fake_dns_response(query: &[u8], ips: &[IpAddr]) -> Vec<u8> {
+        let qtype = u16::from_be_bytes([query[query.len() - 4], query[query.len() - 3]]);
+        let mut resp = query.to_vec();
+        resp[2] = 0x81;
+        resp[3] = 0x80;
+        let mut count = 0u16;
+        for ip in ips {
+            let rdata = match (qtype, ip) {
+                (1, IpAddr::V4(ip)) => ip.octets().to_vec(),
+                (28, IpAddr::V6(ip)) => ip.octets().to_vec(),
+                _ => continue,
+            };
+            resp.extend_from_slice(&[0xC0, 0x0C]);
+            resp.extend_from_slice(&qtype.to_be_bytes());
+            resp.extend_from_slice(&1u16.to_be_bytes());
+            resp.extend_from_slice(&60u32.to_be_bytes());
+            resp.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+            resp.extend_from_slice(&rdata);
+            count += 1;
+        }
+        resp[6..8].copy_from_slice(&count.to_be_bytes());
+        resp
+    }
+
+    /// Loopback TCP DNS stub: A answers `[dead, live]` in that order, AAAA
+    /// answers nothing. UDP is unusable in this sandbox, so the stub speaks
+    /// DNS over TCP (length-prefixed messages).
+    async fn spawn_tcp_dns_stub(dead: Ipv4Addr, live: Ipv4Addr) -> SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    loop {
+                        let mut len_buf = [0u8; 2];
+                        if stream.read_exact(&mut len_buf).await.is_err() {
+                            break;
+                        }
+                        let len = u16::from_be_bytes(len_buf) as usize;
+                        let mut query = vec![0u8; len];
+                        if stream.read_exact(&mut query).await.is_err() {
+                            break;
+                        }
+                        let reply =
+                            fake_dns_response(&query, &[IpAddr::V4(dead), IpAddr::V4(live)]);
+                        if stream
+                            .write_all(&(reply.len() as u16).to_be_bytes())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        if stream.write_all(&reply).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// The builtin direct node is the only Direct node the config accepts:
+    /// name `direct`, the builtin id, no host or address.
+    fn direct_node() -> Node {
+        honk_config::config::Config::builtin_direct_node()
+    }
+
+    /// A detour dial must reach a server whose first resolved address refuses
+    /// the connection: the dial races every resolved address the way a direct
+    /// dial does, instead of betting the whole dial on the first one.
+    #[tokio::test]
+    async fn detour_dial_races_resolved_addresses() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        if crate::bootstrap::run_global_test_in_child(
+            "proxy::detour::tests::detour_dial_races_resolved_addresses",
+        ) {
+            return;
+        }
+        let dead = Ipv4Addr::new(127, 0, 0, 2);
+        let live = Ipv4Addr::new(127, 0, 0, 1);
+        let stub = spawn_tcp_dns_stub(dead, live).await;
+        crate::bootstrap::set_global(crate::bootstrap::BootstrapResolver::parse(&format!(
+            "tcp://{stub}"
+        )));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4];
+            stream.read_exact(&mut buf).await.unwrap();
+            buf
+        });
+
+        let front = direct_node();
+        let generation =
+            Arc::new(OutboundRuntimeRegistry::build(std::slice::from_ref(&front)).unwrap());
+        let path = DetourPath::new(
+            Arc::new(ProxyRegistry::default_resolver().unwrap()),
+            Arc::clone(&generation),
+            front.id,
+        );
+        let mut back = node_named("back");
+        back.host = "back.invalid".to_string();
+        back.address = format!("back.invalid:{port}");
+        back.port = port;
+        back.detour = Some("direct".into());
+        back.id = back.derive_id();
+
+        let dialed = connect_server(&back, Some(&path), Duration::from_secs(5)).await;
+        crate::bootstrap::set_global(None);
+        let mut carrier = dialed
+            .expect("detour dial reaches the live address although the first resolved one refuses");
+        carrier.write_all(b"ping").await.unwrap();
+        assert_eq!(accepted.await.unwrap(), *b"ping");
     }
 }
