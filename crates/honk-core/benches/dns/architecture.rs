@@ -47,7 +47,9 @@ pub(super) fn bench_warmed_forwarder_hits(c: &mut Criterion) {
             .expect("warm positive");
     });
 
-    for (label, forwarder, query) in [("POSITIVE", Arc::clone(&positive), positive_query.as_slice())] {
+    for (label, forwarder, query) in
+        [("POSITIVE", Arc::clone(&positive), positive_query.as_slice())]
+    {
         let region = Region::new(GLOBAL);
         runtime.block_on(async {
             for _ in 0..1_000 {

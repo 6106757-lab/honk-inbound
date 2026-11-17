@@ -41,7 +41,7 @@ pub mod warp;
 ///
 /// Re-exported so the boot path can record the setting once, before any
 /// tunnel opens; the value is then read on every tunnel open.
-pub use device::{set_masque_tunnel_backend, TunnelBackend};
+pub use device::{TunnelBackend, set_masque_tunnel_backend};
 
 use async_trait::async_trait;
 use honk_config::node::Node;
@@ -299,13 +299,16 @@ impl TcpOutbound for MasqueHandler {
     ) -> anyhow::Result<ProxyStream> {
         let masque = masque_runtime(runtime.as_ref())?;
         let tunnel = masque.tunnel(runtime.as_ref(), connect_timeout).await?;
-        let stream = tunnel.dial(target, connect_timeout).await.map_err(|error| {
-            anyhow::anyhow!(
-                "masque node {} cannot reach {target} through {}: {error}",
-                runtime.node.name,
-                tunnel.label()
-            )
-        })?;
+        let stream = tunnel
+            .dial(target, connect_timeout)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "masque node {} cannot reach {target} through {}: {error}",
+                    runtime.node.name,
+                    tunnel.label()
+                )
+            })?;
         crate::runtime::flow_observation::milestone(
             crate::runtime::flow_observation::Milestone::TransportReady,
         );
@@ -339,13 +342,16 @@ impl TcpOutbound for MasqueHandler {
         let tunnel = masque
             .tunnel_for(runtime.as_ref(), connect_timeout, Some(detour.as_ref()))
             .await?;
-        let stream = tunnel.dial(target, connect_timeout).await.map_err(|error| {
-            anyhow::anyhow!(
-                "masque node {} cannot reach {target} through {}: {error}",
-                runtime.node.name,
-                tunnel.label()
-            )
-        })?;
+        let stream = tunnel
+            .dial(target, connect_timeout)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "masque node {} cannot reach {target} through {}: {error}",
+                    runtime.node.name,
+                    tunnel.label()
+                )
+            })?;
         crate::runtime::flow_observation::milestone(
             crate::runtime::flow_observation::Milestone::TransportReady,
         );

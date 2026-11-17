@@ -368,7 +368,7 @@ async fn packet_transport_socket_is_peer_pinned_and_family_matched() {
             full_cone: false,
             packets: Mutex::new(std::collections::VecDeque::from([
                 (b"wrong".to_vec(), wrong),
-                (vec![0x5a; 65], remote),
+                (b"ok".to_vec(), remote),
             ])),
         }),
         remote,
@@ -392,9 +392,12 @@ async fn packet_transport_socket_is_peer_pinned_and_family_matched() {
     .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
 
+    // The wrong-source datagram is dropped by the receiver worker, never
+    // delivered: surfacing it as an error would kill quinn's endpoint driver.
+    // The next datagram, from the pinned peer, still arrives.
     let mut data = [0u8; 64];
     let mut meta = [quinn::udp::RecvMeta::default()];
-    let error = tokio::time::timeout(
+    let received = tokio::time::timeout(
         Duration::from_secs(1),
         std::future::poll_fn(|cx| {
             let mut bufs = [std::io::IoSliceMut::new(&mut data)];
@@ -403,8 +406,10 @@ async fn packet_transport_socket_is_peer_pinned_and_family_matched() {
     )
     .await
     .unwrap()
-    .unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    .unwrap();
+    assert_eq!(received, 1);
+    assert_eq!(&data[..meta[0].len], b"ok");
+    assert_eq!(meta[0].addr, remote);
 }
 
 #[tokio::test]

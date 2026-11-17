@@ -1,13 +1,12 @@
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use super::{CacheKey, CacheSlot, CacheValue, CachedEntry, DnsCacheService, PublicationEpoch, lock};
+use super::{
+    CacheKey, CacheSlot, CacheValue, CachedEntry, DnsCacheService, PublicationEpoch, lock,
+};
 
 pub(crate) enum ExactLookup {
-    Positive {
-        entry: CachedEntry,
-        revision: u64,
-    },
+    Positive { entry: CachedEntry, revision: u64 },
     Miss,
 }
 

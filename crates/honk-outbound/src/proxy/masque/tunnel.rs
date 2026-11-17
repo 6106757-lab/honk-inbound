@@ -138,9 +138,11 @@ impl MasqueTunnel {
             )
         })?;
         match &self.device {
-            TunnelDevice::Kernel(tun) => bind::connect_via_tun(tun.name(), source, target, connect_timeout)
-                .await
-                .map(|stream| Box::new(stream) as Box<dyn AsyncReadWrite>),
+            TunnelDevice::Kernel(tun) => {
+                bind::connect_via_tun(tun.name(), source, target, connect_timeout)
+                    .await
+                    .map(|stream| Box::new(stream) as Box<dyn AsyncReadWrite>)
+            }
             TunnelDevice::Userspace(device) => {
                 bind::connect_via_userspace(device, source, target, connect_timeout).await
             }

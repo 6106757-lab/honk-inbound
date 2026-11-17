@@ -211,8 +211,7 @@ pub(crate) fn group_detour_for_chain(
     rider: NodeProtocol,
 ) -> Option<Arc<DetourPath>> {
     group_detour(config, proxies, generation, manager, group_name, rider).or_else(|| {
-        owning_group
-            .and_then(|via| group_detour(config, proxies, generation, manager, via, rider))
+        owning_group.and_then(|via| group_detour(config, proxies, generation, manager, via, rider))
     })
 }
 

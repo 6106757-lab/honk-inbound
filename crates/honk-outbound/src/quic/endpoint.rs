@@ -147,9 +147,7 @@ impl quinn::Runtime for OwnedTaskRuntime {
         // endpoint driver and reports `EndpointStopping`, which is far away
         // from the real cause, so make each one observable.
         let Some(tasks) = self.tasks.upgrade() else {
-            tracing::warn!(
-                "quinn driver not spawned: packet endpoint's task owner was dropped"
-            );
+            tracing::warn!("quinn driver not spawned: packet endpoint's task owner was dropped");
             return;
         };
         let (start, started) = tokio::sync::oneshot::channel();

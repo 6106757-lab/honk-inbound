@@ -25,8 +25,8 @@ use std::future::poll_fn;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -89,8 +89,14 @@ struct SmolDevice {
 }
 
 impl Device for SmolDevice {
-    type RxToken<'a> = SmolRxToken where Self: 'a;
-    type TxToken<'a> = SmolTxToken<'a> where Self: 'a;
+    type RxToken<'a>
+        = SmolRxToken
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = SmolTxToken<'a>
+    where
+        Self: 'a;
 
     fn receive(&mut self, _timestamp: SmolInstant) -> Option<(SmolRxToken, SmolTxToken<'_>)> {
         let packet = self.queues.ingress.lock().unwrap().pop_front()?;
@@ -136,12 +142,7 @@ impl TxToken for SmolTxToken<'_> {
     {
         let mut buffer = vec![0u8; len];
         let result = f(&mut buffer);
-        self.device
-            .queues
-            .egress
-            .lock()
-            .unwrap()
-            .push_back(buffer);
+        self.device.queues.egress.lock().unwrap().push_back(buffer);
         self.device.queues.carrier_recv_notify.notify_one();
         result
     }

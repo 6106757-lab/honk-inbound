@@ -17,9 +17,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 
+use super::userspace::UserspaceDevice;
 use crate::proxy::AsyncReadWrite;
 use crate::proxy::PacketTransport;
-use super::userspace::UserspaceDevice;
 
 /// Open a TCP connection whose packets leave through `tun` using `source` as
 /// the source address.
@@ -130,14 +130,15 @@ pub async fn connect_via_userspace(
             "masque tunnel source and target address families differ",
         ));
     }
-    let connection = device.tcp_connect(source, target, connect_timeout).await.map_err(
-        |error| {
+    let connection = device
+        .tcp_connect(source, target, connect_timeout)
+        .await
+        .map_err(|error| {
             io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 format!("masque userspace connect to {target} failed: {error}"),
             )
-        },
-    )?;
+        })?;
     Ok(Box::new(connection) as Box<dyn AsyncReadWrite>)
 }
 
@@ -155,13 +156,14 @@ pub async fn udp_via_userspace(
             "masque tunnel source and target address families differ",
         ));
     }
-    let socket = device.udp_bind(source, target, connect_timeout).await.map_err(
-        |error| {
+    let socket = device
+        .udp_bind(source, target, connect_timeout)
+        .await
+        .map_err(|error| {
             io::Error::new(
                 io::ErrorKind::AddrInUse,
                 format!("masque userspace udp bind for {target} failed: {error}"),
             )
-        },
-    )?;
+        })?;
     Ok(Arc::new(socket) as Arc<dyn PacketTransport>)
 }
