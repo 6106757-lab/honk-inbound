@@ -78,6 +78,7 @@ const CONNECT_FLOW_ID: u64 = 0;
 /// connection is raced across them. On a detour, QUIC rides the framed UDP
 /// transport the front node hands back, adapted into a quinn endpoint;
 /// without one it binds a socket of its own as before.
+#[allow(clippy::too_many_arguments)]
 pub async fn open_h3(
     node: &Node,
     endpoints: &[SocketAddr],
@@ -205,7 +206,7 @@ pub async fn open_h3(
                             static SEND_DROPS: std::sync::atomic::AtomicU64 =
                                 std::sync::atomic::AtomicU64::new(0);
                             let drops = SEND_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
-                            if drops <= 3 || drops % 1000 == 0 {
+                            if drops <= 3 || drops.is_multiple_of(1000) {
                                 tracing::warn!(drops, "masque h3 dropped an oversized IP datagram");
                             }
                             continue;

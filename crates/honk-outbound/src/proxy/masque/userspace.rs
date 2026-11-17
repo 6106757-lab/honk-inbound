@@ -244,15 +244,15 @@ impl UserspaceDevice {
         // which is what lets socket egress proceed without an ARP cache.
         {
             let routes = iface.routes_mut();
-            if let Some(gateway) = addresses.iter().find(|a| a.is_ipv4()).copied() {
-                if let IpAddress::Ipv4(gw) = IpAddress::from(gateway) {
-                    let _ = routes.add_default_ipv4_route(gw);
-                }
+            if let Some(gateway) = addresses.iter().find(|a| a.is_ipv4()).copied()
+                && let IpAddress::Ipv4(gw) = IpAddress::from(gateway)
+            {
+                let _ = routes.add_default_ipv4_route(gw);
             }
-            if let Some(gateway) = addresses.iter().find(|a| a.is_ipv6()).copied() {
-                if let IpAddress::Ipv6(gw) = IpAddress::from(gateway) {
-                    let _ = routes.add_default_ipv6_route(gw);
-                }
+            if let Some(gateway) = addresses.iter().find(|a| a.is_ipv6()).copied()
+                && let IpAddress::Ipv6(gw) = IpAddress::from(gateway)
+            {
+                let _ = routes.add_default_ipv6_route(gw);
             }
         }
 

@@ -273,7 +273,7 @@ impl TransportQuinnSocket {
                             std::sync::atomic::AtomicU64::new(0);
                         let filtered =
                             FILTERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                        if filtered <= 3 || filtered % 1000 == 0 {
+                        if filtered <= 3 || filtered.is_multiple_of(1000) {
                             tracing::warn!(
                                 source = %source,
                                 expected = %remote,
@@ -317,7 +317,7 @@ impl TransportQuinnSocket {
                                 std::sync::atomic::AtomicU64::new(0);
                             let dropped =
                                 DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                            if dropped <= 3 || dropped % 1000 == 0 {
+                            if dropped <= 3 || dropped.is_multiple_of(1000) {
                                 tracing::warn!(
                                     dropped,
                                     "QUIC adapter receive queue full: dropping datagram"
@@ -548,7 +548,7 @@ impl quinn::AsyncUdpSocket for TransportQuinnSocket {
                             std::sync::atomic::AtomicU64::new(0);
                         let dropped =
                             OVERSIZED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                        if dropped <= 3 || dropped % 1000 == 0 {
+                        if dropped <= 3 || dropped.is_multiple_of(1000) {
                             tracing::warn!(
                                 datagram_len = data.len(),
                                 buffer_len = buf.len(),

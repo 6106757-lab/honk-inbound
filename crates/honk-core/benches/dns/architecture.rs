@@ -47,26 +47,23 @@ pub(super) fn bench_warmed_forwarder_hits(c: &mut Criterion) {
             .expect("warm positive");
     });
 
-    for (label, forwarder, query) in
-        [("POSITIVE", Arc::clone(&positive), positive_query.as_slice())]
-    {
-        let region = Region::new(GLOBAL);
-        runtime.block_on(async {
-            for _ in 0..1_000 {
-                black_box(
-                    forwarder
-                        .resolve_outcome(black_box(query))
-                        .await
-                        .expect("warmed hit"),
-                );
-            }
-        });
-        let allocation = region.change();
-        eprintln!(
-            "DNS_WARMED_{label}_ALLOCATIONS={} DNS_WARMED_{label}_BYTES={}",
-            allocation.allocations, allocation.bytes_allocated
-        );
-    }
+    let (label, forwarder, query) = ("POSITIVE", Arc::clone(&positive), positive_query.as_slice());
+    let region = Region::new(GLOBAL);
+    runtime.block_on(async {
+        for _ in 0..1_000 {
+            black_box(
+                forwarder
+                    .resolve_outcome(black_box(query))
+                    .await
+                    .expect("warmed hit"),
+            );
+        }
+    });
+    let allocation = region.change();
+    eprintln!(
+        "DNS_WARMED_{label}_ALLOCATIONS={} DNS_WARMED_{label}_BYTES={}",
+        allocation.allocations, allocation.bytes_allocated
+    );
 
     let mut group = c.benchmark_group("dns_forwarder_warmed");
     group.throughput(Throughput::Elements(1));
