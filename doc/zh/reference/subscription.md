@@ -292,7 +292,7 @@ VLESS 字段会在派生节点身份前应用：
 | `reality-opts.spider-x` | REALITY spider path；缺失或为空时使用 `/`。 |
 | `ws-opts.path` | WebSocket path；回退到扁平别名 `ws-path`。 |
 | `ws-opts.headers.Host` | WebSocket Host 标头：第一个非空、不区分大小写的 Host 值获胜；字符串保留原字节，有限数字转为文本。无效或空白的 Host 值会被忽略。依次回退到 scalar `ws-headers`、`ws-host`，仅在前面的值都未获胜时才检查。 |
-| `ws-opts.headers.<name>` | 额外的 WebSocket 升级标头，所有支持 WebSocket 的代理共用，按小写名称导入（例如 `User-Agent`）。Null 值忽略，非标量值会丢弃整个条目；保留的握手标头按[节点字段约定](./nodes.md#node-fields)拒绝该条目。 |
+| `ws-opts.headers.<name>` | 额外的 WebSocket 升级标头，所有支持 WebSocket 的代理共用，按小写名称导入（例如 `User-Agent`）。Null 值忽略，非标量值会丢弃整个条目；保留的握手标头按[节点字段约定](./nodes.md#节点字段)拒绝该条目。 |
 | `grpc-opts.grpc-service-name` | gRPC service name；回退到 `grpc-service`。 |
 | `client-fingerprint` | 有意不导入。TLS 指纹由进程级 `global.tls_implementation` 与 `global.utls_imitate` 选择。 |
 
@@ -342,7 +342,7 @@ TLS/SNI、REALITY、WebSocket/gRPC（包括非 `Host` 升级标头）、VLESS �
 
 | 来源特有情况 | 导入行为 |
 | --- | --- |
-| WebSocket `transport.headers` | `Host` 仍是专用字符串字段；重复的 Host 别名拒绝。其他字符串值（含空字符串）保留；null 忽略，其他类型拒绝该条目。名称与值遵循[节点标头约定](./nodes.md#node-fields)。 |
+| WebSocket `transport.headers` | `Host` 仍是专用字符串字段；重复的 Host 别名拒绝。其他字符串值（含空字符串）保留；null 忽略，其他类型拒绝该条目。名称与值遵循[节点标头约定](./nodes.md#节点字段)。 |
 | VLESS 未启用 H2MUX/UoT 封装，且没有显式 `packet_encoding` 选择其他路径 | 使用 Single XUDP 并允许 UDP。这是 sing-box 导入默认值，不是 Auto 的全局含义。 |
 | gRPC 服务名为空或省略 | 保留 sing-box 的空服务名，不使用 honk 的 `GunService` 默认值。 |
 | Hysteria2 提供 `server_ports`，未提供 `server_port` | 以第一个跳跃端口作为名义端点。 |
