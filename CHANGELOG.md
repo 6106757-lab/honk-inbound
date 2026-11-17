@@ -37,6 +37,7 @@ Entries live in [changes/](changes/) until release.
 - Runtime jemalloc options use `_RJEM_MALLOC_CONF`, not `MALLOC_CONF`: the crate prefixes jemalloc symbols and the environment variable with `_rjem_`.
 - Add reloadable `global.shutdown_wait_connections` (default `false`). Set `true` to retain the previous five-second connection grace; mandatory cleanup and native HTTP shutdown are unchanged.
 - The embedded doona UI now comes from this project's own doona fork, so its MASQUE latency-test fix ships with the binary instead of waiting for an upstream release.
+- The embedded doona UI moves to 0.1.0-rc.8, which drops the negative DNS coverage entry now that honk no longer caches negative answers.
 
 ### Fixed
 
@@ -79,6 +80,7 @@ Entries live in [changes/](changes/) until release.
 - A UDP flow reaching a group that names `detour:` now dials through that front instead of the node's own path. The group detour was resolved only on the TCP dial path, so every UDP flow — QUIC/HTTP3, DNS-over-QUIC, UDP associates — silently left through the node's direct connection even while TCP traffic on the same group was chained.
 - MASQUE, Hysteria2, TUIC, Juicity, Trojan and AnyTLS now carry a group's detour on UDP. A detoured flow builds its own tunnel, QUIC client or session instead of borrowing a pooled or shared-source carrier opened over another path, and a MASQUE UDP socket now keeps its tunnel alive so reload pruning cannot delete the device from under a live flow. Protocols that cannot carry a detour refuse the dial rather than quietly going direct.
 - A VLESS node that names `dialer-proxy` now dials through it. The plain stream path ignored the node's own detour and every dial failed with `detour ... is not bound in this generation`; only a group's detour reached a VLESS member.
+- Mask the rule expression, chain and start time in the partial connections view; the tracker fallbacks for those fields now only apply to the full detail view.
 
 ### Security
 
@@ -88,6 +90,10 @@ Entries live in [changes/](changes/) until release.
 
 - Move the aya family to userspace `aya` 0.16, `aya-obj` 0.6, `aya-log` 0.4 and kernel-side `aya-ebpf` 0.3, adapting call sites to the new map, loader and TC context APIs while preserving programs, map names and shared binary layouts.
 - Make shared payload padding explicit and restrict locked-value `Pod` implementations to the three audited payloads; reject stale BTF schemas without changing existing field offsets or map-value sizes.
+- Fix the clippy findings the 1.99 toolchain reports with `-D warnings`: `is_multiple_of` for the rate-limited log counters, collapsed `if let` chains, `is_none_or` for the inbound-not match, a removed dead `FetchFailure` re-export, a single-element benchmark loop, and `&[b'x'; 64]` instead of `&vec![b'x'; 64]`.
+- The quoted-name routing test drops the unreachable `RoutingOutbound` arm: the enum has only the `Simple` variant, so the test asserts on `as_str()` instead.
+- The detour/QUIC tests follow the refactors they lagged behind: the QUIC client test reads the renamed `dial_endpoint`, the Hysteria2 test covers port-hopping refusal now that obfuscation rides a detour, and the packet-transport test expects wrong-source datagrams to be dropped; the tree is formatted with `cargo fmt`.
+- Fix the stale native flow and netlink tests: the TCP close test now expects the row reclaimed at retirement admission, the UDP removal test asserts the tombstone is already reclaimed after a failed cleanup, and the netkit fallback test accepts EINVAL and ENOSYS as missing-driver signals.
 
 ## [0.1.0-beta.4] - 2026-10-30
 
