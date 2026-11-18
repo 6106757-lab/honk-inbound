@@ -147,7 +147,7 @@ pub struct XhttpOptions {
 
 /// Xray `downloadSettings`: GET requests use their own endpoint and request
 /// shape. Like Xray, nothing is inherited from the upload side; the TLS name
-/// falls back to the address, never to the upload SNI.
+/// falls back to the download host, then the address, never to the upload SNI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct XhttpDownload {

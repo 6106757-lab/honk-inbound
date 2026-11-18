@@ -439,7 +439,7 @@ XHTTP 禁止 TCP Mux.Cool，但保留 UDP-only XUDP 承载连接。已有 VLESS 
 
 TLS/REALITY、flow 或传输声明相互冲突时会拒绝链接，不会静默降级。VLESS 的 `obfs` 仅接受空值/`none`、`websocket` 或 `grpc`，不会把不支持的传输方式当作 TCP。`host` 和 `serviceName`/`service_name` 保留原有回退顺序。显式 SNI 别名在赋值前按原始字节比较：相同值合并，不同值报错，不转换大小写。空值或纯空白的 SNI 和 flow 在派生节点 ID 前规范化为未指定；非空 flow 必须为 `xtls-rprx-vision` 或 `xtls-rprx-vision-udp443`。
 
-Clash 导入会比较 `servername`、`server-name` 和 `sni`；记录格式还会比较 `tls-name` 和 `tls-host`，并保留较低优先级的 `obfs_sni` 回退值，包括 Quantumult X 的 WSS Host。记录中的 `off` 仍为无效值。分享链接和 VMess JSON 的 WebSocket `host` 只存为 Host 请求头；非 WebSocket 传输则将其作为较低优先级的 SNI 回退值。拨号时普通 TLS 连接有显式 `sni` 就发它，否则发去掉端口后的非空 WebSocket `Host`，最后才发节点主机名；CDN 前置节点因此校验请求头里命名的分发证书，而不是它的边缘地址。
+Clash 导入会比较 `servername`、`server-name` 和 `sni`；记录格式还会比较 `tls-name` 和 `tls-host`，并保留较低优先级的 `obfs_sni` 回退值，包括 Quantumult X 的 WSS Host。记录中的 `off` 仍为无效值。分享链接和 VMess JSON 的 WebSocket `host` 只存为 Host 请求头；非 WebSocket 传输则将其作为较低优先级的 SNI 回退值。拨号时普通 TLS 连接有显式 `sni` 就发它，否则发去掉端口后的非空 WebSocket `Host` 或 XHTTP `host`，最后才发节点主机名；CDN 前置节点因此校验请求头里命名的分发证书，而不是它的边缘地址。
 
 ### Hysteria2
 

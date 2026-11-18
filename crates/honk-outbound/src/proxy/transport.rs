@@ -327,32 +327,42 @@ pub(crate) async fn maybe_tls_wrap_concrete(
 }
 
 /// TLS server name for a plain-TLS dial: an explicit SNI wins, then the
-/// WebSocket `Host` authority, then the endpoint address.
+/// WebSocket `Host` authority or the XHTTP `host` option, then the endpoint
+/// address.
 ///
 /// CDN-fronted nodes carry the edge IP as their address and the distribution
-/// name only in the WebSocket `Host` header. An IP-literal server name sends
+/// name only in the transport `Host` header. An IP-literal server name sends
 /// no SNI, so the edge answers with a default certificate that cannot match
 /// the distribution and verification fails.
 fn tls_server_name(node: &Node) -> String {
     if let Some(sni) = node.tls().and_then(|tls| tls.sni.as_deref()) {
         return sni.to_string();
     }
-    // The header is an authority, so a `:port` suffix is not SNI; an empty or
-    // unparsable one falls through to the endpoint address.
     node.transport()
-        .filter(|transport| transport.transport == "ws")
-        .and_then(|transport| transport.ws_host.as_deref())
-        .and_then(|host| host.parse::<http::uri::Authority>().ok())
-        .map(|authority| {
-            // `Authority::host` keeps the brackets of an IPv6 literal; the connector
-            // recognises (and sends no SNI for) only the bare address.
-            authority
-                .host()
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .to_string()
+        .and_then(|transport| match transport.transport.as_str() {
+            "ws" => transport.ws_host.as_deref(),
+            "xhttp" => transport
+                .xhttp
+                .as_ref()
+                .and_then(|xhttp| xhttp.host.as_deref()),
+            _ => None,
         })
+        .and_then(authority_bare_host)
         .unwrap_or_else(|| node.host().to_string())
+}
+
+/// Bare host of an `Authority` value: a `:port` suffix is not SNI, and an
+/// empty or unparsable one falls through to the endpoint address.
+/// `Authority::host` keeps the brackets of an IPv6 literal; the connector
+/// recognises (and sends no SNI for) only the bare address.
+fn authority_bare_host(value: &str) -> Option<String> {
+    value.parse::<http::uri::Authority>().ok().map(|authority| {
+        authority
+            .host()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_string()
+    })
 }
 
 fn encode_uri_path(path: &str) -> PercentEncode<'_> {

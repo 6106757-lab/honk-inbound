@@ -300,3 +300,75 @@ fn ws_tls_server_name_prefers_the_host_header() {
     node.transport_mut().unwrap().ws_host = Some("cdn.example".into());
     assert_eq!(tls_server_name(&node), "127.0.0.1");
 }
+
+/// A CDN-fronted XHTTP node names the edge IP as its address and the
+/// distribution only in the XHTTP `host` option; SNI must follow the host
+/// or the edge answers with a certificate that cannot match the address.
+#[test]
+fn xhttp_tls_server_name_prefers_the_host_header() {
+    let mut node = transport_node(443);
+    node.tls_mut().unwrap().enabled = true;
+    node.transport_mut().unwrap().transport = "xhttp".into();
+    node.transport_mut().unwrap().xhttp = Some(Default::default());
+    assert_eq!(tls_server_name(&node), "127.0.0.1");
+
+    node.transport_mut().unwrap().xhttp.as_mut().unwrap().host = Some("cdn.example".into());
+    assert_eq!(tls_server_name(&node), "cdn.example");
+
+    node.transport_mut().unwrap().xhttp.as_mut().unwrap().host = Some("cdn.example:8443".into());
+    assert_eq!(tls_server_name(&node), "cdn.example");
+
+    node.transport_mut().unwrap().xhttp.as_mut().unwrap().host = Some("[2001:db8::1]:8443".into());
+    assert_eq!(tls_server_name(&node), "2001:db8::1");
+
+    node.transport_mut().unwrap().xhttp.as_mut().unwrap().host = Some(String::new());
+    assert_eq!(tls_server_name(&node), "127.0.0.1");
+
+    node.tls_mut().unwrap().sni = Some("sni.example".into());
+    assert_eq!(tls_server_name(&node), "sni.example");
+
+    node.tls_mut().unwrap().sni = None;
+    node.transport_mut().unwrap().transport = "grpc".into();
+    node.transport_mut().unwrap().xhttp.as_mut().unwrap().host = Some("cdn.example".into());
+    assert_eq!(tls_server_name(&node), "127.0.0.1");
+}
+
+/// The download peer is the node cloned onto its own endpoint; its SNI must
+/// follow the download `host`, not the download address, and an explicit
+/// download `server_name` still wins.
+#[test]
+fn xhttp_download_view_server_name_prefers_the_download_host() {
+    let mut node = transport_node(443);
+    node.tls_mut().unwrap().enabled = true;
+    let transport = node.transport_mut().unwrap();
+    transport.transport = "xhttp".into();
+    transport.xhttp = Some(honk_config::node::XhttpOptions {
+        host: Some("up.example".into()),
+        download: Some(Box::new(honk_config::node::XhttpDownload {
+            address: "203.0.113.7".into(),
+            port: 443,
+            server_name: None,
+            host: Some("dl.example".into()),
+            path: "/down/".into(),
+            x_padding_bytes: honk_config::node::XhttpRange {
+                min: 100,
+                max: 1000,
+            },
+        })),
+        ..Default::default()
+    });
+    let view = node.xhttp_download_view().unwrap();
+    assert_eq!(tls_server_name(&view), "dl.example");
+
+    node.transport_mut()
+        .unwrap()
+        .xhttp
+        .as_mut()
+        .unwrap()
+        .download
+        .as_mut()
+        .unwrap()
+        .server_name = Some("dl-sni.example".into());
+    let view = node.xhttp_download_view().unwrap();
+    assert_eq!(tls_server_name(&view), "dl-sni.example");
+}
