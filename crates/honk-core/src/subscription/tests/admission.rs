@@ -474,6 +474,43 @@ fn xhttp_mihomo_options_reach_canonical_nodes_and_identity() {
 }
 
 #[test]
+fn xhttp_obfs_padding_keys_are_accepted_in_clash_opts() {
+    let body = r#"proxies:
+  - {name: obfs, type: vless, server: example.com, port: 443, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: true, network: xhttp, xhttp-opts: {path: /api, mode: stream-one, x-padding-obfs-mode: true, x-padding-method: tokenish, x-padding-placement: queryInHeader, x-padding-header: abc123, x-padding-key: _def456}}
+"#;
+    let nodes = parse_subscription_content(&Subscription::default(), body).unwrap();
+    assert_eq!(nodes.len(), 1);
+    let options = nodes[0].transport().unwrap().xhttp.as_ref().unwrap();
+    assert!(options.x_padding_obfs_mode);
+    assert_eq!(options.x_padding_method.as_deref(), Some("tokenish"));
+    assert_eq!(
+        options.x_padding_placement.as_deref(),
+        Some("queryInHeader")
+    );
+    assert_eq!(options.x_padding_header.as_deref(), Some("abc123"));
+    assert_eq!(options.x_padding_key.as_deref(), Some("_def456"));
+    // An invalid method rejects the entry while a sibling survives.
+    let body = body.replace("x-padding-method: tokenish", "x-padding-method: bad")
+        + "  - {name: survivor, type: socks5, server: 127.0.0.1, port: 1080}\n";
+    let mut diagnostics = Vec::new();
+    let nodes = parse_subscription_content_with_diagnostics(
+        &Subscription::default(),
+        &body,
+        &mut diagnostics,
+    )
+    .unwrap();
+    assert_eq!(
+        nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        ["survivor"]
+    );
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].code, "malformed-subscription-entry");
+}
+
+#[test]
 fn xhttp_unsupported_raw_presence_salvages_siblings_and_redacts_errors() {
     for field in [
         "download-settings",
@@ -481,7 +518,6 @@ fn xhttp_unsupported_raw_presence_salvages_siblings_and_redacts_errors() {
         "seq-placement",
         "uplink-data-placement",
         "uplink-http-method",
-        "x-padding-obfs-mode",
         "PRIVATE_UNKNOWN",
     ] {
         for value in ["null", "''", "{}", "false"] {

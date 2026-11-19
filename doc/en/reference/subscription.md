@@ -266,7 +266,7 @@ XHTTP is the exception to the raw-TCP ALPN rule: it always uses H2, including RE
 
 | `xhttp-opts` fields | Import behavior |
 | --- | --- |
-| `path`, `host`, `mode`, `headers`, `x-padding-bytes`, `no-grpc-header`, `sc-max-each-post-bytes`, `sc-min-posts-interval-ms` | Accepted. |
+| `path`, `host`, `mode`, `headers`, `x-padding-bytes`, `no-grpc-header`, `sc-max-each-post-bytes`, `sc-min-posts-interval-ms`, `x-padding-obfs-mode`, `x-padding-method`, `x-padding-placement`, `x-padding-header`, `x-padding-key` | Accepted. The obfs padding keys are stored but do not yet shape requests. |
 | `no-sse-header`, `sc-max-buffered-posts`, `sc-stream-up-server-secs` | Server-only; type-checked and dropped. |
 | `reuse-settings`, `xmux` | Follow the URI `xmux` rule with Xray's meaning. Mihomo instead enables its own reuse manager whenever `reuse-settings` is present. |
 | `download-settings` | Must be an Xray StreamConfig mapping, as described below. |
@@ -275,7 +275,7 @@ XHTTP is the exception to the raw-TCP ALPN rule: it always uses H2, including RE
 
 Mihomo's inheriting keys, such as `server`, `servername`, `tls`, and `skip-cert-verify`, reject. This intentionally differs from mihomo, which ignores Xray-shaped keys and sends GETs to the upload server. See the [XHTTP node reference](./nodes.md#xhttp-over-h2) for canonical defaults, bounds and header restrictions.
 
-Other unsupported options, including alternate placements and padding-obfuscation settings, reject the entry by raw presence, even when null, empty or false. Valid sibling nodes survive. URI/VMess extra JSON rejects duplicate members before map construction.
+Other unsupported options, including alternate placements, reject the entry by raw presence, even when null, empty or false. Valid sibling nodes survive. URI/VMess extra JSON rejects duplicate members before map construction.
 
 #### VLESS transport and REALITY
 

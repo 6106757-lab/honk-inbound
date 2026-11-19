@@ -266,7 +266,7 @@ XHTTP 不受裸 TCP ALPN 规则限制：它始终使用 H2，包括 REALITY 和�
 
 | `xhttp-opts` 字段 | 导入行为 |
 | --- | --- |
-| `path`、`host`、`mode`、`headers`、`x-padding-bytes`、`no-grpc-header`、`sc-max-each-post-bytes`、`sc-min-posts-interval-ms` | 接受。 |
+| `path`、`host`、`mode`、`headers`、`x-padding-bytes`、`no-grpc-header`、`sc-max-each-post-bytes`、`sc-min-posts-interval-ms`、`x-padding-obfs-mode`、`x-padding-method`、`x-padding-placement`、`x-padding-header`、`x-padding-key` | 接受。混淆填充键会被保存，但暂不用于发包。 |
 | `no-sse-header`、`sc-max-buffered-posts`、`sc-stream-up-server-secs` | 仅服务端使用，检查类型后丢弃。 |
 | `reuse-settings`、`xmux` | 按 Xray 语义遵循 URI `xmux` 规则。Mihomo 则只要存在 `reuse-settings` 就启用自己的复用管理器。 |
 | `download-settings` | 须为 Xray StreamConfig 映射，见下文。 |
@@ -275,7 +275,7 @@ XHTTP 不受裸 TCP ALPN 规则限制：它始终使用 H2，包括 REALITY 和�
 
 Mihomo 自身具有继承语义的键会被拒绝，如 `server`、`servername`、`tls`、`skip-cert-verify`。这与 mihomo 有意不同：mihomo 忽略 Xray 结构的键，将 GET 发往上传服务器。规范默认值、范围和请求头限制见 [XHTTP 节点参考](./nodes.md#h2-上的-xhttp)。
 
-其他不支持的参数，包括其他字段位置和填充混淆设置，只要存在就会使条目被拒绝，即使值为 null、空值或 false。其他有效节点保留。URI/VMess extra JSON 在构造映射前拒绝重复成员。
+其他不支持的参数，包括其他字段位置，只要存在就会使条目被拒绝，即使值为 null、空值或 false。其他有效节点保留。URI/VMess extra JSON 在构造映射前拒绝重复成员。
 
 #### VLESS transport 与 REALITY
 

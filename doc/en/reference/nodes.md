@@ -379,6 +379,11 @@ URI `extra` accepts a percent-encoded JSON object containing `host`, `path` and 
 | `noGRPCHeader` | `no_grpc_header` | `false` | Boolean |
 | `scMaxEachPostBytes` | `sc_max_each_post_bytes` | `1000000` | 1–16777216 bytes |
 | `scMinPostsIntervalMs` | `sc_min_posts_interval_ms` | `30` | 0–60000 ms; zero disables the minimum interval |
+| `xPaddingObfsMode` | `x_padding_obfs_mode` | `false` | Boolean; accepted and stored, not yet used to shape requests |
+| `xPaddingMethod` | `x_padding_method` | absent | `repeat-x` or `tokenish` |
+| `xPaddingPlacement` | `x_padding_placement` | absent | `queryInHeader`, `cookie`, `header`, `query`, `path`, `body` or `auto` |
+| `xPaddingHeader` | `x_padding_header` | absent | Nonempty header name carrying the padding |
+| `xPaddingKey` | `x_padding_key` | absent | Nonempty query key carrying the padding |
 
 Ranges accept an unsigned scalar, a `min-max` string or `{"min":N,"max":N}` in structured input. Headers normalize to lowercase and equal aliases coalesce; conflicting aliases, control characters and protocol-managed headers (`host`, `content-type`, `content-length`, `referer`, hop-by-hop headers and trailers) reject. URI/VMess extra JSON rejects duplicate members before map construction. Padding remains enabled. The bounds are local safety limits, not a guarantee that a peer or CDN accepts every value.
 
@@ -403,7 +408,7 @@ Top-level `host`, `path` and `mode` remain authoritative when `extra` is present
 | Extra `noSSEHeader`, `scMaxBufferedPosts`, `scStreamUpServerSecs` | Server-only Xray settings; type-checked and dropped. |
 | `xmux` | Accepted and dropped only when all-zero or exactly Xray's fill-in for omitted XMUX: `maxConcurrency` 1, `hMaxRequestTimes` 600–900, `hMaxReusableSecs` 1800–3000, everything else 0. Other values reject. |
 
-Unknown or unsupported options reject the entire node, even when null or empty. These include alternate session/sequence/payload placement, custom upload methods and padding-obfuscation profiles. Mihomo subscriptions use the corresponding `xhttp-opts` fields. Official sing-box and client-record XHTTP transports remain unsupported.
+Unknown or unsupported options reject the entire node, even when null or empty. These include alternate session/sequence/payload placement and custom upload methods. Mihomo subscriptions use the corresponding `xhttp-opts` fields. Official sing-box and client-record XHTTP transports remain unsupported.
 
 Extra `downloadSettings` is an Xray StreamConfig that sends the GET to a separate endpoint. It inherits nothing from the upload side, including configured headers. Download GETs therefore carry the default Chrome `fetch()` set even when upload requests have a configured `User-Agent`.
 

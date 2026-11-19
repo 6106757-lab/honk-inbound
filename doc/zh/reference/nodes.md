@@ -376,6 +376,11 @@ URI `extra` 接受百分号编码的 JSON 对象，可含 `host`、`path`、`mod
 | `noGRPCHeader` | `no_grpc_header` | `false` | 布尔值 |
 | `scMaxEachPostBytes` | `sc_max_each_post_bytes` | `1000000` | 1–16777216 字节 |
 | `scMinPostsIntervalMs` | `sc_min_posts_interval_ms` | `30` | 0–60000 ms；零关闭最小间隔 |
+| `xPaddingObfsMode` | `x_padding_obfs_mode` | `false` | 布尔值；接受并保存，暂不用于发包 |
+| `xPaddingMethod` | `x_padding_method` | 未指定 | `repeat-x` 或 `tokenish` |
+| `xPaddingPlacement` | `x_padding_placement` | 未指定 | `queryInHeader`、`cookie`、`header`、`query`、`path`、`body` 或 `auto` |
+| `xPaddingHeader` | `x_padding_header` | 未指定 | 承载填充的非空请求头名 |
+| `xPaddingKey` | `x_padding_key` | 未指定 | 承载填充的非空查询键 |
 
 结构化范围接受无符号标量、`min-max` 字符串或 `{"min":N,"max":N}`。Header 名称规范化为小写，等价别名合并；冲突别名、控制字符与传输层管理的标头（`host`、`content-type`、`content-length`、`referer`、hop-by-hop 标头、trailers）会被拒绝。URI/VMess extra JSON 在转为 map 前拒绝重复成员。Padding 始终启用。这些范围是本地安全上限，不保证每个对端或 CDN 都接受。
 
@@ -400,7 +405,7 @@ CDN 的机器人过滤规则可能拒绝不含这些请求头的 XHTTP 请求。
 | Extra 中的 `noSSEHeader`、`scMaxBufferedPosts`、`scStreamUpServerSecs` | 仅作用于 Xray 服务端，检查类型后丢弃。 |
 | `xmux` | 仅在全为零或恰好等于 Xray 的缺省 XMUX 填充值时接受并丢弃：`maxConcurrency` 为 1、`hMaxRequestTimes` 为 600–900、`hMaxReusableSecs` 为 1800–3000，其余为 0。其他值拒绝。 |
 
-未知或不支持的参数会使整个节点被拒绝，即使值为 null 或空值也不例外。这包括其他会话、序号或载荷位置、自定义上传方法和填充混淆配置。Mihomo 订阅使用对应的 `xhttp-opts` 字段。官方 sing-box 和客户端记录格式仍不支持 XHTTP 传输。
+未知或不支持的参数会使整个节点被拒绝，即使值为 null 或空值也不例外。这包括其他会话、序号或载荷位置和自定义上传方法。Mihomo 订阅使用对应的 `xhttp-opts` 字段。官方 sing-box 和客户端记录格式仍不支持 XHTTP 传输。
 
 Extra 中的 `downloadSettings` 是 Xray StreamConfig，将 GET 发往独立端点。下载端不继承上传端的任何设置，包括请求头。因此，即使上传端配置了 `User-Agent`，下载 GET 仍携带默认的 Chrome `fetch()` 请求头。
 

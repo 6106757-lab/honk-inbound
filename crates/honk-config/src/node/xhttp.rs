@@ -140,6 +140,44 @@ pub struct XhttpOptions {
         deserialize_with = "interval_range"
     )]
     pub sc_min_posts_interval_ms: XhttpRange,
+    /// Xray obfs padding claims. Accepted and stored, but not yet used to
+    /// shape requests: the dialer still sends the standard Referer padding.
+    /// A false mode and absent strings serialize nothing, keeping existing
+    /// XHTTP node IDs.
+    #[serde(
+        default,
+        alias = "x-padding-obfs-mode",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub x_padding_obfs_mode: bool,
+    #[serde(
+        default,
+        alias = "x-padding-method",
+        deserialize_with = "padding_method",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub x_padding_method: Option<String>,
+    #[serde(
+        default,
+        alias = "x-padding-placement",
+        deserialize_with = "padding_placement",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub x_padding_placement: Option<String>,
+    #[serde(
+        default,
+        alias = "x-padding-header",
+        deserialize_with = "padding_header",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub x_padding_header: Option<String>,
+    #[serde(
+        default,
+        alias = "x-padding-key",
+        deserialize_with = "padding_key",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub x_padding_key: Option<String>,
     /// Absent options serialize nothing, keeping existing XHTTP node IDs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub download: Option<Box<XhttpDownload>>,
@@ -205,6 +243,11 @@ impl Default for XhttpOptions {
             no_grpc_header: false,
             sc_max_each_post_bytes: Self::DEFAULT_POST,
             sc_min_posts_interval_ms: Self::DEFAULT_INTERVAL,
+            x_padding_obfs_mode: false,
+            x_padding_method: None,
+            x_padding_placement: None,
+            x_padding_header: None,
+            x_padding_key: None,
             download: None,
         }
     }
@@ -218,6 +261,65 @@ fn post_range<'de, D: Deserializer<'de>>(deserializer: D) -> Result<XhttpRange, 
 }
 fn interval_range<'de, D: Deserializer<'de>>(deserializer: D) -> Result<XhttpRange, D::Error> {
     deserialize_range(deserializer, Some(XhttpOptions::DEFAULT_INTERVAL))
+}
+
+/// Xray `xpadding.go`: only these methods shape padding bytes.
+fn validate_padding_method(value: &str) -> Result<(), &'static str> {
+    if matches!(value, "repeat-x" | "tokenish") {
+        Ok(())
+    } else {
+        Err("invalid XHTTP padding method")
+    }
+}
+
+/// Xray `common.go`: only these placements carry padding.
+fn validate_padding_placement(value: &str) -> Result<(), &'static str> {
+    if matches!(
+        value,
+        "queryInHeader" | "cookie" | "header" | "query" | "path" | "body" | "auto"
+    ) {
+        Ok(())
+    } else {
+        Err("invalid XHTTP padding placement")
+    }
+}
+
+fn padding_method<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    let value = Option::<String>::deserialize(deserializer)?;
+    if let Some(value) = &value {
+        validate_padding_method(value).map_err(serde::de::Error::custom)?;
+    }
+    Ok(value)
+}
+
+fn padding_placement<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let value = Option::<String>::deserialize(deserializer)?;
+    if let Some(value) = &value {
+        validate_padding_placement(value).map_err(serde::de::Error::custom)?;
+    }
+    Ok(value)
+}
+
+fn padding_header<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    let value = Option::<String>::deserialize(deserializer)?;
+    if let Some(value) = &value
+        && value.is_empty()
+    {
+        return Err(serde::de::Error::custom("invalid XHTTP padding header"));
+    }
+    Ok(value)
+}
+
+fn padding_key<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    let value = Option::<String>::deserialize(deserializer)?;
+    if let Some(value) = &value
+        && value.is_empty()
+    {
+        return Err(serde::de::Error::custom("invalid XHTTP padding key"));
+    }
+    Ok(value)
 }
 
 fn xhttp_headers<'de, D: Deserializer<'de>>(
@@ -292,6 +394,38 @@ pub(crate) struct XrayExtra {
         deserialize_with = "extra_interval"
     )]
     sc_min_posts_interval_ms: Option<XhttpRange>,
+    // Xray obfs padding claims. Accepted and stored, but not yet used to
+    // shape requests; see `XhttpOptions`.
+    #[serde(
+        default,
+        rename = "xPaddingObfsMode",
+        deserialize_with = "present_option"
+    )]
+    x_padding_obfs_mode: Option<bool>,
+    #[serde(
+        default,
+        rename = "xPaddingMethod",
+        deserialize_with = "extra_padding_method"
+    )]
+    x_padding_method: Option<String>,
+    #[serde(
+        default,
+        rename = "xPaddingPlacement",
+        deserialize_with = "extra_padding_placement"
+    )]
+    x_padding_placement: Option<String>,
+    #[serde(
+        default,
+        rename = "xPaddingHeader",
+        deserialize_with = "extra_padding_header"
+    )]
+    x_padding_header: Option<String>,
+    #[serde(
+        default,
+        rename = "xPaddingKey",
+        deserialize_with = "extra_padding_key"
+    )]
+    x_padding_key: Option<String>,
     #[serde(
         default,
         rename = "downloadSettings",
@@ -463,6 +597,43 @@ fn extra_interval<'de, D: Deserializer<'de>>(
     interval_range(deserializer).map(Some)
 }
 
+// Strict like the other extra claims: a present null is not an absent value.
+fn extra_padding_method<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    validate_padding_method(&value).map_err(serde::de::Error::custom)?;
+    Ok(Some(value))
+}
+
+fn extra_padding_placement<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    validate_padding_placement(&value).map_err(serde::de::Error::custom)?;
+    Ok(Some(value))
+}
+
+fn extra_padding_header<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    if value.is_empty() {
+        return Err(serde::de::Error::custom("invalid XHTTP padding header"));
+    }
+    Ok(Some(value))
+}
+
+fn extra_padding_key<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    if value.is_empty() {
+        return Err(serde::de::Error::custom("invalid XHTTP padding key"));
+    }
+    Ok(Some(value))
+}
+
 struct Extra;
 impl<'de> serde::de::Visitor<'de> for Extra {
     type Value = XrayExtra;
@@ -592,6 +763,22 @@ impl XhttpOptions {
             .path
             .split_once('?')
             .map_or(self.path.as_str(), |(path, _)| path);
+        if let Some(method) = &self.x_padding_method {
+            validate_padding_method(method)?;
+        }
+        if let Some(placement) = &self.x_padding_placement {
+            validate_padding_placement(placement)?;
+        }
+        if let Some(header) = &self.x_padding_header
+            && header.is_empty()
+        {
+            return Err("invalid XHTTP padding header");
+        }
+        if let Some(key) = &self.x_padding_key
+            && key.is_empty()
+        {
+            return Err("invalid XHTTP padding key");
+        }
         if !path.starts_with('/') || !path.ends_with('/') {
             return Err("XHTTP path must be normalized before admission");
         }
@@ -654,6 +841,11 @@ impl XhttpOptions {
             options.sc_min_posts_interval_ms = extra
                 .sc_min_posts_interval_ms
                 .unwrap_or(Self::DEFAULT_INTERVAL);
+            options.x_padding_obfs_mode = extra.x_padding_obfs_mode.unwrap_or_default();
+            options.x_padding_method = extra.x_padding_method;
+            options.x_padding_placement = extra.x_padding_placement;
+            options.x_padding_header = extra.x_padding_header;
+            options.x_padding_key = extra.x_padding_key;
             options.download = extra
                 .download_settings
                 .map(XrayDownload::into_download)
