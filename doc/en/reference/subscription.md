@@ -266,7 +266,7 @@ XHTTP is the exception to the raw-TCP ALPN rule: it always uses H2, including RE
 
 | `xhttp-opts` fields | Import behavior |
 | --- | --- |
-| `path`, `host`, `mode`, `headers`, `x-padding-bytes`, `no-grpc-header`, `sc-max-each-post-bytes`, `sc-min-posts-interval-ms`, `x-padding-obfs-mode`, `x-padding-method`, `x-padding-placement`, `x-padding-header`, `x-padding-key` | Accepted. The obfs padding keys are stored but do not yet shape requests. |
+| `path`, `host`, `mode`, `headers`, `x-padding-bytes`, `no-grpc-header`, `sc-max-each-post-bytes`, `sc-min-posts-interval-ms`, `x-padding-obfs-mode`, `x-padding-method`, `x-padding-placement`, `x-padding-header`, `x-padding-key` | Accepted. When obfs mode is on and the method, placement, header and key are all set, the dialer sends the obfs padding instead of the Referer padding; otherwise it falls back to the Referer padding. |
 | `no-sse-header`, `sc-max-buffered-posts`, `sc-stream-up-server-secs` | Server-only; type-checked and dropped. |
 | `reuse-settings`, `xmux` | Follow the URI `xmux` rule with Xray's meaning. Mihomo instead enables its own reuse manager whenever `reuse-settings` is present. |
 | `download-settings` | Must be an Xray StreamConfig mapping, as described below. |

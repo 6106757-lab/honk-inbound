@@ -266,7 +266,7 @@ XHTTP 不受裸 TCP ALPN 规则限制：它始终使用 H2，包括 REALITY 和�
 
 | `xhttp-opts` 字段 | 导入行为 |
 | --- | --- |
-| `path`、`host`、`mode`、`headers`、`x-padding-bytes`、`no-grpc-header`、`sc-max-each-post-bytes`、`sc-min-posts-interval-ms`、`x-padding-obfs-mode`、`x-padding-method`、`x-padding-placement`、`x-padding-header`、`x-padding-key` | 接受。混淆填充键会被保存，但暂不用于发包。 |
+| `path`、`host`、`mode`、`headers`、`x-padding-bytes`、`no-grpc-header`、`sc-max-each-post-bytes`、`sc-min-posts-interval-ms`、`x-padding-obfs-mode`、`x-padding-method`、`x-padding-placement`、`x-padding-header`、`x-padding-key` | 接受。混淆模式开启且 method、placement、header、key 齐全时，拨号器发送混淆填充代替 Referer 填充；否则回落到 Referer 填充。 |
 | `no-sse-header`、`sc-max-buffered-posts`、`sc-stream-up-server-secs` | 仅服务端使用，检查类型后丢弃。 |
 | `reuse-settings`、`xmux` | 按 Xray 语义遵循 URI `xmux` 规则。Mihomo 则只要存在 `reuse-settings` 就启用自己的复用管理器。 |
 | `download-settings` | 须为 Xray StreamConfig 映射，见下文。 |

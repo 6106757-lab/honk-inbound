@@ -140,8 +140,10 @@ pub struct XhttpOptions {
         deserialize_with = "interval_range"
     )]
     pub sc_min_posts_interval_ms: XhttpRange,
-    /// Xray obfs padding claims. Accepted and stored, but not yet used to
-    /// shape requests: the dialer still sends the standard Referer padding.
+    /// Xray obfs padding claims. When `x_padding_obfs_mode` is true and
+    /// method, placement, header and key are all present, the dialer sends
+    /// the padding in place of the standard Referer padding; otherwise it
+    /// falls back to the Referer padding.
     /// A false mode and absent strings serialize nothing, keeping existing
     /// XHTTP node IDs.
     #[serde(
@@ -394,8 +396,8 @@ pub(crate) struct XrayExtra {
         deserialize_with = "extra_interval"
     )]
     sc_min_posts_interval_ms: Option<XhttpRange>,
-    // Xray obfs padding claims. Accepted and stored, but not yet used to
-    // shape requests; see `XhttpOptions`.
+    // Xray obfs padding claims, sent by the dialer when complete; see
+    // `XhttpOptions`.
     #[serde(
         default,
         rename = "xPaddingObfsMode",

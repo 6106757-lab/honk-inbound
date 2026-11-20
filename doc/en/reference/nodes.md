@@ -379,7 +379,7 @@ URI `extra` accepts a percent-encoded JSON object containing `host`, `path` and 
 | `noGRPCHeader` | `no_grpc_header` | `false` | Boolean |
 | `scMaxEachPostBytes` | `sc_max_each_post_bytes` | `1000000` | 1–16777216 bytes |
 | `scMinPostsIntervalMs` | `sc_min_posts_interval_ms` | `30` | 0–60000 ms; zero disables the minimum interval |
-| `xPaddingObfsMode` | `x_padding_obfs_mode` | `false` | Boolean; accepted and stored, not yet used to shape requests |
+| `xPaddingObfsMode` | `x_padding_obfs_mode` | `false` | Boolean; when true and method, placement, header and key are all set, the dialer sends the obfs padding instead of the Referer padding |
 | `xPaddingMethod` | `x_padding_method` | absent | `repeat-x` or `tokenish` |
 | `xPaddingPlacement` | `x_padding_placement` | absent | `queryInHeader`, `cookie`, `header`, `query`, `path`, `body` or `auto` |
 | `xPaddingHeader` | `x_padding_header` | absent | Nonempty header name carrying the padding |

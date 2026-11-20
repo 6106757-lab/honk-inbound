@@ -376,7 +376,7 @@ URI `extra` 接受百分号编码的 JSON 对象，可含 `host`、`path`、`mod
 | `noGRPCHeader` | `no_grpc_header` | `false` | 布尔值 |
 | `scMaxEachPostBytes` | `sc_max_each_post_bytes` | `1000000` | 1–16777216 字节 |
 | `scMinPostsIntervalMs` | `sc_min_posts_interval_ms` | `30` | 0–60000 ms；零关闭最小间隔 |
-| `xPaddingObfsMode` | `x_padding_obfs_mode` | `false` | 布尔值；接受并保存，暂不用于发包 |
+| `xPaddingObfsMode` | `x_padding_obfs_mode` | `false` | 布尔值；为 true 且 method、placement、header、key 齐全时，拨号器发送混淆填充代替 Referer 填充 |
 | `xPaddingMethod` | `x_padding_method` | 未指定 | `repeat-x` 或 `tokenish` |
 | `xPaddingPlacement` | `x_padding_placement` | 未指定 | `queryInHeader`、`cookie`、`header`、`query`、`path`、`body` 或 `auto` |
 | `xPaddingHeader` | `x_padding_header` | 未指定 | 承载填充的非空请求头名 |
