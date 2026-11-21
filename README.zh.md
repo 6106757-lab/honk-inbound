@@ -49,6 +49,7 @@ Selector（默认）、URLTest、LoadBalance、Fallback、Score 五种策略。
 ### DNS
 
 - 上游支持 UDP、TCP、DoT、DoH、DoQ、DoH3，可经节点或组出站。
+- 跟随策略（`-> follow`，本 fork 独有）：上游写 `-> follow` 时，DNS 查询走该域名内容流量所在的组（按域名/geosite 路由规则解析），DNS 出口与内容出口保持地域一致；解析到 `block` 的域名直接拒绝，解析到 `direct` 的按解析器 IP 路由。
 - 请求路由与响应路由、缓存（仅缓存带有所查地址族地址的 NOERROR 正应答；NXDOMAIN / SERVFAIL / NODATA 等一律不缓存，过期正应答可 serve-stale 1 小时）。
 - 支持 `ipversion_prefer`、`client_subnet`（`auto` 或固定值）、bootstrap 解析。
 
@@ -67,6 +68,7 @@ Selector（默认）、URLTest、LoadBalance、Fallback、Score 五种策略。
 - **MASQUE（connect-ip）出站**：可从订阅导入 `type: masque` 节点（含 Cloudflare WARP），以 HTTP/2 或 HTTP/3 承载，支持 TUN 设备与内置界面延迟测试。详见[链式代理与 MASQUE 配置指南](doc/zh/guide/chained-proxy-and-masque.md)。
 - **链式代理（detour）**：节点可写 `dialer-proxy`（Clash 订阅 / 分享链接）或 `detour`（sing-box JSON）；组可写 `detour:`，前置可为节点、组或 `direct`。组级前置每次拨号现解析，换前置热重载即生效，无需重启；`filter: group(X)` 的组自动继承上游组的 detour，显式 `detour:`（含 `direct`）可覆盖；未绑定的 detour 直接拒绝拨号，不悄悄走直连。TCP、UDP 拨号与 Clash / 原生 API 延迟测试共用同一解析。
 - **XHTTP 混淆填充**：导入与发送 edgetunnel 风格的 XHTTP 填充字段（`xPaddingObfsMode/Method/Placement/Header/Key`），已在真实 edgetunnel 上验证通过。
+- **DNS 跟随策略**：上游写 `-> follow`，DNS 查询走该域名内容流量所在的组，DNS 出口与内容出口保持地域一致。
 - **内置定制版 doona 界面**：`full` 构建内置 [6106757-lab/doona](https://github.com/6106757-lab/doona) `v0.1.0` 编译的界面，支持 MASQUE 延迟测试与手动添加 XHTTP 节点（含 5 个混淆填充字段）。
 - **现成二进制**：[Releases](https://github.com/6106757-lab/honk/releases) 提供已编译的 x86_64 与 aarch64 musl `full` 构建（tar.gz、deb、rpm、pkg.tar.zst），下载即可部署，不需要本地 Rust 编译环境。
 
@@ -138,6 +140,7 @@ global {
 # 静态节点：分享链接，tag 会成为路由/API 名称。
 node {
     backup: 'socks5://192.0.2.2:1080'
+    # 本 fork 独有：节点级前置，dialer-proxy 指定该节点拨号先经哪个前置。
     landing: 'vless://uuid@example.com:443?dialer-proxy=qianzhi#Landing'
 }
 
@@ -157,11 +160,13 @@ group {
     Final {
         filter: name(keyword: 'WARP')
         policy: selector
+        # 本 fork 独有：组级前置，前置可是节点名、组名或 direct，每次拨号现解析。
         detour: qianzhi
     }
     Proxy {
         filter: group(Final)
         policy: selector
+        # 本 fork 独有：filter: group(Final) 的组自动继承 Final 的 detour，无需重复写。
     }
 }
 
@@ -178,6 +183,8 @@ dns {
     upstream {
         direct_dns: 'udp://1.1.1.1:53' -> direct
         proxy_doh: 'https://dns.google/dns-query' -> Proxy
+        # 本 fork 独有：跟随策略，DNS 查询走该域名内容流量所在的组。
+        follow_dns: 'udp://8.8.8.8:53' -> follow
     }
     routing {
         request {

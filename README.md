@@ -49,6 +49,7 @@ Selector (the default), URLTest, LoadBalance, Fallback, and Score.
 ### DNS
 
 - Upstreams over UDP, TCP, DoT, DoH, DoQ, and DoH3, optionally through a node or group.
+- Follow policy (`-> follow`, fork-only): an upstream tagged `-> follow` routes the query through the same group the domain's content traffic would use (resolved from the domain/geosite routing rules), keeping DNS egress and content egress geographically aligned; domains resolving to `block` are rejected, `direct` falls back to resolver-IP routing.
 - Request and response routing plus caching (only NOERROR answers carrying an address for the queried family are cached; NXDOMAIN / SERVFAIL / NODATA are never cached, and expired positives serve stale for 1 hour).
 - `ipversion_prefer`, `client_subnet` (`auto` or a fixed value), and bootstrap resolution.
 
@@ -67,6 +68,7 @@ This fork adds features that upstream `daeuniverse/honk` does not ship. Upstream
 - **MASQUE (connect-ip) outbound**: import `type: masque` nodes from subscriptions (including Cloudflare WARP) over HTTP/2 or HTTP/3, with TUN devices and UI latency probes. See the [chained-proxy and MASQUE guide](doc/zh/guide/chained-proxy-and-masque.md).
 - **Chained proxies (detour)**: nodes take `dialer-proxy` (Clash subscriptions / share links) or `detour` (sing-box JSON); groups take `detour:`, whose front can be a node, a group, or `direct`. A group front is resolved on every dial, so switching fronts takes effect on hot reload without a restart; `filter: group(X)` groups inherit the upstream group's detour, an explicit `detour:` (including `direct`) overrides it, and an unbound detour refuses the dial instead of silently going direct. TCP, UDP, and Clash / native-API latency probes share the same resolution.
 - **XHTTP obfuscation padding**: import and send edgetunnel-style XHTTP padding fields (`xPaddingObfsMode/Method/Placement/Header/Key`), verified against a real edgetunnel.
+- **DNS follow policy**: tag an upstream `-> follow` and the query goes through the same group the domain's content traffic uses, keeping DNS and content egress geographically aligned.
 - **Embedded customized doona UI**: `full` builds embed the [6106757-lab/doona](https://github.com/6106757-lab/doona) `v0.1.0` UI, which probes MASQUE nodes and lets you add XHTTP nodes by hand (including the 5 padding fields).
 - **Prebuilt binaries**: [Releases](https://github.com/6106757-lab/honk/releases) ship compiled x86_64 and aarch64 musl `full` builds (tar.gz, deb, rpm, pkg.tar.zst); download and deploy, no local Rust toolchain needed.
 
@@ -138,6 +140,7 @@ global {
 # Static nodes: share links; the tag becomes the routing/API name.
 node {
     backup: 'socks5://192.0.2.2:1080'
+    # Fork-only: node-level front; dialer-proxy names the front this node's dials go through first.
     landing: 'vless://uuid@example.com:443?dialer-proxy=qianzhi#Landing'
 }
 
@@ -157,11 +160,13 @@ group {
     Final {
         filter: name(keyword: 'WARP')
         policy: selector
+        # Fork-only: group front; the front can be a node name, a group name, or direct, resolved on every dial.
         detour: qianzhi
     }
     Proxy {
         filter: group(Final)
         policy: selector
+        # Fork-only: a filter: group(Final) group inherits Final's detour automatically, no need to repeat it.
     }
 }
 
@@ -178,6 +183,8 @@ dns {
     upstream {
         direct_dns: 'udp://1.1.1.1:53' -> direct
         proxy_doh: 'https://dns.google/dns-query' -> Proxy
+        # Fork-only: follow policy; the query uses the group the domain's content traffic uses.
+        follow_dns: 'udp://8.8.8.8:53' -> follow
     }
     routing {
         request {
