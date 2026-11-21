@@ -29,9 +29,9 @@ honk 的 eBPF 数据面和配置语法参考 dae 的设计，出站组与 Clash 
 
 支持 SOCKS5、Shadowsocks/2022、Trojan、AnyTLS、Hysteria2、TUIC、Juicity、VMess、VLESS、`direct`、`block`，以及本 fork 的 MASQUE（connect-ip，见下）。
 
-- Trojan / VMess / VLESS 支持 H2 XHTTP（`packet-up`、`stream-up`、`stream-one`）；VMess 仅 TCP。
+- Trojan / VMess / VLESS 支持 H2 XHTTP（`packet-up`、`stream-up`、`stream-one`）。
 - XHTTP 支持混淆填充（obfuscation padding）的导入与发送，可对接 Cloudflare edgetunnel 一类入口；WS / XHTTP 的 Host 会用作 TLS SNI（未显式写 `sni` 时）。
-- VLESS 支持 REALITY、Vision（`xtls-rprx-vision`）、XUDP 与多路复用；VMess 支持真正的 command-UDP。
+- VLESS 支持 REALITY、Vision（`xtls-rprx-vision`）、XUDP 与多路复用；VMess 支持真正的 command-UDP（每个目标一条关联）。
 - 前置 QUIC（fronted QUIC）接收上限 1452 字节；DoT（853）走 LAN 保护，不经过代理。
 
 详见[协议限制](doc/zh/reference/nodes.md)。

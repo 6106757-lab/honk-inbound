@@ -29,9 +29,9 @@ honk follows the design of dae's eBPF datapath and configuration syntax, and of 
 
 SOCKS5, Shadowsocks/2022, Trojan, AnyTLS, Hysteria2, TUIC, Juicity, VMess, VLESS, `direct`, `block`, plus MASQUE (connect-ip) from this fork (see below).
 
-- Trojan / VMess / VLESS support H2 XHTTP (`packet-up`, `stream-up`, `stream-one`); VMess is TCP-only.
+- Trojan / VMess / VLESS support H2 XHTTP (`packet-up`, `stream-up`, `stream-one`).
 - XHTTP supports obfuscation-padding import and sending, interoperable with Cloudflare edgetunnel-style entries; the WS / XHTTP Host is used as the TLS SNI when no explicit `sni` is set.
-- VLESS supports REALITY, Vision (`xtls-rprx-vision`), XUDP, and multiplexing; VMess supports true command-UDP.
+- VLESS supports REALITY, Vision (`xtls-rprx-vision`), XUDP, and multiplexing; VMess supports true command-UDP (one association per destination).
 - Fronted QUIC receive cap is 1452 bytes; DoT (853) takes the LAN-protection path and never goes through a proxy.
 
 See [protocol limits](doc/en/reference/nodes.md).
