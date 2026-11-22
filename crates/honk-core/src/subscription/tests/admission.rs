@@ -552,12 +552,15 @@ fn xhttp_unsupported_raw_presence_salvages_siblings_and_redacts_errors() {
         );
         assert!(parse_subscription_content(&Subscription::default(), &body).is_err());
     }
-    for alpn in ["[http/1.1]", "[h3]", "[h2, http/1.1]"] {
+    for alpn in ["[http/1.1]", "[h3]"] {
         let body = format!(
             "proxies: [{{name: invalid, type: vless, server: example.com, port: 443, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, network: xhttp, alpn: {alpn}}}]"
         );
         assert!(parse_subscription_content(&Subscription::default(), &body).is_err());
     }
+    // An XHTTP ALPN list containing h2 is accepted (not only exactly ["h2"]).
+    let body = "proxies: [{name: ok, type: vless, server: example.com, port: 443, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, network: xhttp, alpn: [h2, http/1.1]}]";
+    assert!(parse_subscription_content(&Subscription::default(), body).is_ok());
 }
 
 #[test]
