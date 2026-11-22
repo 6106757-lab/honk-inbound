@@ -19,6 +19,46 @@ pub struct TlsOptions {
     pub reality_spider_x: Option<String>,
     pub pin_sha256: Option<String>,
     pub alpn: Vec<String>,
+    /// Per-node TLS fingerprint (`fp` share-link parameter), e.g. `chrome`,
+    /// `firefox`, `safari`, `ios`, `android`. `None` falls back to the global
+    /// `tls_implementation`/`utls_imitate` mode. Stored lowercase.
+    pub fingerprint: Option<String>,
+}
+
+/// TLS fingerprints honk can imitate. Mirrors the uTLS profile names clients
+/// use in share links; the outbound TLS stack implements the profiles.
+pub const TLS_FINGERPRINTS: &[&str] = &["chrome", "firefox", "safari", "ios", "android", "edge"];
+
+impl TlsOptions {
+    /// Normalize a share-link `fp` value, or `None` when absent/blank.
+    /// Returns an error naming the value when it is not a known fingerprint.
+    pub(crate) fn normalize_fingerprint(value: Option<&str>) -> Result<Option<String>, String> {
+        let Some(raw) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+            return Ok(None);
+        };
+        let lowered = raw.to_ascii_lowercase();
+        if TLS_FINGERPRINTS.contains(&lowered.as_str()) {
+            Ok(Some(lowered))
+        } else {
+            Err(format!(
+                "unsupported TLS fingerprint '{raw}' (expected one of: {})",
+                TLS_FINGERPRINTS.join(", ")
+            ))
+        }
+    }
+
+    /// Validate the stored fingerprint, if any.
+    pub(crate) fn validate_fingerprint(&self) -> Result<(), ValidationFailure> {
+        if let Some(fp) = &self.fingerprint
+            && !TLS_FINGERPRINTS.contains(&fp.as_str())
+        {
+            return Err(ValidationFailure::new(
+                Some("tls_fingerprint"),
+                "unsupported TLS fingerprint",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl TlsOptions {
@@ -38,10 +78,10 @@ impl TlsOptions {
     }
 
     pub(super) fn check_xhttp_alpn(&self) -> Result<(), &'static str> {
-        if self.alpn == ["h2"] {
+        if self.alpn.iter().any(|proto| proto == "h2") {
             Ok(())
         } else {
-            Err("XHTTP requires H2-only ALPN")
+            Err("XHTTP requires H2 ALPN")
         }
     }
 
@@ -494,6 +534,7 @@ impl OutboundConfig {
                 .unwrap_or(""),
             tls.and_then(|tls| tls.reality_spider_x.as_deref())
                 .unwrap_or(""),
+            tls.and_then(|tls| tls.fingerprint.as_deref()).unwrap_or(""),
             match self {
                 Self::Vless(config) => config.wire_flow().unwrap_or(""),
                 _ => "",

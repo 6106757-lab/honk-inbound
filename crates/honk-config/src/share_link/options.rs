@@ -305,6 +305,18 @@ pub(super) fn apply_tls(
             .get("pinSHA256")
             .or_else(|| query.get("pin_sha256"))
             .cloned();
+        if let Some(fp) = query.get("fp") {
+            tls.fingerprint = crate::node::TlsOptions::normalize_fingerprint(Some(fp)).map_err(
+                |_| {
+                    query_error(
+                        source,
+                        &["tls_fingerprint"],
+                        "invalid-config-value",
+                        "unsupported TLS fingerprint (expected one of: chrome, firefox, safari, ios, android, edge)",
+                    )
+                },
+            )?;
+        }
         if let Some(value) = query.get("ech_config").or_else(|| query.get("echconfig")) {
             tls.ech_enabled = true;
             tls.ech_config = Some(value.clone());

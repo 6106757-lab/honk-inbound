@@ -1487,6 +1487,7 @@ fn test_vless_reality_full() {
         Some("a1b2c3d4e5f60718")
     );
     assert_eq!(node.tls().unwrap().reality_spider_x.as_deref(), Some("/"));
+    assert_eq!(node.tls().unwrap().fingerprint.as_deref(), Some("chrome"));
     assert_eq!(
         node.vless().unwrap().flow.as_deref(),
         Some("xtls-rprx-vision")
@@ -1496,6 +1497,48 @@ fn test_vless_reality_full() {
     let mut config = Config::default();
     config.nodes.push(node);
     config.validate().unwrap();
+}
+
+#[test]
+fn test_vless_reality_fingerprint_ios_and_xhttp_alpn_contains_h2() {
+    // fp=ios is stored on the node (a REALITY server may require it).
+    let node = Node::from_share_link(
+        "vless://bc98aec8-62be-4ce5-b862-ea99de4f7efb@39.108.122.12:10085?encryption=none&flow=xtls-rprx-vision&security=reality&sni=gateway.icloud.com&fp=ios&pbk=sDT6T702UIaowdDeJ1wu4UEHX0n8pGGjpdBPxjGVWhE&sid=a55c9dc3&type=tcp&headerType=none#US2",
+    )
+    .unwrap();
+    assert_eq!(node.tls().unwrap().fingerprint.as_deref(), Some("ios"));
+    assert_eq!(
+        node.tls().unwrap().reality_public_key.as_deref(),
+        Some("sDT6T702UIaowdDeJ1wu4UEHX0n8pGGjpdBPxjGVWhE")
+    );
+    assert_eq!(
+        node.tls().unwrap().reality_short_id.as_deref(),
+        Some("a55c9dc3")
+    );
+
+    // An unknown fingerprint is rejected.
+    assert!(
+        Node::from_share_link(
+            "vless://bc98aec8-62be-4ce5-b862-ea99de4f7efb@39.108.122.12:10085?security=reality&sni=gateway.icloud.com&fp=banana&pbk=sDT6T702UIaowdDeJ1wu4UEHX0n8pGGjpdBPxjGVWhE&sid=a55c9dc3&type=tcp#bad",
+        )
+        .is_err()
+    );
+
+    // XHTTP ALPN containing h2 (not exactly ["h2"]) is accepted.
+    let node = Node::from_share_link(
+        "vless://203295a3-befc-4f63-acfa-c9af7ee04173@134.185.97.224:44443?type=xhttp&encryption=none&path=%2Fblxgsd&host=&mode=auto&security=tls&fp=chrome&alpn=h2%2Chttp%2F1.1&sni=blog.606699.xyz#xhttp-alpn",
+    )
+    .unwrap();
+    assert!(node.tls().unwrap().alpn.iter().any(|p| p == "h2"));
+    assert_eq!(node.tls().unwrap().fingerprint.as_deref(), Some("chrome"));
+
+    // XHTTP ALPN without h2 is still rejected.
+    assert!(
+        Node::from_share_link(
+            "vless://203295a3-befc-4f63-acfa-c9af7ee04173@134.185.97.224:44443?type=xhttp&encryption=none&path=%2Fblxgsd&host=&mode=auto&security=tls&alpn=http%2F1.1&sni=blog.606699.xyz#xhttp-noh2",
+        )
+        .is_err()
+    );
 }
 
 #[test]

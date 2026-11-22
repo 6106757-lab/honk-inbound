@@ -203,6 +203,7 @@ impl Node {
         }
         let Some(tls) = self.tls() else { return Ok(()) };
         tls.validate_alpn()?;
+        tls.validate_fingerprint()?;
         let reality = tls
             .effective_reality_public_key()
             .map_err(|message| ValidationFailure::new(Some("reality_public_key"), message))?

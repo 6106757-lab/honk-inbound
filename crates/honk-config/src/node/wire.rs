@@ -149,6 +149,8 @@ struct FlatNode {
     #[serde(default)]
     tls_pin_sha256: Option<String>,
     #[serde(default)]
+    tls_fingerprint: Option<String>,
+    #[serde(default)]
     hy2_init_stream_recv_window: Option<u64>,
     #[serde(default)]
     hy2_init_conn_recv_window: Option<u64>,
@@ -537,6 +539,11 @@ impl FlatNode {
             reality_spider_x: self.reality_spider_x.take(),
             pin_sha256: self.tls_pin_sha256.take(),
             alpn: std::mem::take(&mut self.tls_alpn),
+            fingerprint: self
+                .tls_fingerprint
+                .take()
+                .map(|v| v.trim().to_ascii_lowercase())
+                .filter(|v| !v.is_empty()),
         }
     }
 
@@ -823,6 +830,8 @@ struct WireOptions<'a> {
     hy2_port_hopping: Option<&'a str>,
     hy2_hop_interval: Option<u64>,
     tls_pin_sha256: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tls_fingerprint: Option<&'a str>,
     hy2_init_stream_recv_window: Option<u64>,
     hy2_init_conn_recv_window: Option<u64>,
     hy2_disable_mtu_discovery: Option<bool>,
@@ -874,6 +883,7 @@ impl<'a> WireOptions<'a> {
         self.reality_short_id = tls.reality_short_id.as_deref();
         self.reality_spider_x = tls.reality_spider_x.as_deref();
         self.tls_pin_sha256 = tls.pin_sha256.as_deref();
+        self.tls_fingerprint = tls.fingerprint.as_deref();
     }
 
     fn set_transport(&mut self, transport: &'a StreamTransportOptions) {
