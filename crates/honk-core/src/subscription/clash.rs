@@ -610,6 +610,16 @@ fn apply_tls(
         )?
         .unwrap_or(false);
         tls.pin_sha256 = yaml_text_alias(mapping, &["pin-sha256", "pin_sha256", "fingerprint"])?;
+        // `client-fingerprint` is the TLS ClientHello profile (chrome, ios,
+        // ...); `fingerprint` above is the certificate SHA256 pin.
+        if let Some(fp) =
+            optional_text_alias(mapping, &["client-fingerprint", "client_fingerprint"])?
+        {
+            let fp = fp.trim().to_ascii_lowercase();
+            if !fp.is_empty() {
+                tls.fingerprint = Some(fp);
+            }
+        }
         if !supports_quic(protocol)
             && let Some(alpn) = yaml_value(mapping, "alpn")
         {

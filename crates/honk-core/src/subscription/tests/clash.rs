@@ -225,12 +225,15 @@ fn anytls_alpn_import_preserves_distinct_endpoints() {
     )
     .unwrap();
 
+    // `duplicate` shares issue-173's endpoint and ALPN but carries no
+    // `client-fingerprint`, while issue-173 pins chrome: the fingerprint is
+    // part of the dial shape, so the two are distinct nodes now.
     assert_eq!(
         nodes
             .iter()
             .map(|node| node.name.as_str())
             .collect::<Vec<_>>(),
-        ["issue-173", "other-alpn"]
+        ["issue-173", "other-alpn", "duplicate"]
     );
     let anytls = nodes[0].anytls().unwrap();
     assert_eq!(anytls.tls.alpn, ["h2"]);
@@ -528,6 +531,27 @@ fn clash_imports_fingerprint_as_certificate_pin() {
         nodes[1].trojan().unwrap().tls.pin_sha256.as_deref(),
         Some(PIN)
     );
+}
+
+#[test]
+fn clash_imports_client_fingerprint_as_tls_fingerprint() {
+    const PIN: &str = "84c855b4a09bba0ff518c778c0540da87acb9871dd3ae6dc5e8f78423e7ede05";
+    let yaml = format!(
+        r#"proxies:
+  - {{name: us2, type: vless, server: 39.108.122.12, port: 10085, uuid: bc98aec8-62be-4ce5-b862-ea99de4f7efb, flow: xtls-rprx-vision, network: tcp, tls: true, servername: gateway.icloud.com, client-fingerprint: ios, reality-opts: {{public-key: sDT6T702UIaowdDeJ1wu4UEHX0n8pGGjpdBPxjGVWhE, short-id: a55c9dc3}}}}
+  - {{name: pinned, type: trojan, server: trojan.example, port: 443, password: secret, fingerprint: {PIN}, client-fingerprint: Chrome}}
+"#
+    );
+    let nodes = parse_clash_subscription(&yaml, None).unwrap();
+    assert_eq!(nodes.len(), 2);
+    assert_eq!(nodes[0].tls().unwrap().fingerprint.as_deref(), Some("ios"));
+    // `client-fingerprint` is the ClientHello profile; `fingerprint` stays
+    // the certificate pin and is not confused with it.
+    assert_eq!(
+        nodes[1].tls().unwrap().fingerprint.as_deref(),
+        Some("chrome")
+    );
+    assert_eq!(nodes[1].tls().unwrap().pin_sha256.as_deref(), Some(PIN));
 }
 
 #[test]
