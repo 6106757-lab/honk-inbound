@@ -22,7 +22,6 @@ Entries live in [changes/](changes/) until release.
 ### Fixed
 
 - XHTTP ALPN check accepts any list containing `h2` (was exactly `["h2"]`), so `alpn=h2,http/1.1` links import; lists without `h2` are still rejected, and duplicate entries are still rejected at admission.
-- A probe that times out (deadline) now records an unavailable observation instead of leaving the node latency blank (`-`); cancelled probes and local packet refusals still record nothing.
 
 ## [0.2.1] - 2026-11-20
 
