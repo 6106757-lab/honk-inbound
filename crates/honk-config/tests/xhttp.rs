@@ -697,12 +697,10 @@ fn direct_alpn_must_normalize_before_config_admission() {
         .validate()
         .unwrap();
     }
-    for alpn in [vec!["http/1.1".into()]] {
-        let mut node = canonical.clone();
-        node.tls_mut().unwrap().alpn = alpn;
-        assert!(node.validate_protocol().is_err());
-        assert!(node.normalize_stream_transport().is_err());
-    }
+    let mut node = canonical.clone();
+    node.tls_mut().unwrap().alpn = vec!["http/1.1".into()];
+    assert!(node.validate_protocol().is_err());
+    assert!(node.normalize_stream_transport().is_err());
     // An XHTTP ALPN list containing h2 (not exactly ["h2"]) is accepted.
     let mut node = canonical.clone();
     node.tls_mut().unwrap().alpn = vec!["h2".into(), "http/1.1".into()];

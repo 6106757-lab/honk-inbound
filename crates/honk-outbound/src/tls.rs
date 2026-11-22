@@ -166,7 +166,7 @@ pub enum TlsFingerprint {
 
 impl TlsFingerprint {
     /// Parse a share-link / `utls_imitate` fingerprint name (case-insensitive).
-    pub fn from_str(name: &str) -> Option<Self> {
+    pub fn parse(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
             "chrome" | "chrome_auto" => Some(Self::Chrome),
             "firefox" => Some(Self::Firefox),
@@ -541,7 +541,7 @@ pub fn set_utls_imitate(imitate: &str) {
     if requested.is_empty() {
         return;
     }
-    match TlsFingerprint::from_str(requested) {
+    match TlsFingerprint::parse(requested) {
         Some(fingerprint) => {
             DEFAULT_FINGERPRINT.store(fingerprint_discriminant(fingerprint), Ordering::Release);
         }
@@ -574,7 +574,7 @@ pub fn default_fingerprint() -> TlsFingerprint {
 pub fn fingerprint_for_node(node: &Node) -> TlsFingerprint {
     node.tls()
         .and_then(|tls| tls.fingerprint.as_deref())
-        .and_then(TlsFingerprint::from_str)
+        .and_then(TlsFingerprint::parse)
         .unwrap_or_else(default_fingerprint)
 }
 
@@ -585,8 +585,8 @@ pub fn fingerprint_for_node(node: &Node) -> TlsFingerprint {
 pub fn reality_hybrid_first(node: &Node) -> bool {
     node.tls()
         .and_then(|tls| tls.fingerprint.as_deref())
-        .and_then(TlsFingerprint::from_str)
-        .map_or(true, |fingerprint| fingerprint.is_chromium())
+        .and_then(TlsFingerprint::parse)
+        .is_none_or(|fingerprint| fingerprint.is_chromium())
 }
 
 /// Process-wide cache for DNS-discovered ECHConfigLists (RFC 9460 HTTPS RR).

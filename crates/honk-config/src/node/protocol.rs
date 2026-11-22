@@ -48,7 +48,7 @@ impl TlsOptions {
     }
 
     /// Validate the stored fingerprint, if any.
-    pub(crate) fn validate_fingerprint(&self) -> Result<(), ValidationFailure> {
+    pub(super) fn validate_fingerprint(&self) -> Result<(), ValidationFailure> {
         if let Some(fp) = &self.fingerprint
             && !TLS_FINGERPRINTS.contains(&fp.as_str())
         {
