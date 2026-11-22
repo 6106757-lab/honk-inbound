@@ -185,7 +185,12 @@ impl AttemptOutcome {
                 };
                 Self {
                     sample: None,
-                    completed: reason == "probe_failed",
+                    // A probe that ran out of time still proves the node does
+                    // not answer (dead AnyTLS handshakes hang, then time out);
+                    // record it as unavailable so it shows up instead of `-`.
+                    // A cancelled probe or a local packet refusal says nothing
+                    // about the node and still records nothing.
+                    completed: matches!(reason, "probe_failed" | "deadline"),
                     error: Some(reason),
                     observed_at: SystemTime::now(),
                     cleanup: Ok(()),
