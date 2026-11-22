@@ -233,9 +233,19 @@ pub(crate) async fn maybe_tls_wrap_concrete(
                 tcp.peer_addr()?
             };
             let tcp = ObservedTcp::new_carrier(tcp);
-            let chrome = crate::tls::chrome_mode();
+            let fingerprint = crate::tls::fingerprint_for_node(node);
+            // Chromium fingerprints lead with the MLKEM hybrid key share;
+            // other fingerprints (iOS/Safari/Firefox) lead with X25519 only,
+            // which servers that reject the hybrid group require. Without an
+            // explicit per-node fingerprint the historical hybrid-first
+            // default stands.
+            let hybrid_first = crate::tls::reality_hybrid_first(node);
             let mut tls_stream = match crate::reality::reality_connect_with_key_shares(
-                tcp, &reality, chrome, true, alpn,
+                tcp,
+                &reality,
+                fingerprint,
+                hybrid_first,
+                alpn,
             )
             .await
             {
@@ -280,7 +290,11 @@ pub(crate) async fn maybe_tls_wrap_concrete(
                             ),
                         };
                         crate::reality::reality_connect_with_key_shares(
-                            tcp, &reality, chrome, false, alpn,
+                            tcp,
+                            &reality,
+                            fingerprint,
+                            !hybrid_first,
+                            alpn,
                         )
                         .await
                     };

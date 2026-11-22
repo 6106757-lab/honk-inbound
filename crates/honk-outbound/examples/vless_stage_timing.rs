@@ -4,6 +4,7 @@
 use std::time::Instant;
 
 use honk_outbound::reality::{parse_reality_config, reality_connect};
+use honk_outbound::tls::TlsFingerprint;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn vless_request(uuid: [u8; 16], host: &str, port: u16) -> Vec<u8> {
@@ -61,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
 
         let t2 = Instant::now();
         let mut tls = match &reality {
-            Some(config) => match reality_connect(tcp, config, false).await {
+            Some(config) => match reality_connect(tcp, config, TlsFingerprint::Plain).await {
                 Ok(tls) => tls,
                 Err(e) => {
                     println!("run {run}: reality failed after {:?}: {e}", t2.elapsed());

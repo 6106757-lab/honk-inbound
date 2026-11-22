@@ -95,30 +95,30 @@ pub fn parse_reality_config(node: &Node) -> anyhow::Result<Option<RealityConfig>
 pub async fn reality_connect<S>(
     stream: S,
     config: &RealityConfig,
-    chrome: bool,
+    fingerprint: crate::tls::TlsFingerprint,
 ) -> anyhow::Result<TlsStream<S>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    reality_connect_with_key_shares(stream, config, chrome, true, None).await
+    reality_connect_with_key_shares(stream, config, fingerprint, true, None).await
 }
 
 pub(crate) async fn reality_connect_with_key_shares<S>(
     stream: S,
     config: &RealityConfig,
-    chrome: bool,
+    fingerprint: crate::tls::TlsFingerprint,
     hybrid: bool,
     alpn: Option<&[u8]>,
 ) -> anyhow::Result<TlsStream<S>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let connector = crate::tls::build_reality_connector(chrome)?;
+    let connector = crate::tls::build_reality_connector(fingerprint)?;
     let mut cfg = connector.configure()?;
     if let Some(alpn) = alpn {
         cfg.set_alpn_protos(alpn)?;
     }
-    if chrome {
+    if fingerprint.is_chromium() {
         cfg.set_permute_extensions(true);
         // Real Chrome GREASEs ECH whenever it holds no ECH keys.
         cfg.set_enable_ech_grease(true);

@@ -13,7 +13,7 @@
 //! (only the Chrome profile exists; other values warn and fall back).
 
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use anyhow::Context as _;
@@ -148,6 +148,90 @@ pub(crate) const CHROME_CIPHER_LIST: &str = "ECDHE-ECDSA-AES128-GCM-SHA256:\
      ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA:\
      AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA:AES256-SHA";
 
+/// TLS fingerprint a node may request via its `fp` share-link parameter.
+/// The outbound TLS stack implements each profile with BoringSSL settings
+/// (cipher list, curves, signature algorithms, key shares, Chrome toggles).
+/// `Plain` is no emulation: BoringSSL defaults.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TlsFingerprint {
+    Chrome,
+    Firefox,
+    Safari,
+    Ios,
+    Android,
+    Edge,
+    Plain,
+}
+
+impl TlsFingerprint {
+    /// Parse a share-link / `utls_imitate` fingerprint name (case-insensitive).
+    pub fn from_str(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "chrome" | "chrome_auto" => Some(Self::Chrome),
+            "firefox" => Some(Self::Firefox),
+            "safari" => Some(Self::Safari),
+            "ios" => Some(Self::Ios),
+            "android" => Some(Self::Android),
+            "edge" => Some(Self::Edge),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Chrome => "chrome",
+            Self::Firefox => "firefox",
+            Self::Safari => "safari",
+            Self::Ios => "ios",
+            Self::Android => "android",
+            Self::Edge => "edge",
+            Self::Plain => "plain",
+        }
+    }
+
+    /// True for the Chromium-based profiles (Chrome, Android, Edge), which
+    /// share the Chrome ClientHello toggles (permuted extensions, ALPS, ECH
+    /// grease, MLKEM hybrid key share).
+    pub fn is_chromium(&self) -> bool {
+        matches!(self, Self::Chrome | Self::Android | Self::Edge)
+    }
+}
+
+/// iOS / Safari TLS 1.2 cipher list, uTLS HelloIOS order (3DES omitted:
+/// BoringSSL removed it). TLS 1.3 ciphers are implicit and always lead.
+pub(crate) const IOS_CIPHER_LIST: &str = "ECDHE-ECDSA-AES256-GCM-SHA384:\
+     ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305:\
+     ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256:\
+     ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES256-SHA384:\
+     ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES128-SHA256:\
+     AES256-GCM-SHA384:AES128-GCM-SHA256:AES256-SHA256:AES128-SHA256:\
+     ECDHE-ECDSA-AES256-SHA:ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES256-SHA:\
+     ECDHE-RSA-AES128-SHA:AES256-SHA:AES128-SHA";
+
+/// Firefox TLS 1.2 cipher list, uTLS HelloFirefox order (3DES omitted).
+pub(crate) const FIREFOX_CIPHER_LIST: &str = "ECDHE-ECDSA-AES128-GCM-SHA256:\
+     ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:\
+     ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:\
+     ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES256-SHA384:\
+     ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES128-SHA256:\
+     ECDHE-RSA-AES256-SHA:ECDHE-RSA-AES128-SHA:ECDHE-ECDSA-AES256-SHA:\
+     ECDHE-ECDSA-AES128-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:\
+     AES128-SHA256:AES256-SHA256:AES128-SHA:AES256-SHA";
+
+/// iOS / Safari signature algorithms (P-521 added; SHA-1 omitted, BoringSSL
+/// rejects it in `set_sigalgs_list`).
+pub(crate) const IOS_SIGALGS: &str = "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:\
+     ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:\
+     rsa_pss_rsae_sha512:rsa_pkcs1_sha512:ecdsa_secp521r1_sha512";
+
+/// Firefox signature algorithms.
+pub(crate) const FIREFOX_SIGALGS: &str = "ecdsa_secp256r1_sha256:ecdsa_secp384r1_sha384:\
+     ecdsa_secp521r1_sha512:rsa_pss_rsae_sha256:rsa_pss_rsae_sha384:rsa_pss_rsae_sha512:\
+     rsa_pkcs1_sha256:rsa_pkcs1_sha384:rsa_pkcs1_sha512";
+
+/// Non-Chromium curves: X25519 first, no MLKEM hybrid (iOS/Safari/Firefox).
+pub(crate) const NON_CHROMIUM_CURVES: &str = "X25519:P-256:P-384:P-521";
+
 // BoringSSL group IDs (ssl.h) for SSL_set1_client_key_shares: Chrome sends
 // exactly two shares, MLKEM hybrid then X25519.
 const SSL_GROUP_X25519_MLKEM768: u16 = 0x11ec;
@@ -175,12 +259,12 @@ impl CertificateCompressor for BrotliCertCompression {
     }
 }
 
-/// BoringSSL connector carrying per-node ECH settings and the global
-/// fingerprint mode. Clone-cheap (Arc inside); build once per node.
+/// BoringSSL connector carrying per-node ECH settings and the node's
+/// fingerprint. Clone-cheap (Arc inside); build once per node.
 #[derive(Clone, Debug)]
 pub struct TlsConnector {
     connector: SslConnector,
-    chrome: bool,
+    fingerprint: TlsFingerprint,
     alps: bool,
     ech_config_list: Option<Arc<Vec<u8>>>,
     /// `ech_enabled` without a static config: discover via DNS HTTPS RR at
@@ -189,22 +273,24 @@ pub struct TlsConnector {
 }
 
 impl TlsConnector {
-    /// Per-connection `Ssl` configuration: applies the parts of the Chrome
-    /// profile that only exist per-SSL (permuted extensions, key shares,
-    /// ALPS, ECH) — BoringSSL has no ctx-level API for these.
+    /// Per-connection `Ssl` configuration: applies the parts of the
+    /// fingerprint profile that only exist per-SSL (permuted extensions, key
+    /// shares, ALPS, ECH) — BoringSSL has no ctx-level API for these.
     fn configuration(&self, ech: Option<Arc<Vec<u8>>>) -> anyhow::Result<ConnectConfiguration> {
         let mut cfg = self.connector.configure()?;
-        if self.chrome {
+        if self.fingerprint.is_chromium() {
             cfg.set_permute_extensions(true);
-            set_chrome_key_shares_ssl_ref(&cfg)?;
+            set_key_shares_ssl_ref(&cfg, self.fingerprint)?;
             if self.alps {
                 add_chrome_alps(&mut cfg)?;
             }
+        } else if self.fingerprint != TlsFingerprint::Plain {
+            set_key_shares_ssl_ref(&cfg, self.fingerprint)?;
         }
         match ech {
             Some(list) => cfg.set_ech_config_list(&list)?,
             // Real Chrome always GREASEs ECH when it holds no ECH keys.
-            None if self.chrome => cfg.set_enable_ech_grease(true),
+            None if self.fingerprint.is_chromium() => cfg.set_enable_ech_grease(true),
             None => {}
         }
         Ok(cfg)
@@ -256,7 +342,21 @@ impl TlsConnector {
 /// Chrome sends X25519MLKEM768 and X25519 key shares, in that order.
 /// BoringSSL exposes this only through FFI.
 pub(crate) fn set_chrome_key_shares_ssl_ref(ssl: &boring::ssl::SslRef) -> anyhow::Result<()> {
-    let shares = [SSL_GROUP_X25519_MLKEM768, SSL_GROUP_X25519];
+    set_key_shares_ssl_ref(ssl, TlsFingerprint::Chrome)
+}
+
+/// Set the per-SSL client key shares for a fingerprint: Chromium profiles
+/// send the MLKEM hybrid first, then X25519; all others send X25519 only.
+/// BoringSSL exposes this only through FFI.
+pub(crate) fn set_key_shares_ssl_ref(
+    ssl: &boring::ssl::SslRef,
+    fingerprint: TlsFingerprint,
+) -> anyhow::Result<()> {
+    let shares: &[u16] = if fingerprint.is_chromium() {
+        &[SSL_GROUP_X25519_MLKEM768, SSL_GROUP_X25519]
+    } else {
+        &[SSL_GROUP_X25519]
+    };
     let ok = unsafe {
         boring_sys::SSL_set1_client_key_shares(ssl.as_ptr(), shares.as_ptr(), shares.len())
     };
@@ -390,6 +490,35 @@ pub fn validate_connector_config_with_ech_reader(
 
 static USE_CHROME_TLS: LazyLock<AtomicBool> = LazyLock::new(|| AtomicBool::new(false));
 
+/// Global `utls_imitate` fingerprint, as a `TlsFingerprint` discriminant.
+/// Defaults to Chrome; `set_utls_imitate` stores a known profile, and
+/// `default_fingerprint` falls back to `Plain` unless utls mode is on.
+static DEFAULT_FINGERPRINT: LazyLock<AtomicU8> = LazyLock::new(|| AtomicU8::new(0));
+
+fn fingerprint_discriminant(fingerprint: TlsFingerprint) -> u8 {
+    match fingerprint {
+        TlsFingerprint::Chrome => 0,
+        TlsFingerprint::Firefox => 1,
+        TlsFingerprint::Safari => 2,
+        TlsFingerprint::Ios => 3,
+        TlsFingerprint::Android => 4,
+        TlsFingerprint::Edge => 5,
+        TlsFingerprint::Plain => 6,
+    }
+}
+
+fn fingerprint_from_discriminant(value: u8) -> TlsFingerprint {
+    match value {
+        1 => TlsFingerprint::Firefox,
+        2 => TlsFingerprint::Safari,
+        3 => TlsFingerprint::Ios,
+        4 => TlsFingerprint::Android,
+        5 => TlsFingerprint::Edge,
+        6 => TlsFingerprint::Plain,
+        _ => TlsFingerprint::Chrome,
+    }
+}
+
 /// Called from ControlPlane startup with GlobalConfig.tls_implementation.
 pub fn set_tls_mode(implementation: &str) {
     let chrome = implementation.eq_ignore_ascii_case("utls");
@@ -403,22 +532,60 @@ pub fn set_tls_mode(implementation: &str) {
 
 /// Called from ControlPlane startup with GlobalConfig.utls_imitate.
 ///
-/// Only the Chrome profile exists today; any other requested value warns and
-/// falls back to it (dae accepts `chrome*`/`firefox`/`safari`/... here).
+/// Stores the requested profile as the global default; an unknown value
+/// warns and keeps Chrome. (dae accepts `chrome*`/`firefox`/`safari`/...
+/// here.)
 pub fn set_utls_imitate(imitate: &str) {
     let requested = imitate.trim();
-    if requested.is_empty() || requested.starts_with("chrome") {
+    if requested.is_empty() {
         return;
     }
-    tracing::warn!(
-        "utls_imitate '{}' is not implemented; only the Chrome profile is available, using it",
-        requested
-    );
+    match TlsFingerprint::from_str(requested) {
+        Some(fingerprint) => {
+            DEFAULT_FINGERPRINT.store(fingerprint_discriminant(fingerprint), Ordering::Release);
+        }
+        None => {
+            tracing::warn!(
+                "utls_imitate '{}' is not a known fingerprint; using Chrome",
+                requested
+            );
+        }
+    }
 }
 
 /// Chrome fingerprint active (global `tls_implementation: utls`).
 pub fn chrome_mode() -> bool {
     USE_CHROME_TLS.load(Ordering::Acquire)
+}
+
+/// The global default fingerprint: the `utls_imitate` profile when utls mode
+/// is on, else `Plain` (BoringSSL defaults, no emulation).
+pub fn default_fingerprint() -> TlsFingerprint {
+    if !chrome_mode() {
+        return TlsFingerprint::Plain;
+    }
+    fingerprint_from_discriminant(DEFAULT_FINGERPRINT.load(Ordering::Acquire))
+}
+
+/// A node's fingerprint: its stored `fp` when set, else the global default.
+/// The stored value is validated at parse time, so an unknown name falls
+/// back to the default rather than failing the dial.
+pub fn fingerprint_for_node(node: &Node) -> TlsFingerprint {
+    node.tls()
+        .and_then(|tls| tls.fingerprint.as_deref())
+        .and_then(TlsFingerprint::from_str)
+        .unwrap_or_else(default_fingerprint)
+}
+
+/// Whether the first REALITY attempt leads with the MLKEM hybrid key share.
+/// An explicit per-node fingerprint decides (Chromium leads hybrid, others
+/// lead X25519-only); without one, the historical hybrid-first default
+/// stands, since new REALITY servers require the hybrid share first.
+pub fn reality_hybrid_first(node: &Node) -> bool {
+    node.tls()
+        .and_then(|tls| tls.fingerprint.as_deref())
+        .and_then(TlsFingerprint::from_str)
+        .map_or(true, |fingerprint| fingerprint.is_chromium())
 }
 
 /// Process-wide cache for DNS-discovered ECHConfigLists (RFC 9460 HTTPS RR).
@@ -495,7 +662,7 @@ struct ConnectorKey {
     skip_verify: bool,
     pin: Option<[u8; 32]>,
     alpn: Option<Vec<u8>>,
-    chrome: bool,
+    fingerprint: TlsFingerprint,
 }
 
 /// Shapes only multiply with distinct pins or ALPN overrides; past this the
@@ -560,10 +727,41 @@ pub fn pin_sha256_custom_verify(
     }
 }
 
+/// Apply a fingerprint's ctx-level settings (GREASE, signature algorithms,
+/// curves, certificate compression, TLS 1.2 cipher list). Chromium profiles
+/// get the Chrome set; iOS/Safari and Firefox get their own; `Plain` leaves
+/// BoringSSL defaults untouched.
+pub(crate) fn apply_fingerprint_ctx(
+    builder: &mut SslContextBuilder,
+    fingerprint: TlsFingerprint,
+) -> anyhow::Result<()> {
+    match fingerprint {
+        TlsFingerprint::Plain => Ok(()),
+        TlsFingerprint::Chrome | TlsFingerprint::Android | TlsFingerprint::Edge => {
+            apply_chrome_ctx(builder)
+        }
+        TlsFingerprint::Ios | TlsFingerprint::Safari => {
+            builder.set_grease_enabled(true);
+            builder.set_sigalgs_list(IOS_SIGALGS)?;
+            builder.set_curves_list(NON_CHROMIUM_CURVES)?;
+            builder.set_cipher_list(IOS_CIPHER_LIST)?;
+            Ok(())
+        }
+        TlsFingerprint::Firefox => {
+            builder.set_grease_enabled(true);
+            builder.set_sigalgs_list(FIREFOX_SIGALGS)?;
+            builder.set_curves_list(NON_CHROMIUM_CURVES)?;
+            builder.set_cipher_list(FIREFOX_CIPHER_LIST)?;
+            Ok(())
+        }
+    }
+}
+
 pub(crate) fn apply_chrome_ctx(builder: &mut SslContextBuilder) -> anyhow::Result<()> {
     builder.set_grease_enabled(true);
     builder.set_sigalgs_list(CHROME_SIGALGS)?;
     builder.set_curves_list(CHROME_CURVES)?;
+    builder.set_cipher_list(CHROME_CIPHER_LIST)?;
     builder.add_certificate_compression_algorithm(BrotliCertCompression)?;
     Ok(())
 }
@@ -576,7 +774,7 @@ pub fn build_connector(node: &Node) -> anyhow::Result<TlsConnector> {
             node.protocol().as_str()
         )
     })?;
-    let chrome = chrome_mode();
+    let fingerprint = fingerprint_for_node(node);
     let ech_config_list = load_ech_config_list(node)?;
 
     let pin = match tls.pin_sha256.as_deref() {
@@ -604,7 +802,7 @@ pub fn build_connector(node: &Node) -> anyhow::Result<TlsConnector> {
     let websocket = node
         .transport()
         .is_some_and(|transport| transport.transport == "ws");
-    let alps = chrome
+    let alps = fingerprint.is_chromium()
         && if tls.alpn.is_empty() {
             !websocket
         } else {
@@ -616,7 +814,7 @@ pub fn build_connector(node: &Node) -> anyhow::Result<TlsConnector> {
     {
         Some(b"\x02h2".as_slice())
     } else {
-        chrome.then_some(if websocket {
+        fingerprint.is_chromium().then_some(if websocket {
             HTTP11_ALPN_WIRE
         } else {
             CHROME_ALPN_WIRE
@@ -629,16 +827,14 @@ pub fn build_connector(node: &Node) -> anyhow::Result<TlsConnector> {
         skip_verify,
         pin,
         alpn: alpn_wire.map(<[u8]>::to_vec),
-        chrome,
+        fingerprint,
     };
     let connector = shared_connector(key, || {
         let mut builder = base_builder(skip_verify)?;
         if let Some(pin) = pin {
             builder.set_custom_verify_callback(SslVerifyMode::PEER, pin_sha256_custom_verify(pin));
         }
-        if chrome {
-            apply_chrome_ctx(&mut builder)?;
-        }
+        apply_fingerprint_ctx(&mut builder, fingerprint)?;
         if let Some(alpn_wire) = alpn_wire {
             builder.set_alpn_protos(alpn_wire)?;
         }
@@ -647,7 +843,7 @@ pub fn build_connector(node: &Node) -> anyhow::Result<TlsConnector> {
 
     Ok(TlsConnector {
         connector,
-        chrome,
+        fingerprint,
         alps,
         ech_discovery: tls.ech_enabled && ech_config_list.is_none(),
         ech_config_list: ech_config_list.map(Arc::new),
@@ -655,21 +851,19 @@ pub fn build_connector(node: &Node) -> anyhow::Result<TlsConnector> {
 }
 
 /// BoringSSL connector for DNS upstreams (DoT/DoH): caller-chosen ALPN,
-/// webpki verification, the global Chrome fingerprint mode applies.
+/// webpki verification, the global fingerprint applies.
 pub fn build_dns_connector(
     skip_cert_verify: bool,
     alpn_wire: &[u8],
 ) -> anyhow::Result<TlsConnector> {
-    let chrome = chrome_mode();
+    let fingerprint = default_fingerprint();
     let mut builder = base_builder(skip_cert_verify)?;
-    if chrome {
-        apply_chrome_ctx(&mut builder)?;
-    }
+    apply_fingerprint_ctx(&mut builder, fingerprint)?;
     builder.set_alpn_protos(alpn_wire)?;
     Ok(TlsConnector {
         connector: builder.build(),
-        chrome,
-        alps: chrome && alpn_wire.windows(3).any(|proto| proto == b"\x02h2"),
+        fingerprint,
+        alps: fingerprint.is_chromium() && alpn_wire.windows(3).any(|proto| proto == b"\x02h2"),
         ech_config_list: None,
         ech_discovery: false,
     })
@@ -697,22 +891,21 @@ mod pin_tests;
 mod batch_read_tests;
 
 /// REALITY's TLS-1.3-only connector; authentication runs post-handshake in
-/// `reality::verify_server_certificate`. Chrome mode configures the ctx-level
-/// emulation fields. REALITY callers never restore a cached SSL session.
-pub fn build_reality_connector(chrome: bool) -> anyhow::Result<SslConnector> {
+/// `reality::verify_server_certificate`. The fingerprint configures the
+/// ctx-level emulation fields. REALITY callers never restore a cached SSL session.
+pub fn build_reality_connector(fingerprint: TlsFingerprint) -> anyhow::Result<SslConnector> {
     let key = ConnectorKey {
         reality: true,
         skip_verify: true,
         pin: None,
         alpn: None,
-        chrome,
+        fingerprint,
     };
     shared_connector(key, || {
         let mut builder = base_builder(true)?;
         builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
-        if chrome {
-            apply_chrome_ctx(&mut builder)?;
-            builder.set_cipher_list(CHROME_CIPHER_LIST)?;
+        apply_fingerprint_ctx(&mut builder, fingerprint)?;
+        if fingerprint.is_chromium() {
             builder.set_alpn_protos(CHROME_ALPN_WIRE)?;
             builder.enable_ocsp_stapling();
             builder.enable_signed_cert_timestamps();

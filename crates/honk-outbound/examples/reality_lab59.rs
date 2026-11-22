@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use honk_config::node::Node;
 use honk_outbound::reality::{RealityConfig, parse_reality_config, reality_connect};
+use honk_outbound::tls::TlsFingerprint;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const ADDR: &str = "10.10.10.70:8443";
@@ -63,11 +64,11 @@ async fn positive(
     addr: &str,
     addr_host: &str,
     public_key: &str,
-    chrome: bool,
+    fingerprint: TlsFingerprint,
 ) -> anyhow::Result<()> {
     let uuid = uuid::Uuid::parse_str(UUID)?.into_bytes();
     let tcp = tokio::net::TcpStream::connect(addr).await?;
-    let mut tls = reality_connect(tcp, &lab_config(addr_host, public_key), chrome).await?;
+    let mut tls = reality_connect(tcp, &lab_config(addr_host, public_key), fingerprint).await?;
     println!("[+] TLS handshake + REALITY server authentication OK (sni={SNI})");
 
     tls.write_all(&vless_request(uuid, TARGET_HOST, TARGET_PORT))
@@ -133,7 +134,13 @@ async fn negative(addr: &str, addr_host: &str) -> anyhow::Result<()> {
     // must fail closed.
     let wrong_pbk = format!("{}A", &PUBLIC_KEY[..PUBLIC_KEY.len() - 1]);
     let tcp = tokio::net::TcpStream::connect(addr).await?;
-    match reality_connect(tcp, &lab_config(addr_host, &wrong_pbk), true).await {
+    match reality_connect(
+        tcp,
+        &lab_config(addr_host, &wrong_pbk),
+        TlsFingerprint::Chrome,
+    )
+    .await
+    {
         Ok(_) => anyhow::bail!("wrong public key unexpectedly authenticated"),
         Err(e) => {
             println!("[+] wrong public key rejected as expected: {e:#}");
@@ -144,7 +151,11 @@ async fn negative(addr: &str, addr_host: &str) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let chrome = !std::env::args().any(|a| a == "--no-chrome");
+    let fingerprint = if std::env::args().any(|a| a == "--no-chrome") {
+        TlsFingerprint::Plain
+    } else {
+        TlsFingerprint::Chrome
+    };
     // Optional overrides for local debugging: reality_lab59 [addr] [pbk]
     let mut args = std::env::args().skip(1).filter(|a| !a.starts_with("--"));
     let addr = args.next().unwrap_or_else(|| ADDR.to_string());
@@ -152,7 +163,7 @@ async fn main() -> anyhow::Result<()> {
     let pbk = args.next().unwrap_or_else(|| PUBLIC_KEY.to_string());
     tokio::time::timeout(
         Duration::from_secs(20),
-        positive(&addr, &addr_host, &pbk, chrome),
+        positive(&addr, &addr_host, &pbk, fingerprint),
     )
     .await??;
     tokio::time::timeout(Duration::from_secs(20), negative(&addr, &addr_host)).await??;

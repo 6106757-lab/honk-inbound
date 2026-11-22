@@ -488,7 +488,11 @@ async fn targeted_h2_and_raw_reality_profiles_negotiate_and_authenticate() {
             short_id: [0x19; 8],
             server_name: "localhost".into(),
         };
-        for chrome in [false, true] {
+        for fingerprint in [
+            crate::tls::TlsFingerprint::Plain,
+            crate::tls::TlsFingerprint::Chrome,
+        ] {
+            let chrome = fingerprint.is_chromium();
             for hybrid in [false, true] {
                 for targeted in [false, true] {
                     let (client, mut peer) = tokio::io::duplex(16 * 1024);
@@ -533,12 +537,12 @@ async fn targeted_h2_and_raw_reality_profiles_negotiate_and_authenticate() {
                     };
                     let client = async {
                         let result = if !targeted && hybrid {
-                            super::reality_connect(client, &config, chrome).await
+                            super::reality_connect(client, &config, fingerprint).await
                         } else {
                             reality_connect_with_key_shares(
                                 client,
                                 &config,
-                                chrome,
+                                fingerprint,
                                 hybrid,
                                 targeted.then_some(b"\x02h2".as_slice()),
                             )
@@ -562,7 +566,7 @@ async fn targeted_h2_and_raw_reality_profiles_negotiate_and_authenticate() {
 
 #[test]
 fn repeated_client_hello_is_rejected_without_resealing() {
-    let connector = crate::tls::build_reality_connector(false).unwrap();
+    let connector = crate::tls::build_reality_connector(crate::tls::TlsFingerprint::Plain).unwrap();
     let ssl = connector.configure().unwrap();
     setup_reality_ssl(
         &ssl,

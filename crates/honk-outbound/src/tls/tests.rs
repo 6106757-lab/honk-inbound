@@ -19,7 +19,7 @@ fn connectors_share_the_process_root_store() {
     let mut verifying_node = test_node();
     verifying_node.tls_mut().unwrap().skip_cert_verify = false;
     let verifying = build_connector(&verifying_node).unwrap();
-    let reality = build_reality_connector(false).unwrap();
+    let reality = build_reality_connector(TlsFingerprint::Plain).unwrap();
     for context in [
         skipping.connector.context(),
         verifying.connector.context(),
@@ -44,7 +44,7 @@ fn dials_share_one_context_per_shape() {
             build_connector(&node).unwrap(),
             build_connector(&node).unwrap(),
         );
-        if pair.0.chrome == pair.1.chrome {
+        if pair.0.fingerprint == pair.1.fingerprint {
             break pair;
         }
     };
