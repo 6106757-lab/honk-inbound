@@ -78,7 +78,13 @@ impl TlsOptions {
     }
 
     pub(super) fn check_xhttp_alpn(&self) -> Result<(), &'static str> {
-        if self.alpn.iter().any(|proto| proto == "h2") {
+        // XHTTP needs h2 on the offer; other protocols may ride along.
+        // Duplicates are not canonical: admission rejects them, and
+        // `normalize_stream_transport` dedupes them first.
+        let mut seen = std::collections::HashSet::new();
+        if self.alpn.iter().any(|proto| proto == "h2")
+            && self.alpn.iter().all(|proto| seen.insert(proto))
+        {
             Ok(())
         } else {
             Err("XHTTP requires H2 ALPN")
@@ -534,7 +540,6 @@ impl OutboundConfig {
                 .unwrap_or(""),
             tls.and_then(|tls| tls.reality_spider_x.as_deref())
                 .unwrap_or(""),
-            tls.and_then(|tls| tls.fingerprint.as_deref()).unwrap_or(""),
             match self {
                 Self::Vless(config) => config.wire_flow().unwrap_or(""),
                 _ => "",
@@ -542,6 +547,12 @@ impl OutboundConfig {
         ]
         .map(identity_field)
         .join("|");
+        // A set fingerprint changes the ClientHello, so it separates the
+        // identity; unset leaves the historical identity untouched.
+        if let Some(fp) = tls.and_then(|tls| tls.fingerprint.as_deref()) {
+            fingerprint.push_str("|tls-fp:");
+            fingerprint.push_str(fp);
+        }
         if let Some(headers) = transport
             .map(|transport| &transport.ws_headers)
             .filter(|headers| !headers.is_empty())

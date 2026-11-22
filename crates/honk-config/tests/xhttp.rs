@@ -281,7 +281,16 @@ fn xhttp_uri_exporter_metadata_preserves_tls_and_request_options() {
         ))
         .unwrap();
         assert_eq!(exported.transport(), canonical.transport());
-        assert_eq!(exported.tls(), canonical.tls());
+        // `fp` is now a real node field, so the exported node carries it
+        // while the base node does not; everything else matches.
+        assert_eq!(
+            exported.tls().unwrap().fingerprint.as_deref(),
+            Some("chrome")
+        );
+        assert_eq!(canonical.tls().unwrap().fingerprint, None);
+        let mut exported_tls = exported.tls().unwrap().clone();
+        exported_tls.fingerprint = None;
+        assert_eq!(exported_tls, *canonical.tls().unwrap());
         assert!(exported.tls().unwrap().skip_cert_verify);
     }
     assert!(
@@ -488,7 +497,6 @@ fn raw_unsupported_options_ranges_and_headers_fail_closed() {
         "type=xhttp&mode=auto&mode=stream-one",
         "type=xhttp&alpn=http/1.1",
         "type=xhttp&alpn=h3",
-        "type=xhttp&alpn=h2,http/1.1",
         "type=xhttp&extra=null",
     ] {
         assert!(
@@ -689,15 +697,24 @@ fn direct_alpn_must_normalize_before_config_admission() {
         .validate()
         .unwrap();
     }
-    for alpn in [
-        vec!["http/1.1".into()],
-        vec!["h2".into(), "http/1.1".into()],
-    ] {
+    for alpn in [vec!["http/1.1".into()]] {
         let mut node = canonical.clone();
         node.tls_mut().unwrap().alpn = alpn;
         assert!(node.validate_protocol().is_err());
         assert!(node.normalize_stream_transport().is_err());
     }
+    // An XHTTP ALPN list containing h2 (not exactly ["h2"]) is accepted.
+    let mut node = canonical.clone();
+    node.tls_mut().unwrap().alpn = vec!["h2".into(), "http/1.1".into()];
+    node.normalize_stream_transport().unwrap();
+    assert_eq!(node.tls().unwrap().alpn, ["h2", "http/1.1"]);
+    node.id = node.derive_id();
+    honk_config::Config {
+        nodes: vec![node],
+        ..Default::default()
+    }
+    .validate()
+    .unwrap();
 }
 
 #[test]
