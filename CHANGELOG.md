@@ -6,6 +6,24 @@ This changelog follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) 
 
 Entries live in [changes/](changes/) until release.
 
+## [0.2.2-rc.1] - 2026-11-22
+
+### Added
+
+- Per-node TLS fingerprint (`fp` share-link parameter): nodes store `tls_fingerprint` (`chrome`, `firefox`, `safari`, `ios`, `android`, `edge`), validated at parse and node validation; REALITY and TLS dials use it.
+- TLS fingerprint profiles in the outbound stack: iOS/Safari and Firefox get their own cipher list, curves, signature algorithms and X25519-only key shares (no MLKEM hybrid, no Chrome ALPS/ECH grease); a node with an explicit non-Chromium `fp` leads its first REALITY attempt with X25519 only, so servers that reject the MLKEM hybrid group connect.
+- Clash subscriptions now map `client-fingerprint` to the node's TLS fingerprint (the subscription's `fingerprint` key stays the certificate SHA256 pin); a node that only carries its fingerprint in the subscription no longer falls back to Chrome.
+- QUIC (Hysteria2/TUIC/Juicity) now dials with the node's TLS fingerprint instead of the process-wide Chrome mode; MASQUE keeps its fixed plain profile.
+
+### Changed
+
+- Embedded doona updated to 0.1.1-rc.1 (node form offers a TLS fingerprint choice and a `headerType` choice; XHTTP ALPN accepts any list containing `h2`).
+
+### Fixed
+
+- XHTTP ALPN check accepts any list containing `h2` (was exactly `["h2"]`), so `alpn=h2,http/1.1` links import; lists without `h2` are still rejected, and duplicate entries are still rejected at admission.
+- A probe that times out (deadline) now records an unavailable observation instead of leaving the node latency blank (`-`); cancelled probes and local packet refusals still record nothing.
+
 ## [0.2.1] - 2026-11-20
 
 ### Changed
@@ -203,7 +221,8 @@ Summarised from the [release notes](https://github.com/daeuniverse/honk/releases
 - Shared UDP sources survive malformed SOCKS5, Trojan and Juicity datagrams.
 - QUIC session tickets honour `skip_cert_verify`, and a reload restores warm carriers and probes.
 
-[Unreleased]: https://github.com/daeuniverse/honk/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/daeuniverse/honk/compare/v0.2.2-rc.1...HEAD
+[0.2.2-rc.1]: https://github.com/daeuniverse/honk/compare/v0.2.1...v0.2.2-rc.1
 [0.2.1]: https://github.com/daeuniverse/honk/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/daeuniverse/honk/compare/v0.1.0-beta.4...v0.2.0
 [0.1.0-beta.4]: https://github.com/daeuniverse/honk/compare/v0.1.0-beta.3...v0.1.0-beta.4
