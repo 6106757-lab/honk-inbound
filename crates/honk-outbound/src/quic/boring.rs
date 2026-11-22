@@ -20,6 +20,7 @@ use std::ffi::c_void;
 use std::ptr;
 use std::sync::{Arc, LazyLock};
 
+use crate::tls::TlsFingerprint;
 use aes::cipher::{BlockCipherEncrypt, KeyInit};
 use boring::aead::{AeadCtx, Algorithm as AeadAlgorithm};
 use boring::error::ErrorStack;
@@ -523,9 +524,10 @@ pub struct BoringQuicOptions {
     pub alpn_wire: Vec<u8>,
     /// Skip all certificate verification.
     pub skip_cert_verify: bool,
-    /// Chrome ClientHello fingerprint.
-    pub chrome: bool,
-    /// Static ECHConfigList; ECH GREASE applies when `chrome` and unset.
+    /// TLS ClientHello fingerprint for this endpoint.
+    pub fingerprint: TlsFingerprint,
+    /// Static ECHConfigList; ECH GREASE applies when the fingerprint is
+    /// Chromium and no list is set.
     pub ech_config_list: Option<Arc<Vec<u8>>>,
     /// pinSHA256 leaf-certificate fingerprint; replaces PKI and hostname
     /// verification when set.
@@ -552,7 +554,7 @@ pub struct BoringQuicOptions {
 pub struct BoringQuicClientConfig {
     ctx: SslContext,
     alpn_wire: Vec<u8>,
-    chrome: bool,
+    fingerprint: TlsFingerprint,
     ech_config_list: Option<Arc<Vec<u8>>>,
     /// pinSHA256 is in use: resumption disabled (PSK would bypass the pin).
     has_pin: bool,
@@ -588,7 +590,7 @@ impl BoringQuicClientConfig {
         let BoringQuicOptions {
             alpn_wire,
             skip_cert_verify,
-            chrome,
+            fingerprint,
             ech_config_list,
             pin_sha256,
             client_certificate,
@@ -632,9 +634,7 @@ impl BoringQuicClientConfig {
             builder.set_verify(SslVerifyMode::PEER);
             builder.set_verify_cert_store(crate::tls::root_store()?)?;
         }
-        if chrome {
-            crate::tls::apply_chrome_ctx(&mut builder)?;
-        }
+        crate::tls::apply_fingerprint_ctx(&mut builder, fingerprint)?;
         // Client-side TLS 1.3 session ticket cache: a repeat connection to
         // the same server can resume (and offer 0-RTT early data when the
         // server accepts it). BoringSSL has no implicit internal cache —
@@ -650,7 +650,7 @@ impl BoringQuicClientConfig {
         Ok(Self {
             ctx: builder.build(),
             alpn_wire,
-            chrome,
+            fingerprint,
             ech_config_list,
             // A resumed PSK skips certificate verification, which would let a
             // connection bypass either kind of pin. Keep the pin variants on
@@ -718,15 +718,19 @@ impl crypto::ClientConfig for BoringQuicClientConfig {
         ssl.set_alpn_protos(&self.alpn_wire)
             .expect("invalid ALPN wire format");
 
-        if self.chrome {
+        if self.fingerprint.is_chromium() {
             ssl.set_permute_extensions(true);
-            crate::tls::set_chrome_key_shares_ssl_ref(&ssl).expect("SSL_set1_client_key_shares");
+            crate::tls::set_key_shares_ssl_ref(&ssl, self.fingerprint)
+                .expect("SSL_set1_client_key_shares");
+        } else if self.fingerprint != crate::tls::TlsFingerprint::Plain {
+            crate::tls::set_key_shares_ssl_ref(&ssl, self.fingerprint)
+                .expect("SSL_set1_client_key_shares");
         }
         match &self.ech_config_list {
             Some(list) => ssl
                 .set_ech_config_list(list)
                 .expect("invalid ECHConfigList"),
-            None if self.chrome => ssl.set_enable_ech_grease(true),
+            None if self.fingerprint.is_chromium() => ssl.set_enable_ech_grease(true),
             None => {}
         }
 

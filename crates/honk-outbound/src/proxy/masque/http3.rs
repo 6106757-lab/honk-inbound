@@ -479,7 +479,7 @@ fn build_client_config(node: &Node, fronted: bool) -> anyhow::Result<ClientConfi
         // With a pin, the custom verify callback replaces PKI. Without one the
         // SNI is still a decoy, so certificate verification has to be skipped.
         skip_cert_verify: pinned.is_none(),
-        chrome: false,
+        fingerprint: crate::tls::TlsFingerprint::Plain,
         ech_config_list: None,
         pin_sha256: None,
         client_certificate: Some(certificate),

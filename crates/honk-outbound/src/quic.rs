@@ -395,7 +395,7 @@ pub async fn client_config(
         crate::quic::boring::BoringQuicClientConfig::new(crate::quic::boring::BoringQuicOptions {
             alpn_wire,
             skip_cert_verify: tls.skip_cert_verify,
-            chrome: crate::tls::chrome_mode(),
+            fingerprint: crate::tls::fingerprint_for_node(node),
             ech_config_list: ech,
             pin_sha256,
             // WARP MASQUE supplies these directly through `http3.rs`; the

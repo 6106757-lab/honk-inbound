@@ -152,7 +152,7 @@ pub(crate) const CHROME_CIPHER_LIST: &str = "ECDHE-ECDSA-AES128-GCM-SHA256:\
 /// The outbound TLS stack implements each profile with BoringSSL settings
 /// (cipher list, curves, signature algorithms, key shares, Chrome toggles).
 /// `Plain` is no emulation: BoringSSL defaults.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum TlsFingerprint {
     Chrome,
     Firefox,
@@ -160,6 +160,7 @@ pub enum TlsFingerprint {
     Ios,
     Android,
     Edge,
+    #[default]
     Plain,
 }
 
