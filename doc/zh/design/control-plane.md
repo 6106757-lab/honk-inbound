@@ -228,7 +228,7 @@ copy pump 在读取新输入前先 flush 嗅探或协议设置阶段已缓冲的
 空闲时也会 flush 待发字节。每个方向先使用 8 KiB 缓冲区；第一次读满即判定为大流量，该方向随后改用 65,535 字节缓冲区，使满载 read 恰好容纳一个最大 AnyTLS frame，不拆成 8 KiB write，也不留下单字节尾帧（仅首帧较小）。空闲和小流量连接不会扩容，因此一条空闲连接的 copy 缓冲区是 16 KiB，而不是 128 KiB。
 应用不需要再发一个请求或关闭连接才能送出当前请求。
 
-首次 EOF 后，两条中继路径只限制空闲排空时间：`DRAIN_DEADLINE` 是没有任何字节进展的 30 秒。活跃 survivor 可以运行超过 30 秒；静默 survivor 不能无限持有 accepted socket。
+用户态复制中继从任一源首次返回 EOF 时启动 30 秒空闲计时，涵盖最后一次刷新和写端半关闭。中继每 100 毫秒采样复制进度，但用单调时钟计算空闲时长。如果任务直到期限过后才再次获得调度，这次轮询就结束排空，除非观察到新的非空读取或目的端新接受的字节。这两种进展都会续期；传输层在刷新过程中自行发送数据不会续期。到期时只统计目的端已接受的字节，清理不再等待正常关闭。原生 `splice` 的半关闭和空闲排空策略不变。
 
 客户端不发 FIN 或 RST 就消失的情况单独限制：TPROXY TCP listener 启用 TCP keepalive（空闲 3600 秒、间隔 15 秒、4 次探测），accepted socket 继承该设置。静默的客户端约一小时后结束其 relay；仍在线的空闲客户端会应答探测，因此长时间空闲的连接保持打开。该错误是客户端侧的 `TimedOut`，内核存在待处理的 ICMP/ARP 软错误时则为 `HostUnreachable`／`NetworkUnreachable`；均按取消结算 Score。
 
@@ -246,7 +246,7 @@ NFQUEUE 冷 cell 重建在同一读锁 guard 内保留 conn-state 快照，并�
 
 `splice.rs` 的 `relay_splice` 在普通 `TcpStream` 之间使用双向零拷贝 `splice(2)`，并传播半关闭。每个方向的首次 splice 都会探测能力。在任何字节进入管道前，EINVAL/ENOSYS/EXDEV/EPERM 会触发无损 copy 回退，并设置进程级禁用标志；创建管道失败也会回退到 copy，但不设置该标志。**不得恢复单向 splice**，它曾导致超时。
 
-`relay_auto` 对 TLS 或协议封装的流使用同一个基于 select 的 copy loop。`vision.rs` 将 Direct Vision carrier 的 socket 借给同一个双向引擎。两条路径都会在首次 EOF 时半关闭对端，剩余排空时间只受空闲期限 `DRAIN_DEADLINE` 限制：连续 30 秒没有字节进展才结束，不会截断仍在传输的另一方向。这样可防止无数据传输的对端使任务和套接字长期停留在 CLOSE-WAIT。UDP 使用 `UdpEndpointPool`。
+TLS 或协议封装的流走 `relay_auto` 的用户态复制路径；进入 Direct 模式的 Vision 可以把底层 socket 交给同一套双向 `splice` 引擎。UDP 走 `UdpEndpointPool`。
 
 ## Reload 与运行时 generation
 
