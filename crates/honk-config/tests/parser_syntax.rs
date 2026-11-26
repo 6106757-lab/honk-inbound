@@ -179,6 +179,23 @@ mod routing_syntax {
     }
 
     #[test]
+    fn vertical_tab_only_routing_line_is_ignored_with_warning() {
+        let mut diagnostics = Vec::new();
+        let config = parse_dae_config_with_detailed_diagnostics(
+            "routing {\n\x0b\n domain(example.com) -> direct\n}",
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(config.routing.rules.len(), 1);
+        let warnings: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "unknown-statement")
+            .collect();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].severity, Severity::Warning);
+    }
+
+    #[test]
     fn direct_marks_decode_decimal_hex_must_and_fallback() {
         for (target, mark, must) in [
             ("direct(mark: 10)", 10, false),
