@@ -367,7 +367,7 @@ impl super::GroupManager {
         excluded: Option<&ExcludedScoreLeaf<'_>>,
         original: Option<&ScoreContinuation>,
     ) -> super::ScoreSelectionPlan<'_> {
-        let Some(group) = self.groups.get(group_name) else {
+        let Some(entry) = self.groups.get(group_name) else {
             observation::gap();
             return self.score_selection_plan(
                 Vec::new(),
@@ -376,11 +376,9 @@ impl super::GroupManager {
                 original,
             );
         };
-        if effects.applies() {
-            self.mark_used(group_name);
-        }
-        let (mode, candidates) = self.selection_candidates_for_target(
-            group,
+        let (mode, candidates) = self.selection_candidates_for_entry(
+            &entry.group,
+            Some(&entry.idle_activity),
             context,
             &mut Vec::new(),
             0,
@@ -403,13 +401,34 @@ impl super::GroupManager {
         effects: super::SelectionEffects,
         rules: ScoreSelectionRules<'_>,
     ) -> (super::SelectionPlanMode, Vec<super::Candidate<'a>>) {
+        self.selection_candidates_for_entry(group, None, context, visited, depth, effects, rules)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::group) fn selection_candidates_for_entry<'a>(
+        &'a self,
+        group: &'a honk_config::group::Group,
+        idle_activity: Option<&'a std::sync::OnceLock<Arc<crate::alive::IdleActivitySlot>>>,
+        context: &ScoreSelectionContext,
+        visited: &mut Vec<&'a str>,
+        depth: usize,
+        effects: super::SelectionEffects,
+        rules: ScoreSelectionRules<'_>,
+    ) -> (super::SelectionPlanMode, Vec<super::Candidate<'a>>) {
         observation::decision(group, context.health_family, effects, || {
             if depth >= super::MAX_GROUP_DEPTH || visited.contains(&group.name.as_str()) {
                 observation::reason("resolution_limit");
                 return (super::SelectionPlanMode::Authoritative, Vec::new());
             }
-            let (mut mode, mut candidates, mut ordinary) =
-                self.normal_candidates_for_target(group, context, visited, depth, effects, rules);
+            let (mut mode, mut candidates, mut ordinary) = self.normal_candidates_for_target(
+                group,
+                idle_activity,
+                context,
+                visited,
+                depth,
+                effects,
+                rules,
+            );
             if candidates.is_empty()
                 && let Some(member) = self.final_member(group)
                 && rules.excluded.is_none_or(|excluded| {
@@ -430,7 +449,13 @@ impl super::GroupManager {
                     };
                     if !observation::decision(group, ipv4.health_family, preflight, || {
                         self.normal_candidates_for_target(
-                            group, &ipv4, visited, depth, preflight, rules,
+                            group,
+                            idle_activity,
+                            &ipv4,
+                            visited,
+                            depth,
+                            preflight,
+                            rules,
                         )
                     })
                     .1
@@ -471,9 +496,6 @@ impl super::GroupManager {
                         }
                     }
                     GroupMember::Group(final_group) => {
-                        if effects.applies() {
-                            self.mark_used(&final_group.name);
-                        }
                         visited.push(group.name.as_str());
                         (mode, candidates) = self.selection_candidates_for_target(
                             final_group,
@@ -521,9 +543,11 @@ impl super::GroupManager {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn normal_candidates_for_target<'a>(
         &'a self,
         group: &'a honk_config::group::Group,
+        idle_activity: Option<&'a std::sync::OnceLock<Arc<crate::alive::IdleActivitySlot>>>,
         context: &ScoreSelectionContext,
         visited: &mut Vec<&'a str>,
         depth: usize,
@@ -540,13 +564,13 @@ impl super::GroupManager {
         } else {
             group.policy
         };
+        if effects.applies() && policy != honk_config::group::GroupPolicy::Selector {
+            self.mark_used(&group.name, idle_activity);
+        }
         let ordinary_score = policy == honk_config::group::GroupPolicy::Score;
         let (mut candidates, withdrawn) = if policy == honk_config::group::GroupPolicy::Selector
             && let Some(GroupMember::Group(subgroup)) = selected_member
         {
-            if effects.applies() {
-                self.mark_used(&subgroup.name);
-            }
             // Apply must reach the chosen child even when its committed readonly view is empty.
             visited.push(group.name.as_str());
             let candidate = self.pick_candidate_for_target(
@@ -755,13 +779,22 @@ impl super::GroupManager {
             ) {
                 return None;
             }
-            let subgroup = self.groups.get(tag)?;
-            self.pick_candidate_for_target(subgroup, context, visited, depth + 1, effects, rules)
-                .filter(|candidate| candidate.node.id == node.id)
-                .map(|mut candidate| {
-                    candidate.via = Some(subgroup);
-                    candidate
-                })
+            let sub_entry = self.groups.get(tag)?;
+            let subgroup = &sub_entry.group;
+            self.pick_candidate_for_entry(
+                subgroup,
+                Some(&sub_entry.idle_activity),
+                context,
+                visited,
+                depth + 1,
+                effects,
+                rules,
+            )
+            .filter(|candidate| candidate.node.id == node.id)
+            .map(|mut candidate| {
+                candidate.via = Some(subgroup);
+                candidate
+            })
         });
         visited.pop();
         candidate
@@ -776,8 +809,23 @@ impl super::GroupManager {
         effects: super::SelectionEffects,
         rules: ScoreSelectionRules<'_>,
     ) -> Option<super::Candidate<'a>> {
-        self.selection_candidates_for_target(
+        self.pick_candidate_for_entry(group, None, context, visited, depth, effects, rules)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::group) fn pick_candidate_for_entry<'a>(
+        &'a self,
+        group: &'a honk_config::group::Group,
+        idle_activity: Option<&'a std::sync::OnceLock<Arc<crate::alive::IdleActivitySlot>>>,
+        context: &ScoreSelectionContext,
+        visited: &mut Vec<&'a str>,
+        depth: usize,
+        effects: super::SelectionEffects,
+        rules: ScoreSelectionRules<'_>,
+    ) -> Option<super::Candidate<'a>> {
+        self.selection_candidates_for_entry(
             group,
+            idle_activity,
             context,
             visited,
             depth,
@@ -851,15 +899,14 @@ impl super::GroupManager {
             .collect();
         let mut withdrawn = Vec::new();
         for tag in &group.groups {
-            let Some(subgroup) = self.groups.get(tag.as_str()) else {
+            let Some(sub_entry) = self.groups.get(tag.as_str()) else {
                 observation::gap();
                 continue;
             };
-            if sub_effects.applies() {
-                self.mark_used(tag);
-            }
-            if let Some(mut candidate) = self.pick_candidate_for_target(
+            let subgroup = &sub_entry.group;
+            if let Some(mut candidate) = self.pick_candidate_for_entry(
                 subgroup,
+                Some(&sub_entry.idle_activity),
                 context,
                 visited,
                 depth + 1,

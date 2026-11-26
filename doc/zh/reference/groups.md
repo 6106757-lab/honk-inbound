@@ -42,7 +42,7 @@ group {
 | `check_url` | `check_url` | `null` | 非 Selector 策略的按组 TCP 健康检查目标。Selector 会忽略该字段并告警。 |
 | —（dae 中不可配置） | `check_interval` | `null` | 按组间隔字段，单位为秒。当前运行时不读取该字段，而使用全局间隔。 |
 | `tolerance` | `tolerance` | `50` | 非负整数毫秒；dae URLTest 组未显式设置时继承 `global.check_tolerance`，显式值优先；运行时有效下限为 1 ms。 |
-| `idle_timeout` | `idle_timeout` | `null` | 非负整数秒，URLTest 不活跃后暂停探测的阈值；省略时健康层使用 1800 秒。 |
+| `idle_timeout` | `idle_timeout` | `null` | 非负整数秒，组不活跃后暂停探测的阈值；省略时健康层使用 1800 秒。 |
 | `interrupt_connections` | `interrupt_connections` | `false` | 选择变化时按捕获的组身份/路径与网络关闭精确旧 TCP/UDP owner，不再仅移除 tracker；共享 XUDP 只退役匹配 view。严格布尔值。 |
 | —（dae 中不可配置） | `id` | 随机 UUID | 字段缺失时生成的内部组标识。 |
 

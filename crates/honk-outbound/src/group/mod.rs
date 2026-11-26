@@ -48,8 +48,8 @@ pub use score::{
 #[cfg(test)]
 pub use state::SelectorChoices;
 pub use state::{
-    InterruptCallback, PersistCallback, SelectorChangeCallback, SelectorError, SelectorMember,
-    SelectorNetworks, SelectorUpdate,
+    InterruptCallback, PersistCallback, SelectedProbeWake, SelectorChangeCallback, SelectorError,
+    SelectorMember, SelectorNetworks, SelectorUpdate,
 };
 
 /// Maximum nesting depth for group → sub-group resolution. Construction-
@@ -287,8 +287,41 @@ fn removed_unique_candidates(
     Some(before)
 }
 
+/// A group as this manager selects through it: its cycle-cut copy and its
+/// lazily cached lock-free idle-activity slot. The fork has no chain routes,
+/// so there is no `routes` / `udp_chain` / `udp_root` here (upstream #510/#511).
+struct ManagedGroup {
+    group: Group,
+    idle_activity: std::sync::OnceLock<Arc<crate::alive::IdleActivitySlot>>,
+}
+
+impl std::borrow::Borrow<Group> for ManagedGroup {
+    fn borrow(&self) -> &Group {
+        &self.group
+    }
+}
+
+impl std::borrow::BorrowMut<Group> for ManagedGroup {
+    fn borrow_mut(&mut self) -> &mut Group {
+        &mut self.group
+    }
+}
+
+impl std::ops::Deref for ManagedGroup {
+    type Target = Group;
+
+    fn deref(&self) -> &Group {
+        &self.group
+    }
+}
+
+impl std::ops::DerefMut for ManagedGroup {
+    fn deref_mut(&mut self) -> &mut Group {
+        &mut self.group
+    }
+}
 pub struct GroupManager {
-    groups: HashMap<String, Group>,
+    groups: HashMap<String, ManagedGroup>,
     /// Node lookup by UUID.
     nodes: HashMap<uuid::Uuid, Node>,
     node_order: Vec<uuid::Uuid>,
@@ -355,6 +388,21 @@ impl GroupManager {
         let mut group_map: HashMap<String, Group> =
             groups.iter().map(|g| (g.name.clone(), g.clone())).collect();
         resolver::break_group_cycles(&mut group_map);
+        // Wrap after cycle-cutting: the fork has no `honk_config::group_graph`,
+        // so the upstream `cut_cycles(&mut managed)` step is the fork's own
+        // `break_group_cycles` above.
+        let group_map: HashMap<String, ManagedGroup> = group_map
+            .into_iter()
+            .map(|(name, group)| {
+                (
+                    name,
+                    ManagedGroup {
+                        group,
+                        idle_activity: std::sync::OnceLock::new(),
+                    },
+                )
+            })
+            .collect();
         for g in groups {
             if g.check_url.is_some() && g.policy == GroupPolicy::Selector {
                 tracing::warn!(
@@ -402,8 +450,8 @@ impl GroupManager {
         domain: ProbeDomain,
         ipver: IpVersion,
     ) -> Option<&Node> {
-        let group = self.groups.get(group_name)?;
-        self.mark_used(group_name);
+        let entry = self.groups.get(group_name)?;
+        let group = &entry.group;
         // The overwhelmingly common selector has only direct members. Avoid
         // constructing its transient candidate/visited vectors; nested
         // groups still take the guarded recursive path below.
@@ -416,8 +464,8 @@ impl GroupManager {
                 .or_else(|| self.last_resort_tcp_leaf(group, domain, SelectionEffects::Apply));
         }
         let mut visited = Vec::with_capacity(MAX_GROUP_DEPTH);
-        self.pick_in_group(
-            group,
+        self.pick_in_group_entry(
+            entry,
             domain,
             ipver,
             &mut visited,
@@ -488,15 +536,26 @@ impl GroupManager {
         ipver: IpVersion,
         effects: SelectionEffects,
     ) -> SelectionPlan<'_> {
-        let Some(group) = self.groups.get(group_name) else {
+        let Some(entry) = self.groups.get(group_name) else {
             return SelectionPlan {
                 mode: SelectionPlanMode::Authoritative,
                 nodes: vec![],
             };
         };
-        if effects.applies() {
-            self.mark_used(group_name);
-        }
+        self.selection_plan_for_group(entry, domain, ipver, effects)
+    }
+
+    // An out-of-line call added about 25 instructions to a direct Selector plan.
+    #[inline(always)]
+    fn selection_plan_for_group<'a>(
+        &'a self,
+        entry: &'a ManagedGroup,
+        domain: ProbeDomain,
+        ipver: IpVersion,
+        effects: SelectionEffects,
+    ) -> SelectionPlan<'a> {
+        let group = &entry.group;
+        let network = SelectionNetwork::from_probe_domain(domain);
         if group.policy == GroupPolicy::Selector
             && group.groups.is_empty()
             && group.final_outbound.is_none()
@@ -510,13 +569,10 @@ impl GroupManager {
                     .collect(),
             };
         }
-        let context = ScoreSelectionContext::aggregate(
-            SelectionNetwork::from_probe_domain(domain),
-            domain,
-            ipver,
-        );
-        let (mode, candidates) = self.selection_candidates_for_target(
+        let context = ScoreSelectionContext::aggregate(network, domain, ipver);
+        let (mode, candidates) = self.selection_candidates_for_entry(
             group,
+            Some(&entry.idle_activity),
             &context,
             &mut Vec::new(),
             0,
