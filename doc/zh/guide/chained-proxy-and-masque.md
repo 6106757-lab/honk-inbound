@@ -140,12 +140,15 @@ proxies:
 
 | 协议 | TCP 组 detour | UDP 组 detour |
 | --- | --- | --- |
-| SOCKS5 / Shadowsocks / Trojan / VMess / VLESS（普通流） / AnyTLS | 支持 | 支持（AnyTLS 为私有 session） |
+| SOCKS5 / Trojan / VMess / VLESS（普通流） / AnyTLS | 支持 | 支持（AnyTLS 为私有 session） |
+| Shadowsocks | 支持（TCP 握手走已连通的前置流） | 拨号前拒绝（UDP 没有可骑的流） |
 | Hysteria2 / TUIC / Juicity | 支持 | 支持（私有 QUIC client） |
 | MASQUE | 支持 | 支持（每路径独立 tunnel，socket 持有 tunnel） |
 | VLESS H2 / Cool / XUDP | 明确拒绝 | 明确拒绝 |
 
 UDP 拨号前会先筛一遍前置：按（末端协议的 UDP 需求 × 前置的 UDP 能力 × 目标端口）逐个检查组内候选前置，筛掉不能用的、换下一个；全部筛掉时立即报错 `detour could not carry UDP to …`，不等满拨号超时。
+
+Shadowsocks 作末端时，TCP 握手在已连通的前置流上跑，不再要求真实 socket；UDP 没有流可骑，走组 detour 的 UDP 仍在拨号前拒绝。Shadowsocks 作前置（carrier）不受影响，仍按原来的直接拨号走。
 
 - 不支持的协议会**拒绝拨号并记日志**，不会静默直连；日志出现 `cannot carry a detour` 时请换协议或去掉该组的 `detour:`。
 - honk 自身发起的流量（DoH、订阅 / geodata 下载）由各自的 `route` / `download_detour` 控制，**不受组 detour 影响**。

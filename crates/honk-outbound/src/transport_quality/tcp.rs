@@ -31,6 +31,14 @@ impl TcpPressure {
     }
 
     pub(crate) fn observe(&mut self, socket: &TcpStream) {
+        use std::os::fd::AsRawFd;
+        self.observe_fd(socket.as_raw_fd());
+    }
+
+    /// Sample the carrier by descriptor, for streams that split their
+    /// socket away from the sampler: the fd stays valid while the split
+    /// halves own the socket, and a chained carrier has none to sample.
+    pub(crate) fn observe_fd(&mut self, fd: std::os::fd::RawFd) {
         let Some(sampler) = self.sampler.as_mut() else {
             return;
         };
@@ -46,7 +54,7 @@ impl TcpPressure {
             return;
         }
         self.last_sample = Some(now);
-        sampler.observe(read_sample(socket, now));
+        sampler.observe(read_sample(fd, now));
     }
 }
 
@@ -120,7 +128,11 @@ impl AsyncWrite for Carrier {
 }
 
 impl Carrier {
-    fn socket(&self) -> Option<&TcpStream> {
+    /// The socket behind this carrier, when there is one: `Some` for a
+    /// direct socket, `None` for a chained stream. Streams that split
+    /// the carrier read this at construction to decide whether pressure
+    /// sampling has anything to sample.
+    pub(crate) fn socket(&self) -> Option<&TcpStream> {
         match self {
             Self::Socket(socket) => Some(socket),
             Self::Chained(_) => None,
@@ -301,24 +313,21 @@ fn unknown_sample(at: Instant) -> CarrierSample {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn read_sample(_socket: &TcpStream, at: Instant) -> CarrierSample {
+fn read_sample(_fd: std::os::fd::RawFd, at: Instant) -> CarrierSample {
     unknown_sample(at)
 }
 
 #[cfg(target_os = "linux")]
-fn read_sample(socket: &TcpStream, at: Instant) -> CarrierSample {
-    use std::os::fd::{AsFd, AsRawFd};
-
+fn read_sample(fd: std::os::fd::RawFd, at: Instant) -> CarrierSample {
     // SAFETY: tcp_info is a C integer-only struct with a valid zero value. The
     // borrowed fd cannot outlive this synchronous call or race owner teardown.
     let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
     let mut length = std::mem::size_of_val(&info) as libc::socklen_t;
-    let fd = socket.as_fd();
     // SAFETY: both writable pointers cover their declared sizes, getsockopt
     // respects the supplied capacity, and no pointer or fd escapes this call.
     let result = unsafe {
         libc::getsockopt(
-            fd.as_raw_fd(),
+            fd,
             libc::IPPROTO_TCP,
             libc::TCP_INFO,
             (&mut info as *mut libc::tcp_info).cast(),

@@ -73,7 +73,8 @@ async fn observed_tcp_loopback_preserves_cancelled_reads_payload_and_half_close(
             .inner
             .socket()
             .expect("a fresh ObservedTcp carries a real socket");
-        let sample = read_sample(socket, Instant::now());
+        use std::os::fd::AsRawFd;
+        let sample = read_sample(socket.as_raw_fd(), Instant::now());
         assert!(sample.rtt.is_some_and(|rtt| !rtt.is_zero()));
         assert!(sample.rx_bytes.is_none_or(|bytes| bytes >= 8192));
         assert!(sample.tx_bytes.is_none_or(|bytes| bytes >= 8192));

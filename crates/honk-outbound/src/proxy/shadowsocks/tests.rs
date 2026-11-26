@@ -204,11 +204,11 @@ fn test_batched_decrypt_split_feeds() {
     assert_eq!(received, payload);
 }
 
-/// End-to-end TCP test: mock legacy-AEAD TCP server (salt + chunk
-/// codec), real `dial` through the inline `SsStream`, bulk data both
-/// ways (chunk boundaries crossed many times).
-#[tokio::test]
-async fn test_dial_tcp_legacy_end_to_end() {
+/// Fake legacy-AEAD TCP server: salt + chunk codec, uppercases the payload
+/// after skipping the 7-byte target header, like the inline server this
+/// replaces in `test_dial_tcp_legacy_end_to_end`.
+async fn spawn_legacy_ss_echo_server() -> SocketAddr {
+    use tokio::io::AsyncWriteExt;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -277,6 +277,15 @@ async fn test_dial_tcp_legacy_end_to_end() {
             carry = rest;
         }
     });
+    server_addr
+}
+
+/// End-to-end TCP test: mock legacy-AEAD TCP server (salt + chunk
+/// codec), real `dial` through the inline `SsStream`, bulk data both
+/// ways (chunk boundaries crossed many times).
+#[tokio::test]
+async fn test_dial_tcp_legacy_end_to_end() {
+    let server_addr = spawn_legacy_ss_echo_server().await;
 
     let node = Node {
         name: "test-ss-tcp".into(),
@@ -762,4 +771,505 @@ async fn shared_source_dispatch_builds_a_shadowsocks_association() {
         .unwrap()
         .unwrap();
     assert!(n > b"hi".len());
+}
+
+/// Minimal SOCKS5 server: no-auth greeting, then a CONNECT it proxies
+/// through to the requested address. Twin of
+/// `crate::proxy::detour::tests::spawn_fake_socks5`, copied here because
+/// that helper is private to its module and the SS rider tests need a
+/// front of their own.
+async fn spawn_fake_socks5() -> SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut greeting = [0u8; 2];
+                if stream.read_exact(&mut greeting).await.is_err() {
+                    return;
+                }
+                let mut methods = vec![0u8; greeting[1] as usize];
+                if stream.read_exact(&mut methods).await.is_err() {
+                    return;
+                }
+                if stream.write_all(&[5, 0]).await.is_err() {
+                    return;
+                }
+                let mut head = [0u8; 4];
+                if stream.read_exact(&mut head).await.is_err() {
+                    return;
+                }
+                let target = match head[3] {
+                    1 => {
+                        let mut buf = [0u8; 6];
+                        if stream.read_exact(&mut buf).await.is_err() {
+                            return;
+                        }
+                        SocketAddr::new(
+                            std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                                buf[0], buf[1], buf[2], buf[3],
+                            )),
+                            u16::from_be_bytes([buf[4], buf[5]]),
+                        )
+                    }
+                    _ => return,
+                };
+                match TcpStream::connect(target).await {
+                    Ok(mut upstream) => {
+                        if stream
+                            .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
+                    }
+                    Err(_) => {
+                        let _ = stream.write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0]).await;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+fn socks5_node(name: &str, server: SocketAddr) -> Node {
+    let mut node = Node {
+        name: name.into(),
+        address: server.ip().to_string(),
+        port: server.port(),
+        outbound: honk_config::node::OutboundConfig::Socks5(Default::default()),
+        ..Default::default()
+    };
+    node.id = node.derive_id();
+    node
+}
+
+fn ss_node(name: &str, server: SocketAddr, method: &str, password: &str) -> Node {
+    let mut node = Node {
+        name: name.into(),
+        address: server.ip().to_string(),
+        port: server.port(),
+        outbound: honk_config::node::OutboundConfig::Shadowsocks(
+            honk_config::node::ShadowsocksConfig {
+                encryption: Some(method.into()),
+                password: Some(password.into()),
+                ..Default::default()
+            },
+        ),
+        ..Default::default()
+    };
+    node.id = node.derive_id();
+    node
+}
+
+/// Fake 2022 TCP server: reads the request handshake (salt, sealed fixed
+/// and variable headers), then one data chunk, uppercases it, and answers
+/// with the 2022 response prologue (salt, sealed fixed header naming the
+/// first payload length, sealed first payload). The target header lives
+/// in the variable header, so the data chunk carries no header to skip.
+async fn spawn_2022_ss_echo_server() -> SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut server, _) = listener.accept().await.unwrap();
+        let method =
+            aead2022::Ss2022Method::new("2022-blake3-aes-128-gcm", "AAECAwQFBgcICQoLDA0ODw==")
+                .unwrap();
+        let mut request_salt = vec![0u8; method.key_len];
+        server.read_exact(&mut request_salt).await.unwrap();
+        let subkey = method.session_subkey(&request_salt);
+        let recv_cipher = method.aead(&subkey).unwrap();
+        let mut recv_nonce = vec![0u8; aead2022::NONCE_LEN];
+        let mut fixed_sealed = vec![0u8; 11 + aead2022::TAG_LEN];
+        server.read_exact(&mut fixed_sealed).await.unwrap();
+        let fixed = recv_cipher.open(&recv_nonce, &fixed_sealed).unwrap();
+        increment_nonce(&mut recv_nonce);
+        assert_eq!(fixed[0], 0, "the request fixed header is a client header");
+        let variable_len = u16::from_be_bytes([fixed[9], fixed[10]]) as usize;
+        let mut variable_sealed = vec![0u8; variable_len + aead2022::TAG_LEN];
+        server.read_exact(&mut variable_sealed).await.unwrap();
+        let _variable = recv_cipher.open(&recv_nonce, &variable_sealed).unwrap();
+        increment_nonce(&mut recv_nonce);
+
+        // One data chunk: decrypt, uppercase, answer with the prologue.
+        let mut buf = vec![0u8; 262144];
+        let n = server.read(&mut buf).await.unwrap();
+        assert!(n > 0, "the client writes its payload after the handshake");
+        let mut pending_len = None;
+        let (out_len, _rest) = decrypt_chunks_in_place(
+            &recv_cipher,
+            &mut recv_nonce,
+            &mut pending_len,
+            &mut buf,
+            n,
+            aead2022::TAG_LEN,
+        )
+        .unwrap();
+        let upper: Vec<u8> = buf[..out_len]
+            .iter()
+            .map(|b| b.to_ascii_uppercase())
+            .collect();
+
+        let mut response_salt = vec![0u8; method.key_len];
+        rand::rng().fill_bytes(&mut response_salt);
+        let send_subkey = method.session_subkey(&response_salt);
+        let send_cipher = method.aead(&send_subkey).unwrap();
+        let mut send_nonce = vec![0u8; aead2022::NONCE_LEN];
+        server.write_all(&response_salt).await.unwrap();
+        let mut fixed_response = Vec::with_capacity(11 + method.key_len);
+        fixed_response.push(aead2022::HEADER_TYPE_SERVER);
+        fixed_response.extend_from_slice(&aead2022::unix_timestamp().to_be_bytes());
+        fixed_response.extend_from_slice(&request_salt);
+        fixed_response.extend_from_slice(&(upper.len() as u16).to_be_bytes());
+        let sealed_fixed = send_cipher.seal(&send_nonce, &fixed_response).unwrap();
+        increment_nonce(&mut send_nonce);
+        server.write_all(&sealed_fixed).await.unwrap();
+        let sealed_first = send_cipher.seal(&send_nonce, &upper).unwrap();
+        server.write_all(&sealed_first).await.unwrap();
+    });
+    server_addr
+}
+
+/// One group-detour scene for an SS rider: a Socks5 front in group
+/// "front", the SS node, and the path the rider dials through.
+struct SsDetourScene {
+    generation: std::sync::Arc<crate::runtime::OutboundRuntimeRegistry>,
+    path: std::sync::Arc<crate::proxy::detour::DetourPath>,
+    ss_runtime: std::sync::Arc<crate::runtime::NodeRuntime>,
+}
+
+fn ss_detour_scene(front: Node, ss: Node) -> SsDetourScene {
+    use honk_config::node::{Group, GroupPolicy};
+    let group = Group {
+        name: "front".into(),
+        policy: GroupPolicy::Selector,
+        nodes: vec![front.id],
+        ..Default::default()
+    };
+    let manager = std::sync::Arc::new(crate::group::GroupManager::new(
+        std::slice::from_ref(&group),
+        std::slice::from_ref(&front),
+    ));
+    let generation = std::sync::Arc::new(
+        crate::runtime::OutboundRuntimeRegistry::build(&[front, ss.clone()]).unwrap(),
+    );
+    let path = std::sync::Arc::new(crate::proxy::detour::DetourPath::to_group(
+        std::sync::Arc::new(crate::proxy::ProxyRegistry::default_resolver().unwrap()),
+        std::sync::Arc::clone(&generation),
+        "front",
+        std::sync::Arc::clone(&manager),
+        honk_config::types::NodeProtocol::SS,
+    ));
+    let ss_runtime = generation
+        .get(&ss.id)
+        .expect("the SS node is in the generation");
+    SsDetourScene {
+        generation,
+        path,
+        ss_runtime,
+    }
+}
+
+/// A legacy Shadowsocks rider dials through a group detour: its TCP
+/// handshake runs over the already-connected Socks5 front stream.
+#[tokio::test]
+async fn ss_rider_dials_through_a_group_detour() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let front_addr = spawn_fake_socks5().await;
+    let ss_addr = spawn_legacy_ss_echo_server().await;
+    let front = socks5_node("front-socks", front_addr);
+    let ss = ss_node("ss-legacy", ss_addr, "aes-128-gcm", "test-password");
+    let scene = ss_detour_scene(front, ss);
+    let handler = ShadowsocksHandler::new();
+    let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
+    let mut stream = handler
+        .dial_runtime_detoured(
+            scene.ss_runtime,
+            target,
+            None,
+            std::time::Duration::from_secs(5),
+            &scene.path,
+        )
+        .await
+        .expect("the SS handshake runs over the front stream");
+    stream.stream.write_all(b"hello").await.unwrap();
+    let mut buf = [0u8; 5];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.stream.read_exact(&mut buf),
+    )
+    .await
+    .expect("the echo answers through the detour")
+    .unwrap();
+    assert_eq!(&buf, b"HELLO");
+}
+
+/// A 2022 Shadowsocks rider dials through a group detour: the 2022
+/// handshake takes the `aead2022::dial_stream` path, a different
+/// generalization point from the legacy one, so it needs its own test.
+#[tokio::test]
+async fn ss_rider_dials_through_a_group_detour_2022() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let front_addr = spawn_fake_socks5().await;
+    let ss_addr = spawn_2022_ss_echo_server().await;
+    let front = socks5_node("front-socks", front_addr);
+    let ss = ss_node(
+        "ss-2022",
+        ss_addr,
+        "2022-blake3-aes-128-gcm",
+        "AAECAwQFBgcICQoLDA0ODw==",
+    );
+    let scene = ss_detour_scene(front, ss);
+    let handler = ShadowsocksHandler::new();
+    let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
+    let mut stream = handler
+        .dial_runtime_detoured(
+            scene.ss_runtime,
+            target,
+            None,
+            std::time::Duration::from_secs(5),
+            &scene.path,
+        )
+        .await
+        .expect("the 2022 handshake runs over the front stream");
+    stream.stream.write_all(b"hello").await.unwrap();
+    let mut buf = [0u8; 5];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.stream.read_exact(&mut buf),
+    )
+    .await
+    .expect("the echo answers through the detour")
+    .unwrap();
+    assert_eq!(&buf, b"HELLO");
+}
+
+/// A legacy Shadowsocks node with its own `dialer-proxy` dials through
+/// it: the node-level path shares the group path's handshake tail.
+#[tokio::test]
+async fn ss_rider_dials_through_its_own_detour() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let front_addr = spawn_fake_socks5().await;
+    let ss_addr = spawn_legacy_ss_echo_server().await;
+    let front = socks5_node("front-socks", front_addr);
+    let mut ss = ss_node("ss-legacy", ss_addr, "aes-128-gcm", "test-password");
+    ss.detour = Some("front".into());
+    ss.id = ss.derive_id();
+    let ss_id = ss.id;
+    let scene = ss_detour_scene(front, ss);
+    assert!(
+        scene
+            .generation
+            .bind_detour(ss_id, std::sync::Arc::clone(&scene.path)),
+        "the node detour binds into the generation"
+    );
+    let handler = ShadowsocksHandler::new();
+    let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
+    let mut stream = handler
+        .dial_runtime(
+            scene.ss_runtime,
+            target,
+            None,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("the SS handshake runs over its own detour");
+    stream.stream.write_all(b"hello").await.unwrap();
+    let mut buf = [0u8; 5];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.stream.read_exact(&mut buf),
+    )
+    .await
+    .expect("the echo answers through the detour")
+    .unwrap();
+    assert_eq!(&buf, b"HELLO");
+}
+
+/// Fake legacy-AEAD server that forwards instead of echoing: after the
+/// handshake it reads the target header out of the first decrypted chunk,
+/// TCP-connects there, and relays both directions (decrypting inbound
+/// chunks, sealing outbound bytes into chunks). The target is whatever
+/// the rider asked the front to reach.
+async fn spawn_forwarding_ss_server() -> SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut server, _) = listener.accept().await.unwrap();
+        let method = "aes-128-gcm";
+        let password = "test-password";
+        let conf = CipherConf::for_method(method).unwrap();
+        let master = ShadowsocksHandler::master_key(password, conf.key_len);
+
+        let mut c2s_salt = vec![0u8; conf.salt_len];
+        server.read_exact(&mut c2s_salt).await.unwrap();
+        let mut c2s_subkey = vec![0u8; conf.key_len];
+        hkdf_sha1_derive(&master, &c2s_salt, &mut c2s_subkey);
+        let c2s_cipher = AeadCipher::new(method, &c2s_subkey).unwrap();
+        let mut c2s_nonce = vec![0u8; conf.nonce_len];
+
+        let mut s2c_salt = vec![0u8; conf.salt_len];
+        rand::rng().fill_bytes(&mut s2c_salt);
+        server.write_all(&s2c_salt).await.unwrap();
+        let mut s2c_subkey = vec![0u8; conf.key_len];
+        hkdf_sha1_derive(&master, &s2c_salt, &mut s2c_subkey);
+        let s2c_cipher = AeadCipher::new(method, &s2c_subkey).unwrap();
+        let mut s2c_nonce = vec![0u8; conf.nonce_len];
+
+        // First decrypted chunk opens with the 7-byte IPv4 target header.
+        let mut buf = vec![0u8; 262144];
+        let mut pending_len = None;
+        let mut plain: Vec<u8> = Vec::new();
+        let mut carry = 0usize;
+        let target = loop {
+            let n = server.read(&mut buf[carry..]).await.unwrap();
+            if n == 0 {
+                return;
+            }
+            let total = carry + n;
+            let (out_len, rest) = decrypt_chunks_in_place(
+                &c2s_cipher,
+                &mut c2s_nonce,
+                &mut pending_len,
+                &mut buf,
+                total,
+                conf.tag_len,
+            )
+            .unwrap();
+            plain.extend_from_slice(&buf[..out_len]);
+            if rest > 0 {
+                buf.copy_within(out_len..out_len + rest, 0);
+            }
+            carry = rest;
+            if plain.len() >= 7 {
+                let ip = std::net::Ipv4Addr::new(plain[1], plain[2], plain[3], plain[4]);
+                let port = u16::from_be_bytes([plain[5], plain[6]]);
+                break SocketAddr::new(ip.into(), port);
+            }
+        };
+        let mut upstream = match tokio::net::TcpStream::connect(target).await {
+            Ok(upstream) => upstream,
+            Err(_) => return,
+        };
+        // Bytes already decrypted past the header belong to the target.
+        if plain.len() > 7 {
+            upstream.write_all(&plain[7..]).await.unwrap();
+        }
+        let (mut ss_read, mut ss_write) = server.into_split();
+        let (mut up_read, mut up_write) = upstream.into_split();
+        let client_to_target = async {
+            let mut buf = vec![0u8; 262144];
+            let mut carry = 0usize;
+            let mut pending_len = None;
+            loop {
+                let n = ss_read.read(&mut buf[carry..]).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                let total = carry + n;
+                let (out_len, rest) = decrypt_chunks_in_place(
+                    &c2s_cipher,
+                    &mut c2s_nonce,
+                    &mut pending_len,
+                    &mut buf,
+                    total,
+                    conf.tag_len,
+                )
+                .unwrap();
+                if out_len > 0 {
+                    up_write.write_all(&buf[..out_len]).await.unwrap();
+                }
+                if rest > 0 {
+                    buf.copy_within(out_len..out_len + rest, 0);
+                }
+                carry = rest;
+            }
+        };
+        let target_to_client = async {
+            let mut buf = vec![0u8; 262144];
+            loop {
+                let n = up_read.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                let mut sealed = Vec::new();
+                seal_chunks_into(&s2c_cipher, &mut s2c_nonce, &buf[..n], &mut sealed).unwrap();
+                ss_write.write_all(&sealed).await.unwrap();
+            }
+        };
+        tokio::join!(client_to_target, target_to_client);
+    });
+    server_addr
+}
+
+/// A Socks5 rider dials through a Shadowsocks front: the front's
+/// rewritten `dial_runtime` must carry the rider's stream to the
+/// rider's target (a Socks5 server here), exactly as production dials
+/// every SS node through the control plane.
+#[tokio::test]
+async fn socks5_rider_dials_through_a_shadowsocks_front() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // Final listener: the Socks5 target CONNECTs here.
+    let final_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let final_addr = final_listener.local_addr().unwrap();
+    let accepted = tokio::spawn(async move {
+        let (mut stream, _) = final_listener.accept().await.unwrap();
+        let mut buf = [0u8; 4];
+        stream.read_exact(&mut buf).await.unwrap();
+        buf
+    });
+    // The rider's target: a Socks5 server that proxies CONNECTs through.
+    let socks_target = spawn_fake_socks5().await;
+    // The front: a Shadowsocks server that forwards to the header target.
+    let ss_addr = spawn_forwarding_ss_server().await;
+    let front = ss_node("ss-front", ss_addr, "aes-128-gcm", "test-password");
+    let rider = socks5_node("socks-rider", socks_target);
+    let scene = ss_detour_scene(front, rider.clone());
+    assert!(
+        scene
+            .generation
+            .bind_detour(rider.id, std::sync::Arc::clone(&scene.path)),
+        "the rider detour binds into the generation"
+    );
+    let rider_runtime = scene
+        .generation
+        .get(&rider.id)
+        .expect("the rider is in the generation");
+    let handler = crate::proxy::socks5::Socks5Handler::new();
+    // The dial target is the final destination. The front is dialled
+    // with the rider node's own server address (the Socks5 server), so
+    // the Socks5 CONNECT inside the handshake names this target and the
+    // fake Socks5 server proxies it to the final listener.
+    let mut stream = handler
+        .dial_runtime(
+            rider_runtime,
+            final_addr,
+            None,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("the Socks5 handshake runs over the SS front stream");
+    stream.stream.write_all(b"ping").await.unwrap();
+    // Flush explicitly: the codec stream may hold sealed bytes until a
+    // later write or read, and this test reads nothing back.
+    stream.stream.flush().await.unwrap();
+    let received = tokio::time::timeout(std::time::Duration::from_secs(10), accepted)
+        .await
+        .expect("the final listener answers within 10s");
+    assert_eq!(
+        received.unwrap(),
+        *b"ping",
+        "the rider's bytes reach the final listener through the SS front"
+    );
 }

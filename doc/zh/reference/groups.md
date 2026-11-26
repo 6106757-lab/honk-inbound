@@ -144,7 +144,7 @@ honk 会忽略无法解析的过滤器，并在诊断中注明其在组内节点
 
 组 detour 的解析集中在 `group_detour()`，TCP 拨号、UDP 拨号以及 Clash / 原生 API 的延迟测试都读同一个结果，所以延迟测试测到的是真实业务链路。前置写成组时，Selector 切换或 Fallback 故障转移会在后续拨号立即生效，不需要重启。协议支持范围与验证方法见[链式代理与 MASQUE 配置指南](../guide/chained-proxy-and-masque.md)。
 
-UDP 拨号前会先筛一遍前置：按（末端协议的 UDP 需求 × 前置的 UDP 能力 × 目标端口）逐个检查组内候选前置，筛掉不能用的、换下一个；全部筛掉时立即报错 `detour could not carry UDP to …`，不等满拨号超时。
+UDP 拨号前会先筛一遍前置：按（末端协议的 UDP 需求 × 前置的 UDP 能力 × 目标端口）逐个检查组内候选前置，筛掉不能用的、换下一个；全部筛掉时立即报错 `detour could not carry UDP to …`，不等满拨号超时。Shadowsocks 作末端时 TCP 可走组 detour，UDP 仍拒绝。
 
 ## 相关文档
 

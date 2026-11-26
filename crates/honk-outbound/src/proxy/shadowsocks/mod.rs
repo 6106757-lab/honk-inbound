@@ -28,6 +28,7 @@
 mod aead2022;
 mod stream;
 
+use crate::transport_quality::tcp::Carrier;
 use async_trait::async_trait;
 use hkdf::Hkdf;
 use honk_config::node::Node;
@@ -335,12 +336,14 @@ impl ShadowsocksHandler {
     }
 
     /// Shared dial tail: run the cipher-family prologue on the connected
-    /// socket and return the inline codec stream (no relay task).
+    /// carrier and return the inline codec stream (no relay task). The
+    /// carrier may be a real socket or an already-connected detour stream;
+    /// pressure sampling degrades to nothing on the latter.
     async fn start_relay(
         &self,
         method: &str,
         password: &str,
-        server: TcpStream,
+        server: Carrier,
         header: Vec<u8>,
         target: SocketAddr,
         target_domain: Option<&str>,
@@ -391,6 +394,23 @@ impl ShadowsocksHandler {
             target_domain: target_domain.map(|s| s.to_string()),
         })
     }
+
+    /// Handshake over a server connection that is already open, whatever it
+    /// rides on, and hand the stream back as the proxy connection.
+    async fn dial_with_stream(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        server: Carrier,
+    ) -> anyhow::Result<ProxyStream> {
+        let config = node.shadowsocks().unwrap();
+        let method = config.encryption.as_deref().unwrap_or("aes-128-gcm");
+        let password = config.password.as_deref().unwrap_or("");
+        let header = addr::encode_address(target, target_domain)?;
+        self.start_relay(method, password, server, header, target, target_domain)
+            .await
+    }
 }
 
 #[async_trait]
@@ -417,15 +437,20 @@ impl TcpOutbound for ShadowsocksHandler {
         let server = crate::util::connect_outbound(&addr, connect_timeout).await?;
 
         let header = addr::encode_address(target, target_domain)?;
-        self.start_relay(method, password, server, header, target, target_domain)
-            .await
+        self.start_relay(
+            method,
+            password,
+            Carrier::Socket(server),
+            header,
+            target,
+            target_domain,
+        )
+        .await
     }
 
-    /// Shadowsocks cannot ride a detour yet: its ciphers are built around a
-    /// real socket and the transport-quality sampling that reads one. Refuse
-    /// rather than dialling the server directly, which would send the node's
-    /// traffic out of the real interface while looking like any other
-    /// connection — the one thing a detour is meant to rule out.
+    /// Dial inside a generation, so a node that names a detour is carried by
+    /// it. The handshake runs over the detour stream exactly as it would
+    /// over a direct socket; a node without a detour dials directly.
     async fn dial_runtime(
         &self,
         runtime: Arc<crate::runtime::NodeRuntime>,
@@ -434,18 +459,34 @@ impl TcpOutbound for ShadowsocksHandler {
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<ProxyStream> {
         crate::proxy::detour::ensure_bound(runtime.node.as_ref(), runtime.detour().as_deref())?;
-        anyhow::ensure!(
-            runtime.detour().is_none(),
-            "node {}: Shadowsocks cannot be dialled through a detour yet",
-            runtime.node.name
-        );
-        self.dial(
+        let server = crate::proxy::detour::connect_server(
             runtime.node.as_ref(),
-            target,
-            target_domain,
+            runtime.detour().as_deref(),
             connect_timeout,
         )
-        .await
+        .await?;
+        self.dial_with_stream(runtime.node.as_ref(), target, target_domain, server)
+            .await
+    }
+
+    /// A detour the caller supplies is the same handshake over a connection
+    /// that came from somewhere else.
+    async fn dial_runtime_detoured(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+        detour: &Arc<crate::proxy::detour::DetourPath>,
+    ) -> anyhow::Result<ProxyStream> {
+        let server = crate::proxy::detour::connect_server(
+            runtime.node.as_ref(),
+            Some(detour),
+            connect_timeout,
+        )
+        .await?;
+        self.dial_with_stream(runtime.node.as_ref(), target, target_domain, server)
+            .await
     }
 
     async fn dial_with_tcp(
@@ -456,11 +497,7 @@ impl TcpOutbound for ShadowsocksHandler {
         server: TcpStream,
         _connect_timeout: std::time::Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let config = node.shadowsocks().unwrap();
-        let method = config.encryption.as_deref().unwrap_or("aes-128-gcm");
-        let password = config.password.as_deref().unwrap_or("");
-        let header = addr::encode_address(target, target_domain)?;
-        self.start_relay(method, password, server, header, target, target_domain)
+        self.dial_with_stream(node, target, target_domain, Carrier::Socket(server))
             .await
     }
 }

@@ -1,6 +1,7 @@
 use super::*;
 use crate::proxy::shadowsocks::{CipherConf, ShadowsocksHandler, hkdf_sha1_derive};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 const METHOD: &str = "aes-128-gcm";
 const PASSWORD: &str = "test-password";
@@ -19,7 +20,7 @@ fn ciphers(master: &[u8], c2s_salt: &[u8], s2c_salt: &[u8]) -> (AeadCipher, Aead
 
 fn legacy_stream(server: TcpStream, send_cipher: AeadCipher, recv_cipher: AeadCipher) -> SsStream {
     SsStream::new(
-        server,
+        Carrier::Socket(server),
         send_cipher,
         vec![0u8; 12],
         recv_cipher,
@@ -203,7 +204,8 @@ async fn legacy_deferred_response_salt() {
         method: METHOD.to_string(),
     };
     // Emulate the handler's legacy dial tail through its production constructor.
-    let mut stream = SsStream::new_legacy(server, send_cipher, send_nonce, prologue);
+    let mut stream =
+        SsStream::new_legacy(Carrier::Socket(server), send_cipher, send_nonce, prologue);
     // The payload goes out BEFORE the server salt exists anywhere.
     stream.write_all(b"ping").await.unwrap();
     let mut buf = [0u8; 4];
