@@ -339,7 +339,12 @@ async fn race_quic_connection(
     // attempt would burn one round-robin turn per address tried, and the
     // attempts could ride different fronts.
     let carrier = match detour {
-        Some(path) => Some(path.resolve(crate::alive::ProbeDomain::DataUdp)?),
+        Some(path) => {
+            let first = endpoints.first().copied().ok_or_else(|| {
+                anyhow::anyhow!("masque node {}: no resolved address to dial", node.name)
+            })?;
+            Some(path.resolve_udp_carrier(first)?)
+        }
         None => None,
     };
     crate::address_race::race_resolved_addrs(endpoints, |endpoint| async move {

@@ -135,6 +135,20 @@ impl ControlPlaneHandle {
                         owning_group.as_deref(),
                         node.protocol(),
                     );
+                    // SS, VLESS and Socks5 cannot ride a group detour on UDP:
+                    // their detoured dial is refused inside the dial. Refuse
+                    // here, before any Score attempt or dial, so the candidate
+                    // fails fast and the next staggered candidate starts.
+                    if detour.is_some()
+                        && matches!(
+                            node.protocol(),
+                            honk_config::types::NodeProtocol::SS
+                                | honk_config::types::NodeProtocol::VLess
+                                | honk_config::types::NodeProtocol::Socks5
+                        )
+                    {
+                        anyhow::bail!("this protocol cannot carry a detour a group names on UDP");
+                    }
                     #[cfg(feature = "native-api")]
                     let mut native_attempt = native.as_ref().and_then(|observation| {
                         observation.attempt(&selection_chain, &node, target_domain.as_deref())

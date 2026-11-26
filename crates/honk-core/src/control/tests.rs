@@ -9,10 +9,10 @@ pub(super) mod support;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use support::KernelUdpReplySocketFactory;
 use support::{
-    FailingUdpTestReplySocketFactory, UdpTestHandler, UdpTestMode, addr, assert_udp_outbound,
-    bytes_of, control_plane, dns_query_payload, serve_test_udp, serve_test_udp_to, udp_test_config,
-    udp_test_forwarder, udp_test_handle, udp_test_handle_with_default_pool,
-    udp_test_handle_with_reply_factory, udp_test_node,
+    FailingUdpTestReplySocketFactory, UdpTestHandler, UdpTestMode, UdpTestReplySocketFactory, addr,
+    assert_udp_outbound, bytes_of, control_plane, dns_query_payload, serve_test_udp,
+    serve_test_udp_to, udp_test_config, udp_test_forwarder, udp_test_handle,
+    udp_test_handle_with_default_pool, udp_test_handle_with_reply_factory, udp_test_node,
 };
 
 mod admission;
@@ -2879,6 +2879,205 @@ async fn udp_node_dead_before_production_dial_has_zero_dials_and_sends() {
 
     assert_eq!(dials.load(std::sync::atomic::Ordering::Relaxed), 0);
     assert_eq!(sends.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
+/// Test double that counts detoured UDP dials. The detoured dial returns a
+/// working transport on purpose: a tripwire, not a claim that the rider may
+/// ride a detour. If production ever calls it for a rider the guard should
+/// have refused, the count exposes it.
+#[derive(Debug)]
+struct DetourTripwireHandler {
+    dials: Arc<std::sync::atomic::AtomicUsize>,
+    detoured_dials: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[derive(Debug)]
+struct TripwireTransport {
+    relay: SocketAddr,
+}
+
+#[async_trait::async_trait]
+impl honk_outbound::proxy::PacketTransport for TripwireTransport {
+    fn relay_addr(&self) -> SocketAddr {
+        self.relay
+    }
+
+    async fn send_packet(&self, _data: &[u8]) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    async fn recv_packet(&self, _buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        std::future::pending().await
+    }
+}
+
+#[async_trait::async_trait]
+impl honk_outbound::proxy::TcpOutbound for DetourTripwireHandler {
+    async fn dial(
+        &self,
+        _node: &Node,
+        _target: SocketAddr,
+        _target_domain: Option<&str>,
+        _connect_timeout: Duration,
+    ) -> anyhow::Result<honk_outbound::proxy::ProxyStream> {
+        anyhow::bail!("TCP dial is not used by the UDP lifecycle tests")
+    }
+}
+
+#[async_trait::async_trait]
+impl honk_outbound::proxy::PacketOutbound for DetourTripwireHandler {
+    async fn dial_udp_transport(
+        &self,
+        _node: &Node,
+        target: SocketAddr,
+        _target_domain: Option<&str>,
+        _connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn honk_outbound::proxy::PacketTransport>> {
+        self.dials
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Arc::new(TripwireTransport { relay: target }))
+    }
+
+    async fn dial_udp_transport_runtime_detoured(
+        &self,
+        _runtime: Arc<honk_outbound::runtime::NodeRuntime>,
+        target: SocketAddr,
+        _target_domain: Option<&str>,
+        _connect_timeout: Duration,
+        _detour: &Arc<honk_outbound::proxy::detour::DetourPath>,
+    ) -> anyhow::Result<Arc<dyn honk_outbound::proxy::PacketTransport>> {
+        self.detoured_dials
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Arc::new(TripwireTransport { relay: target }))
+    }
+}
+
+fn tripwire_test_handle(
+    config: Config,
+    dials: Arc<std::sync::atomic::AtomicUsize>,
+    detoured_dials: Arc<std::sync::atomic::AtomicUsize>,
+) -> ControlPlaneHandle {
+    let router =
+        crate::routing::Router::new(&config.routing.rules, &config.routing.default_outbound)
+            .unwrap();
+    let mut registry = honk_outbound::proxy::ProxyRegistry::new();
+    let handler = Arc::new(DetourTripwireHandler {
+        dials,
+        detoured_dials,
+    });
+    registry.register(
+        honk_outbound::proxy::ProtocolEntry::new(
+            honk_config::types::NodeProtocol::Socks5,
+            handler.clone(),
+        )
+        .with_packet(handler),
+    );
+    // The production endpoint pool binds real UDP reply sockets, which the
+    // sandbox blocks (EPERM); the test pool keeps the flow off real sockets,
+    // the same swap `udp_test_handle` makes.
+    let mut control_plane = ControlPlane::new(
+        config,
+        Box::new(crate::ebpf::mock::MockEbpfBackend::new()),
+        router,
+        Arc::new(registry),
+        crate::dns::DnsResolver::new(&honk_config::dns::DnsConfig::default()).unwrap(),
+        udp_test_forwarder(),
+    )
+    .unwrap();
+    control_plane.udp_pool = Arc::new(
+        crate::control::udp_endpoint::UdpEndpointPool::with_reply_socket_factory(
+            1,
+            Arc::new(UdpTestReplySocketFactory),
+        ),
+    );
+    control_plane.spawn_handle()
+}
+
+fn tripwire_socks5_node(name: &str, port: u16) -> Node {
+    let mut node = Node {
+        name: name.into(),
+        outbound: honk_config::node::OutboundConfig::from_protocol(
+            honk_config::types::NodeProtocol::Socks5,
+        ),
+        address: "127.0.0.1".into(),
+        port,
+        ..Default::default()
+    };
+    node.id = node.derive_id();
+    node
+}
+
+/// A Socks5 rider on a group detour is refused before any dial: the guard in
+/// `prepare_udp_candidates` fails the candidate fast, so neither the
+/// protocol dial nor the detoured dial is attempted. The same rider without
+/// a detour dials normally, proving the flow reaches the dial when the guard
+/// does not apply.
+#[tokio::test]
+async fn udp_group_detour_refuses_non_riding_protocol_before_dialing() {
+    let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let detoured_dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ride = tripwire_socks5_node("ride-socks", 9);
+    let front = tripwire_socks5_node("front-socks", 10);
+    let mut ride_group = Group {
+        name: "ride".into(),
+        policy: honk_config::group::GroupPolicy::Selector,
+        nodes: vec![ride.id],
+        ..Default::default()
+    };
+    ride_group.detour = Some("front".into());
+    let mut config = udp_test_config(
+        "ride",
+        vec![ride.clone(), front.clone()],
+        vec![
+            ride_group,
+            Group {
+                name: "front".into(),
+                policy: honk_config::group::GroupPolicy::Selector,
+                nodes: vec![front.id],
+                ..Default::default()
+            },
+        ],
+    );
+    config.ensure_builtin_nodes();
+    let handle = tripwire_test_handle(config, dials.clone(), detoured_dials.clone());
+    serve_test_udp(&handle).await.unwrap();
+    assert_eq!(
+        dials.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "no protocol dial is attempted for a refused rider"
+    );
+    assert_eq!(
+        detoured_dials.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the detoured dial is never attempted"
+    );
+
+    // Control: the same rider without a detour dials normally.
+    let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let detoured_dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut config = udp_test_config(
+        "ride",
+        vec![ride.clone(), front.clone()],
+        vec![Group {
+            name: "ride".into(),
+            policy: honk_config::group::GroupPolicy::Selector,
+            nodes: vec![ride.id],
+            ..Default::default()
+        }],
+    );
+    config.ensure_builtin_nodes();
+    let handle = tripwire_test_handle(config, dials.clone(), detoured_dials.clone());
+    serve_test_udp(&handle).await.unwrap();
+    assert_eq!(
+        dials.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the rider dials when no detour applies"
+    );
+    assert_eq!(
+        detoured_dials.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "no detoured dial without a detour"
+    );
 }
 
 #[tokio::test]

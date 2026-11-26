@@ -145,6 +145,8 @@ proxies:
 | MASQUE | 支持 | 支持（每路径独立 tunnel，socket 持有 tunnel） |
 | VLESS H2 / Cool / XUDP | 明确拒绝 | 明确拒绝 |
 
+UDP 拨号前会先筛一遍前置：按（末端协议的 UDP 需求 × 前置的 UDP 能力 × 目标端口）逐个检查组内候选前置，筛掉不能用的、换下一个；全部筛掉时立即报错 `detour could not carry UDP to …`，不等满拨号超时。
+
 - 不支持的协议会**拒绝拨号并记日志**，不会静默直连；日志出现 `cannot carry a detour` 时请换协议或去掉该组的 `detour:`。
 - honk 自身发起的流量（DoH、订阅 / geodata 下载）由各自的 `route` / `download_detour` 控制，**不受组 detour 影响**。
 - `detour: direct` 可让某个引用组显式绕过前置。

@@ -35,6 +35,26 @@ impl GroupManager {
         alive.is_alive_for(node_id, domain, ipver)
     }
 
+    /// Whether the node carries UDP itself.
+    #[inline]
+    pub fn node_carries_udp(&self, node: &Node) -> bool {
+        crate::descriptor::node_carries_udp(node)
+    }
+
+    /// Whether `front` can hand a UDP-transport rider a working UDP transport
+    /// to `target_port`.
+    ///
+    /// The screen is the composed check: the front's own UDP capability, its
+    /// DataUdp liveness (a capable front with no UDP state yet inherits TCP
+    /// liveness), and its VLESS port policy for the target port. MASQUE
+    /// nesting is judged by the caller, which knows whether the rider is
+    /// MASQUE.
+    pub fn front_carries_udp_for(&self, front: &Node, target_port: u16) -> bool {
+        self.node_carries_udp(front)
+            && self.is_node_selectable_for_domain(front.id, ProbeDomain::DataUdp, IpVersion::V4)
+            && crate::descriptor::udp_target_allowed(front, target_port)
+    }
+
     /// Keep only capable, alive leaves; absent health tracking skips only health.
     ///
     /// When the group has a custom `check_url` (sing-box urltest `url`

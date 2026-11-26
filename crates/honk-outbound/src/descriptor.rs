@@ -226,6 +226,15 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
     },
 ];
 
+/// Whether the node carries UDP over its own protocol.
+///
+/// The fork has no `Chain` protocol, so there is no tunneled exit to consider;
+/// UDP capability is the per-protocol descriptor predicate.
+#[inline]
+pub fn node_carries_udp(node: &Node) -> bool {
+    (descriptor(node.protocol()).supports_udp)(node)
+}
+
 /// Target policy only; absent UDP capability is handled separately by callers.
 pub fn udp_target_allowed(node: &Node, port: u16) -> bool {
     node.vless()
