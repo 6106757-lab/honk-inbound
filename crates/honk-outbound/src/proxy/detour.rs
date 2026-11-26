@@ -59,6 +59,56 @@ pub(crate) fn transport_error_context(cause: impl std::fmt::Display) -> String {
     format!("QUIC transport error: {cause}")
 }
 
+/// Per-dial detour context: which leg this dial is, and when the whole chain
+/// runs out of time. Created once at the dial entry, threaded down, never
+/// stored on a shared struct (a runtime is shared across concurrent dials;
+/// a dial's hop is not a property of the node). Public because the outbound
+/// traits carry it in their dial methods.
+#[derive(Clone, Copy, Debug)]
+pub struct DetourDialCtx {
+    /// Zero-based detour leg: 0 is the rider's own leg, 1 the front's, …
+    pub hop: usize,
+    /// Absolute deadline for the whole detour dial; every leg waits at most
+    /// what is left of it.
+    pub deadline: tokio::time::Instant,
+}
+
+/// Deepest a detour may nest: four legs, the same cap upstream puts on its
+/// static chains. A cycle past this fails fast instead of burning the dial
+/// timeout one leg at a time.
+pub(crate) const MAX_DETOUR_HOPS: usize = 4;
+
+impl DetourDialCtx {
+    /// A root context for a dial that enters without one (probes, one-shot
+    /// dials): hop 0, deadline three connect timeouts out — the same horizon
+    /// the per-candidate dial timeout and the REALITY setup deadline already
+    /// use, so a leg entered this way is bounded exactly as its caller is.
+    pub(crate) fn root(connect_timeout: Duration) -> Self {
+        Self {
+            hop: 0,
+            deadline: tokio::time::Instant::now() + connect_timeout * 3,
+        }
+    }
+
+    /// The context the next leg down dials with: one hop further out, the
+    /// same deadline.
+    pub(crate) fn child(&self) -> Self {
+        Self {
+            hop: self.hop + 1,
+            deadline: self.deadline,
+        }
+    }
+
+    /// What this leg may still wait: the nominal timeout, capped at the time
+    /// left on the dial — upstream's `budget()` formula, verbatim.
+    pub(crate) fn budget(&self, connect_timeout: Duration) -> Duration {
+        connect_timeout.min(
+            self.deadline
+                .saturating_duration_since(tokio::time::Instant::now()),
+        )
+    }
+}
+
 /// Which group member carries a detour, on each network a MASQUE tunnel can be
 /// dialled on. The tunnel cache compares the whole signature.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,6 +251,19 @@ impl DetourPath {
         match &self.target {
             DetourTarget::Node(node_id) => format!("node:{node_id}"),
             DetourTarget::Group { name, .. } => format!("group:{name}"),
+        }
+    }
+
+    /// A human name for what this path points at, for error reports that
+    /// fail before any front is chosen: the group name, or the node's name.
+    pub(crate) fn target_description(&self) -> String {
+        match &self.target {
+            DetourTarget::Node(node_id) => self
+                .generation
+                .get(node_id)
+                .map(|runtime| runtime.node.name.clone())
+                .unwrap_or_else(|| format!("node:{node_id}")),
+            DetourTarget::Group { name, .. } => name.clone(),
         }
     }
 

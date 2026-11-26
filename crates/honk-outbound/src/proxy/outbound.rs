@@ -90,6 +90,38 @@ pub trait TcpOutbound: Send + Sync {
         anyhow::bail!("this protocol cannot be carried by a detour a group names")
     }
 
+    /// [`Self::dial_runtime`] with the detour dial context threaded through:
+    /// which leg this dial is and when the whole chain runs out of time.
+    /// The default forwards to [`Self::dial_runtime`]; handlers whose dial
+    /// can enter a detour override this so the leg they open carries the
+    /// context instead of a fresh root one.
+    async fn dial_runtime_ctx(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        _ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<ProxyStream> {
+        self.dial_runtime(runtime, target, target_domain, connect_timeout)
+            .await
+    }
+
+    /// [`Self::dial_runtime_detoured`] with the detour dial context threaded
+    /// through. The default forwards to [`Self::dial_runtime_detoured`].
+    async fn dial_runtime_detoured_ctx(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        detour: &Arc<crate::proxy::detour::DetourPath>,
+        _ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<ProxyStream> {
+        self.dial_runtime_detoured(runtime, target, target_domain, connect_timeout, detour)
+            .await
+    }
+
     /// Dial a routed direct flow with a nonzero mark. Outbounds that do not
     /// own the flow's socket cannot apply it and refuse the dial.
     async fn dial_runtime_marked(
@@ -156,6 +188,22 @@ pub trait PacketOutbound: Send + Sync {
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         let _ = detour;
         anyhow::bail!("this protocol cannot carry a detour a group names on UDP")
+    }
+
+    /// [`Self::dial_udp_transport_runtime_detoured`] with the detour dial
+    /// context threaded through. The default forwards to
+    /// [`Self::dial_udp_transport_runtime_detoured`].
+    async fn dial_udp_transport_runtime_detoured_ctx(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        detour: &Arc<crate::proxy::detour::DetourPath>,
+        _ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        self.dial_udp_transport_runtime_detoured(runtime, target, target_domain, connect_timeout, detour)
+            .await
     }
 
     /// UDP counterpart of [`TcpOutbound::dial_runtime_marked`].

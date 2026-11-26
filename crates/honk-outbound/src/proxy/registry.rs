@@ -267,6 +267,27 @@ impl ProxyRegistry {
         .await
     }
 
+    /// [`Self::dial_runtime`] with the detour dial context threaded through.
+    pub async fn dial_runtime_ctx(
+        &self,
+        generation: Arc<crate::runtime::OutboundRuntimeRegistry>,
+        node_id: uuid::Uuid,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<ProxyStream> {
+        let ctx = *ctx;
+        self.dial_generation(generation, node_id, |runtime, entry| {
+            let tcp = Arc::clone(&entry.tcp);
+            Ok(async move {
+                tcp.dial_runtime_ctx(runtime, target, target_domain, connect_timeout, &ctx)
+                    .await
+            })
+        })
+        .await
+    }
+
     /// Dial a node through a detour the caller names, rather than the node's
     /// own — the one a group carries, resolved to this path only once a flow
     /// arrives.
@@ -284,6 +305,30 @@ impl ProxyRegistry {
             let detour = Arc::clone(&detour);
             Ok(async move {
                 tcp.dial_runtime_detoured(runtime, target, target_domain, connect_timeout, &detour)
+                    .await
+            })
+        })
+        .await
+    }
+
+    /// [`Self::dial_runtime_detoured`] with the detour dial context threaded
+    /// through.
+    pub async fn dial_runtime_detoured_ctx(
+        &self,
+        generation: Arc<crate::runtime::OutboundRuntimeRegistry>,
+        node_id: uuid::Uuid,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        detour: Arc<crate::proxy::detour::DetourPath>,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<ProxyStream> {
+        let ctx = *ctx;
+        self.dial_generation(generation, node_id, |runtime, entry| {
+            let tcp = Arc::clone(&entry.tcp);
+            let detour = Arc::clone(&detour);
+            Ok(async move {
+                tcp.dial_runtime_detoured_ctx(runtime, target, target_domain, connect_timeout, &detour, &ctx)
                     .await
             })
         })
@@ -493,6 +538,37 @@ impl ProxyRegistry {
                         target_domain,
                         connect_timeout,
                         &detour,
+                    )
+                    .await
+            })
+        })
+        .await
+    }
+
+    /// [`Self::dial_udp_transport_runtime_detoured`] with the detour dial
+    /// context threaded through.
+    pub async fn dial_udp_transport_runtime_detoured_ctx(
+        &self,
+        generation: Arc<crate::runtime::OutboundRuntimeRegistry>,
+        node_id: uuid::Uuid,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        detour: Arc<crate::proxy::detour::DetourPath>,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        let ctx = *ctx;
+        self.dial_generation(generation, node_id, |runtime, entry| {
+            let packet = Arc::clone(Self::packet_for_runtime(&runtime, entry, target.port())?);
+            Ok(async move {
+                packet
+                    .dial_udp_transport_runtime_detoured_ctx(
+                        runtime,
+                        target,
+                        target_domain,
+                        connect_timeout,
+                        &detour,
+                        &ctx,
                     )
                     .await
             })
