@@ -23,6 +23,8 @@ use super::{
     parse_query, timestamp,
     types::RequestId,
 };
+#[cfg(test)]
+use crate::subscription::FetchFailure;
 use crate::{
     control::ReloadOutcome,
     subscription::{
