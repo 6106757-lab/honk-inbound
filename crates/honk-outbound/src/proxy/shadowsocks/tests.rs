@@ -1273,3 +1273,115 @@ async fn socks5_rider_dials_through_a_shadowsocks_front() {
         "the rider's bytes reach the final listener through the SS front"
     );
 }
+
+/// A Shadowsocks node that names a dialer-proxy must not dial UDP directly:
+/// the UDP dial is refused before any packet is sent. (The sandbox DNS
+/// resolves any name, so this pins the refusal itself, not the refusal's
+/// order relative to resolution; the refusal is the first statement in
+/// `udp_transport`, which is what orders it before resolution.)
+#[tokio::test]
+async fn ss_udp_transport_refuses_a_node_with_a_detour() {
+    let mut node = ss_node(
+        "ss-a",
+        "127.0.0.1:1".parse().unwrap(),
+        "aes-128-gcm",
+        "test-password",
+    );
+    node.address = "ss.invalid:8388".into();
+    node.detour = Some("front".into());
+    node.id = node.derive_id();
+    let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
+    let error = ShadowsocksHandler::new()
+        .dial_udp_transport(&node, target, None, std::time::Duration::from_secs(3))
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("node ss-a: shadowsocks UDP cannot carry detour \"front\""),
+        "unexpected error: {error:#}"
+    );
+}
+
+/// Same refusal for the 2022 cipher family: the refusal sits before the
+/// crypto branch, so both families must hit it.
+#[tokio::test]
+async fn ss_udp_transport_2022_refuses_a_node_with_a_detour() {
+    let mut node = ss_node(
+        "ss-a",
+        "127.0.0.1:1".parse().unwrap(),
+        "2022-blake3-aes-128-gcm",
+        "AAECAwQFBgcICQoLDA0ODw==",
+    );
+    node.address = "ss.invalid:8388".into();
+    node.detour = Some("front".into());
+    node.id = node.derive_id();
+    let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
+    let error = ShadowsocksHandler::new()
+        .dial_udp_transport(&node, target, None, std::time::Duration::from_secs(3))
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("node ss-a: shadowsocks UDP cannot carry detour \"front\""),
+        "unexpected error: {error:#}"
+    );
+}
+
+/// `dialer-proxy: direct` names no detour: the dial proceeds past the
+/// refusal and builds a transport. This is a control: it passes before the
+/// fix too, and guards the exemption once the refusal lands.
+#[tokio::test]
+async fn ss_udp_transport_direct_detour_is_not_a_detour() {
+    let mut node = ss_node(
+        "ss-a",
+        "127.0.0.1:1".parse().unwrap(),
+        "aes-128-gcm",
+        "test-password",
+    );
+    node.detour = Some("direct".into());
+    node.id = node.derive_id();
+    let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
+    let transport = ShadowsocksHandler::new()
+        .dial_udp_transport(&node, target, None, std::time::Duration::from_secs(3))
+        .await
+        .unwrap();
+    assert_eq!(transport.relay_addr(), target);
+}
+
+/// Control: the same node without a detour dials UDP fine, so the refusal
+/// above is caused by the detour, not by a broken node.
+#[tokio::test]
+async fn ss_udp_transport_without_a_detour_still_dials() {
+    let server = spawn_legacy_udp_echo_server().await;
+    let node = ss_node("ss-a", server, "aes-128-gcm", "test-password");
+    let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
+    let transport = ShadowsocksHandler::new()
+        .dial_udp_transport(&node, target, None, std::time::Duration::from_secs(3))
+        .await
+        .unwrap();
+    assert_eq!(transport.relay_addr(), target);
+}
+
+async fn spawn_legacy_udp_echo_server() -> SocketAddr {
+    let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let server_crypto = LegacyUdpCrypto::new("aes-128-gcm", "test-password").unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 65536];
+        loop {
+            let (n, src) = server.recv_from(&mut buf).await.unwrap();
+            let payload = server_crypto.open(&buf[..n]).unwrap();
+            let reply: Vec<u8> = payload
+                .payload()
+                .iter()
+                .map(|b| b.to_ascii_uppercase())
+                .collect();
+            let socks = addr::encode_address("8.8.8.8:53".parse().unwrap(), None).unwrap();
+            let packet = server_crypto.seal(&socks, &reply).unwrap();
+            server.send_to(&packet, src).await.unwrap();
+        }
+    });
+    server_addr
+}

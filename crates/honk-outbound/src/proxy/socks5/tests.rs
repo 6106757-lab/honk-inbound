@@ -965,3 +965,42 @@ async fn test_socks5_handshake_no_auth() {
 }
 
 mod shared_source;
+
+/// A SOCKS5 node that names a dialer-proxy must not dial UDP directly: the
+/// UDP association is refused before the control channel is connected. The
+/// dead proxy address proves the refusal runs before any connect.
+#[tokio::test]
+async fn socks5_udp_transport_refuses_a_node_with_a_detour() {
+    let mut node = socks5_test_node("127.0.0.1:1".parse().unwrap());
+    node.name = "socks-a".into();
+    node.detour = Some("front".into());
+    let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
+    let error = Socks5Handler::new()
+        .dial_udp_transport(&node, target, None, std::time::Duration::from_secs(1))
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("node socks-a: socks5 UDP cannot carry detour \"front\""),
+        "unexpected error: {error:#}"
+    );
+}
+
+/// `dialer-proxy: direct` names no detour: the dial proceeds past the
+/// refusal and fails later, at the dead proxy address.
+#[tokio::test]
+async fn socks5_udp_transport_direct_detour_is_not_a_detour() {
+    let mut node = socks5_test_node("127.0.0.1:1".parse().unwrap());
+    node.name = "socks-a".into();
+    node.detour = Some("direct".into());
+    let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
+    let error = Socks5Handler::new()
+        .dial_udp_transport(&node, target, None, std::time::Duration::from_secs(1))
+        .await
+        .unwrap_err();
+    assert!(
+        !error.to_string().contains("cannot carry detour"),
+        "direct must not be refused: {error:#}"
+    );
+}
