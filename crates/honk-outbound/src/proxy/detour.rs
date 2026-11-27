@@ -596,10 +596,11 @@ pub(crate) async fn connect_server(
         .connect_raced(&endpoints, connect_timeout, ctx)
         .await
         .map_err(|error| {
-            anyhow::anyhow!(
+            let context = format!(
                 "node {}: detour could not reach {address}: {error}",
                 node.name
-            )
+            );
+            error.context(context)
         })?;
     Ok(crate::transport_quality::tcp::Carrier::Chained(stream))
 }
@@ -1289,5 +1290,188 @@ mod tests {
         // The race tried two addresses but the group was selected once: the
         // next pick is the second member, not the first one again.
         assert_eq!(manager.select_node("front").unwrap().name, "socks-b");
+    }
+
+    /// A port nothing listens on: bind, take the address, drop the listener.
+    async fn closed_port() -> SocketAddr {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap()
+    }
+
+    /// A TCP listener that accepts connections and then stays silent forever:
+    /// the peer's handshake waits until its own timeout fires.
+    async fn spawn_silent_tcp() -> SocketAddr {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let _stream = stream;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// A dial that dies on its front reports the front, not the rider: the
+    /// error names hop 0 and the front's id, and a direct dial of the same
+    /// node carries no hop tag at all.
+    #[tokio::test]
+    async fn detour_hop_failure_names_the_failing_front() {
+        let mut front = socks5_node("socks-a", closed_port().await);
+        front.id = front.derive_id();
+        let mut rider = socks5_node("rider", spawn_fake_socks5().await);
+        rider.detour = Some("socks-a".into());
+        rider.id = rider.derive_id();
+        let generation =
+            Arc::new(OutboundRuntimeRegistry::build(&[front.clone(), rider.clone()]).unwrap());
+        let path = DetourPath::new(
+            Arc::new(ProxyRegistry::default_resolver().unwrap()),
+            Arc::clone(&generation),
+            front.id,
+        );
+
+        let error = connect_server(
+            &rider,
+            Some(&path),
+            Duration::from_secs(5),
+            &DetourDialCtx::root(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap_err();
+        let hop = crate::proxy::failed_hop(&error).expect("a front failure is hop-tagged");
+        assert_eq!(hop.hop, 0);
+        assert_eq!(hop.node, Some(front.id));
+        let text = error.to_string();
+        assert!(
+            text.contains("detour hop 0") && text.contains("socks-a"),
+            "{text}"
+        );
+
+        // The same dead node dialled direct carries no hop tag: the tag is a
+        // detour-leg fact, not a property of the failure itself.
+        let direct = connect_server(
+            &front,
+            None,
+            Duration::from_secs(5),
+            &DetourDialCtx::root(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap_err();
+        assert!(crate::proxy::failed_hop(&direct).is_none());
+    }
+
+    /// A second hop that goes silent fails on the shared deadline, not on the
+    /// front's own handshake timeout: the whole two-hop dial returns in well
+    /// under the five seconds the silent leg would otherwise burn.
+    #[tokio::test]
+    async fn detour_second_hop_does_not_wait_out_its_full_timeout() {
+        let mut f2 = socks5_node("f2", spawn_silent_tcp().await);
+        f2.id = f2.derive_id();
+        let mut f1 = socks5_node("f1", spawn_fake_socks5().await);
+        f1.detour = Some("f2".into());
+        f1.id = f1.derive_id();
+        let mut rider = socks5_node("rider", spawn_fake_socks5().await);
+        rider.detour = Some("f1".into());
+        rider.id = rider.derive_id();
+        let generation = Arc::new(
+            OutboundRuntimeRegistry::build(&[f1.clone(), f2.clone(), rider.clone()]).unwrap(),
+        );
+        let proxies = Arc::new(ProxyRegistry::default_resolver().unwrap());
+        let path_to_f2 = Arc::new(DetourPath::new(
+            Arc::clone(&proxies),
+            Arc::clone(&generation),
+            f2.id,
+        ));
+        assert!(generation.bind_detour(f1.id, Arc::clone(&path_to_f2)));
+        let path_to_f1 = DetourPath::new(proxies, Arc::clone(&generation), f1.id);
+
+        let started = std::time::Instant::now();
+        let error = connect_server(
+            &rider,
+            Some(&path_to_f1),
+            Duration::from_secs(5),
+            &DetourDialCtx::root_at(tokio::time::Instant::now() + Duration::from_secs(2)),
+        )
+        .await
+        .unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "a silent second hop waited {elapsed:?}"
+        );
+        let hop = crate::proxy::failed_hop(&error).expect("a silent second hop is hop-tagged");
+        assert_eq!(hop.hop, 1);
+        assert_eq!(hop.node, Some(f2.id));
+        let timed_out = error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
+        });
+        assert!(
+            timed_out,
+            "the second hop failed on the shared deadline: {error}"
+        );
+    }
+
+    /// A detour that points back at itself fails fast on the depth cap: two
+    /// nodes naming each other as detours stop at hop 4, long before the dial
+    /// timeout — the cycle never even opens a socket, it just descends.
+    #[tokio::test]
+    async fn detour_depth_cap_rejects_a_cycle_fast() {
+        let mut a = socks5_node("a", spawn_fake_socks5().await);
+        a.detour = Some("b".into());
+        a.id = a.derive_id();
+        let mut b = socks5_node("b", spawn_fake_socks5().await);
+        b.detour = Some("a".into());
+        b.id = b.derive_id();
+        let mut rider = socks5_node("rider", spawn_fake_socks5().await);
+        rider.detour = Some("a".into());
+        rider.id = rider.derive_id();
+        let generation = Arc::new(
+            OutboundRuntimeRegistry::build(&[a.clone(), b.clone(), rider.clone()]).unwrap(),
+        );
+        let proxies = Arc::new(ProxyRegistry::default_resolver().unwrap());
+        let path_to_a = Arc::new(DetourPath::new(
+            Arc::clone(&proxies),
+            Arc::clone(&generation),
+            a.id,
+        ));
+        let path_to_b = Arc::new(DetourPath::new(
+            Arc::clone(&proxies),
+            Arc::clone(&generation),
+            b.id,
+        ));
+        assert!(generation.bind_detour(a.id, Arc::clone(&path_to_b)));
+        assert!(generation.bind_detour(b.id, Arc::clone(&path_to_a)));
+
+        let started = std::time::Instant::now();
+        let error = connect_server(
+            &rider,
+            Some(&path_to_a),
+            Duration::from_secs(12),
+            &DetourDialCtx::root(Duration::from_secs(12)),
+        )
+        .await
+        .unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "a detour cycle burned {elapsed:?}"
+        );
+        let hop = crate::proxy::failed_hop(&error).expect("a cycle failure is hop-tagged");
+        assert_eq!(hop.hop, 4);
+        assert!(
+            error.to_string().contains("detour depth exceeds 4"),
+            "{error}"
+        );
     }
 }

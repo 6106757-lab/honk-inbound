@@ -127,10 +127,11 @@ async fn open_h2(
                 .connect_raced(&endpoints, connect_timeout, ctx)
                 .await
                 .map_err(|error| {
-                    anyhow::anyhow!(
+                    let context = format!(
                         "masque node {}: detour could not reach {address}: {error}",
                         node.name
-                    )
+                    );
+                    error.context(context)
                 })?;
             stream
         }

@@ -389,11 +389,12 @@ async fn quic_connection_to(
                 .connect_udp_via(carrier, endpoint, Some(node.host()), connect_timeout, ctx)
                 .await
                 .map_err(|error| {
-                    anyhow::anyhow!(
+                    let context = format!(
                         "masque node {}: {}: {error}",
                         node.name,
                         crate::proxy::detour::udp_carry_context(endpoint)
-                    )
+                    );
+                    error.context(context)
                 })?;
             let packet = Arc::new(
                 crate::quic::packet_transport_endpoint_with_mtu(

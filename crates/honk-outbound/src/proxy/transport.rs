@@ -194,10 +194,11 @@ pub(crate) async fn maybe_tls_wrap_concrete(
                 .connect_raced(&endpoints, connect_timeout, ctx)
                 .await
                 .map_err(|error| {
-                    anyhow::anyhow!(
+                    let context = format!(
                         "node {}: detour could not reach {address}: {error}",
                         node.name
-                    )
+                    );
+                    error.context(context)
                 })?;
             // The block's error type has to be pinned here: the detour dial
             // returns before the surrounding `?` conversions have anything to
@@ -279,10 +280,11 @@ pub(crate) async fn maybe_tls_wrap_concrete(
                             Some(path) => ObservedTcp::new_carrier(
                                 crate::transport_quality::tcp::Carrier::Chained(
                                     path.connect(peer, budget, ctx).await.map_err(|error| {
-                                        std::io::Error::other(format!(
+                                        let context = format!(
                                             "node {}: detour could not re-dial {peer}: {error}",
                                             node.name
-                                        ))
+                                        );
+                                        error.context(context)
                                     })?,
                                 ),
                             ),
