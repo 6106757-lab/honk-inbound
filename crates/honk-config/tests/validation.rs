@@ -975,3 +975,157 @@ fn subscription_entry_route_is_validated_as_download_detour() {
         "subscriptions[1].download_detour"
     );
 }
+
+mod detour_cycle_group_members {
+    use honk_config::{
+        Config,
+        group::Group,
+        node::{GroupPolicy, Node, OutboundConfig},
+    };
+
+    /// A SOCKS5 member node. Each node gets its own port: the derived id
+    /// covers address and dial shape but never the name, so two nodes on
+    /// the same address would share an id and the collection check would
+    /// reject them before the cycle walk ever runs.
+    fn member_node(name: &str, detour: Option<&str>, port: u16) -> Node {
+        let mut node = Node {
+            name: name.into(),
+            address: format!("192.0.2.10:{port}"),
+            host: "192.0.2.10".into(),
+            port,
+            outbound: OutboundConfig::Socks5(Default::default()),
+            detour: detour.map(str::to_string),
+            ..Default::default()
+        };
+        node.id = node.derive_id();
+        node
+    }
+
+    fn group(name: &str) -> Group {
+        Group {
+            name: name.into(),
+            policy: GroupPolicy::Selector,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn member_detour_naming_its_own_group_is_a_cycle() {
+        let m = member_node("m", Some("G"), 1080);
+        let mut g = group("G");
+        g.nodes = vec![m.id];
+        let config = Config {
+            nodes: vec![m],
+            groups: vec![g],
+            ..Default::default()
+        };
+        let error = config.validate_detailed().unwrap_err();
+        assert_eq!(error.diagnostic.code, "invalid-node-detour-cycle");
+    }
+
+    #[test]
+    fn member_detour_closing_a_two_step_cycle_is_a_cycle() {
+        let m = member_node("m", Some("H"), 1080);
+        let mut g = group("G");
+        g.nodes = vec![m.id];
+        let mut h = group("H");
+        h.detour = Some("G".into());
+        let config = Config {
+            nodes: vec![m],
+            groups: vec![g, h],
+            ..Default::default()
+        };
+        let error = config.validate_detailed().unwrap_err();
+        assert_eq!(error.diagnostic.code, "invalid-node-detour-cycle");
+    }
+
+    #[test]
+    fn group_walk_reaches_a_member_cycle() {
+        let m = member_node("m", Some("G2"), 1080);
+        let mut g = group("G");
+        g.nodes = vec![m.id];
+        let mut g2 = group("G2");
+        g2.detour = Some("G".into());
+        let config = Config {
+            nodes: vec![m],
+            groups: vec![g, g2],
+            ..Default::default()
+        };
+        let error = config.validate_detailed().unwrap_err();
+        assert_eq!(error.diagnostic.code, "invalid-node-detour-cycle");
+    }
+
+    #[test]
+    fn nested_group_member_cycle_is_rejected() {
+        let m = member_node("m", Some("H"), 1080);
+        let mut g = group("G");
+        g.nodes = vec![m.id];
+        let mut h = group("H");
+        h.groups = vec!["G".into()];
+        let config = Config {
+            nodes: vec![m],
+            groups: vec![g, h],
+            ..Default::default()
+        };
+        let error = config.validate_detailed().unwrap_err();
+        assert_eq!(error.diagnostic.code, "invalid-node-detour-cycle");
+    }
+
+    #[test]
+    fn final_outbound_group_member_cycle_is_rejected() {
+        let m = member_node("m", Some("H"), 1080);
+        let mut g = group("G");
+        g.nodes = vec![m.id];
+        let mut h = group("H");
+        h.final_outbound = Some("G".into());
+        let config = Config {
+            nodes: vec![m],
+            groups: vec![g, h],
+            ..Default::default()
+        };
+        let error = config.validate_detailed().unwrap_err();
+        assert_eq!(error.diagnostic.code, "invalid-node-detour-cycle");
+    }
+
+    #[test]
+    fn member_detour_to_an_unrelated_group_passes() {
+        let m = member_node("m", Some("H"), 1080);
+        let mut g = group("G");
+        g.nodes = vec![m.id];
+        let h = group("H");
+        let config = Config {
+            nodes: vec![m],
+            groups: vec![g, h],
+            ..Default::default()
+        };
+        config.validate_detailed().unwrap();
+    }
+
+    #[test]
+    fn member_without_a_detour_passes() {
+        let m = member_node("m", None, 1080);
+        let mut g = group("G");
+        g.nodes = vec![m.id];
+        let config = Config {
+            nodes: vec![m],
+            groups: vec![g],
+            ..Default::default()
+        };
+        config.validate_detailed().unwrap();
+    }
+
+    #[test]
+    fn group_detour_to_a_member_cycle_still_rejected() {
+        let m = member_node("m", Some("G"), 1080);
+        let mut g = group("G");
+        g.nodes = vec![m.id];
+        g.detour = Some("m".into());
+        let config = Config {
+            nodes: vec![m],
+            groups: vec![g],
+            ..Default::default()
+        };
+        let error = config.validate_detailed().unwrap_err();
+        assert_eq!(error.diagnostic.code, "invalid-node-detour-cycle");
+    }
+}
