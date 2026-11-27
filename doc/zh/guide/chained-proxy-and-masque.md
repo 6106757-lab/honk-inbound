@@ -146,7 +146,7 @@ proxies:
 | MASQUE | 支持 | 支持（每路径独立 tunnel，socket 持有 tunnel） |
 | VLESS H2 / Cool / XUDP | 明确拒绝 | 明确拒绝 |
 
-UDP 拨号前会先筛一遍前置：按（末端协议的 UDP 需求 × 前置的 UDP 能力 × 目标端口）逐个检查组内候选前置，筛掉不能用的、换下一个；全部筛掉时立即报错 `detour could not carry UDP to …`，不等满拨号超时。
+UDP 拨号前会先筛一遍前置：按（末端协议的 UDP 需求 × 前置的 UDP 能力 × 目标端口）逐个检查组内候选前置，筛掉不能用的、换下一个；自身命名了 detour 的 Shadowsocks / SOCKS5 前置也会被筛掉（它的叶函数会直接拒掉这次 UDP 拨号），组改试下一个成员，写 `direct` 的仍可载；全部筛掉时立即报错 `detour could not carry UDP to …`，不等满拨号超时。
 
 XHTTP 也走组 detour：走组 detour 的每次拨号为该连接单独建载体会话走前置，不与节点共享池里的会话混用（走节点自身 detour 的仍共享池）；Trojan / VMess 的 UDP 控制连接同样走这条载体。
 
