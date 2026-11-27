@@ -147,7 +147,7 @@ XHTTP rides a group detour too: each flow riding the group detour opens its own 
 
 A node-level `dialer-proxy` follows the same fail-closed rule: a Shadowsocks or SOCKS5 node that names one has its UDP dial refused before any packet is sent (`node …: shadowsocks/socks5 UDP cannot carry detour …`); its TCP still rides the front. Other protocols' node-level detours are covered by the same binding check, which refuses when the binding is missing.
 
-Dial failures name the failing hop — `detour hop 0 (socks-a): …` counts legs outward from the rider — and share one deadline across the chain, so each leg waits at most `min(connect_timeout, time left)`; a detour cycle fails fast at 4 hops with `detour depth exceeds 4`, and the failure is charged to the front that actually failed, not the rider.
+Dial failures name the failing hop — `detour hop 0 (socks-a): …` counts legs outward from the rider — and share one deadline across the chain, so each leg waits at most `min(connect_timeout, time left)`; a detour cycle fails fast at 4 hops with `detour depth exceeds 4`, and the failure is charged to the front that actually failed, not the rider. UDP legs share the same deadline and the same 4-leg cap.
 
 ## Related docs
 
