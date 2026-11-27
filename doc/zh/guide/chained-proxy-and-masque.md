@@ -125,7 +125,7 @@ proxies:
 - 也识别 `masque://host:port` 形式的手写分享链接；WARP 所需的密钥等字段请以订阅 YAML 提供。
 - 内置网页界面（本组织编译的 doona `v0.1.0-rc.4`）支持对 MASQUE 节点做延迟测试。探针使用独立的高位 TUN 槽位，不会抢占业务隧道的 TUN 设备与默认路由。
 - 一个 MASQUE tunnel 就是一条到端点的 carrier 连接，因此**每条路径各自持有 tunnel**（各自的 TUN 设备与默认路由 metric）。走前置与直连的流量不会共用同一个 tunnel。
-- 节点级 detour 指向另一个 MASQUE 节点会被忽略并告警（会嵌套 tunnel）；组级 detour 也应避免把 MASQUE 节点当前置。
+- MASQUE rider 永不嵌套 tunnel：组 detour 指向 MASQUE 节点时，MASQUE 成员的拨号在 TCP 与 UDP 上都会在拨号时被拒绝（`detour node … is MASQUE and would nest tunnels`）；节点自身的 detour 指向另一个 MASQUE 节点仍在绑定时被忽略并告警。
 
 ## 6. 热切换与重载
 

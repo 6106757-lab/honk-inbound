@@ -145,6 +145,8 @@ For UDP, the front is screened before dialing: group members are checked in orde
 
 XHTTP rides a group detour too: each flow riding the group detour opens its own carrier session through the front instead of sharing the node's pooled sessions (a flow riding the node's own detour keeps pooling), and its UDP control connection rides the same carrier.
 
+A MASQUE rider never nests tunnels: a MASQUE front — a group member or a named node — is refused for it at dial time on TCP and UDP (`detour node … is MASQUE and would nest tunnels`), while a node's own detour to another MASQUE node is still refused at bind time with a warning.
+
 A node-level `dialer-proxy` follows the same fail-closed rule: a Shadowsocks or SOCKS5 node that names one has its UDP dial refused before any packet is sent (`node …: shadowsocks/socks5 UDP cannot carry detour …`); its TCP still rides the front. Other protocols' node-level detours are covered by the same binding check, which refuses when the binding is missing.
 
 Dial failures name the failing hop — `detour hop 0 (socks-a): …` counts legs outward from the rider — and share one deadline across the chain, so each leg waits at most `min(connect_timeout, time left)`; a detour cycle fails fast at 4 hops with `detour depth exceeds 4`, and the failure is charged to the front that actually failed, not the rider. UDP legs share the same deadline and the same 4-leg cap.
