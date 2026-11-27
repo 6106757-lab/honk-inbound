@@ -496,7 +496,9 @@ impl GroupManager {
     /// Nested groups contribute only their own current leaf through
     /// [`Self::flatten_candidates`]; a nested cold URLTest therefore never
     /// contaminates the caller's provenance. Only this requested top-level
-    /// URLTest can return [`SelectionPlanMode::ColdUrlTest`].
+    /// group can return [`SelectionPlanMode::ColdUrlTest`]: a URLTest with
+    /// no measurements at all, or any non-Selector policy whose picked
+    /// member's health data predates the group's idle wake.
     pub fn selection_plan_for_domain(
         &self,
         group_name: &str,
