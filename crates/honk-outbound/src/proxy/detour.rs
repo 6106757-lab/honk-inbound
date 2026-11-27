@@ -62,8 +62,8 @@ pub(crate) fn transport_error_context(cause: impl std::fmt::Display) -> String {
 /// Per-dial detour context: which leg this dial is, and when the whole chain
 /// runs out of time. Created once at the dial entry, threaded down, never
 /// stored on a shared struct (a runtime is shared across concurrent dials;
-/// a dial's hop is not a property of the node). Public because the outbound
-/// traits carry it in their dial methods.
+/// a dial's hop is not a property of the node). Public because honk-core
+/// constructs a root ctx at its dial entries.
 #[derive(Clone, Copy, Debug)]
 pub struct DetourDialCtx {
     /// Zero-based detour leg: 0 is the rider's own leg, 1 the front's, …
