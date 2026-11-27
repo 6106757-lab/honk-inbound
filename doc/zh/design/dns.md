@@ -134,9 +134,9 @@ waiter clone 原始 causal chain，而不是从 display 文本重建。完成的
 
 ### Hosts 快照
 
-构建 generation 时会按声明顺序读取并合并每个可重复的 `use_host` 来源。`true` 选择 `/etc/hosts`，其解析器索引精确名称及别名；路径选择 OxiDNS 兼容的精确、domain 后缀、regexp 和 keyword 规则文件。后定义的同名规则覆盖先定义的规则；精确与最长后缀匹配优先于有序的 regexp 和 keyword 匹配。查询处理不执行文件 I/O。
+构建 generation 时会按声明顺序读取并合并每个可重复的 `use_host` 来源。`true` 选择 `/etc/hosts`，其解析器索引精确名称及别名；路径选择 OxiDNS 兼容的精确、domain 后缀、regexp 和 keyword 规则文件。后定义的同名规则覆盖先定义的规则；精确与最长后缀匹配优先于有序的 regexp 和 keyword 匹配。规则文件的目标也可以是一个域名，此时匹配的名称是别名。加载时在合并全部来源后拒绝环路和超过 8 级的别名链。查询时，CNAME 链与目标在完整管线中嵌套解析得到的应答合成。查询处理不执行文件 I/O。
 
-只有 IN class 的 A 与 AAAA 查询使用该快照。已知名称缺少所请求地址族时返回 `NOERROR`/NODATA，绝不泄漏给上游。hosts 应答 TTL 为 60 秒，绕过正缓存复用，但仍产生正常的路由投影结果。快照在其 generation 内不可变；修改来源后发送 SIGHUP 以发布替换项。加载或解析失败会令启动失败，或在发布前中止 reload。
+只有 IN class 的 A 与 AAAA 查询使用该快照。地址条目缺少所请求地址族时返回 `NOERROR`/NODATA，绝不泄漏给上游。本地地址记录和生成的别名 CNAME 使用 60 秒 TTL；复制的目标记录保留目标自身的 TTL 策略。Hosts 应答绕过正缓存复用；嵌套的别名目标查询保留调用者的缓存策略。合成结果仍经过正常的路由投影。别名合成保留目标最终应答的 `TC` 和完整 RCODE；非 EDNS 客户端无法表示的扩展错误变为不带记录的 `SERVFAIL`。派生查询仅接受一个问题、空 answer 与 authority section，以及至多一个 additional OPT；保留 ID、全部 flags、type、class 及精确的 OPT class/TTL/选项，并独立编码其根名称 owner。不支持的 section 在目标 I/O 前失败，不会丢弃记录或回退到原始名称。快照在其 generation 内不可变；修改来源后发送 SIGHUP 以发布替换项。加载或解析失败会令启动失败，或在发布前中止 reload。
 
 ### 地址族策略
 

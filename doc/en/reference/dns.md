@@ -44,7 +44,7 @@ Listening on `:53` does not preempt LAN traffic policy: non-`must` LAN TCP/UDP53
 
 ## Hosts snapshot (`use_host`)
 
-`use_host` is repeatable. `true` contributes `/etc/hosts` in standard `IP canonical-name aliases...` format; `false` contributes no source; each path contributes an OxiDNS-compatible `matcher IP...` rule file. All sources are read once in declaration order and merged into one snapshot; a later source replaces an earlier definition of the same exact name or matcher. Duplicate source paths are loaded once.
+`use_host` is repeatable. `true`, `yes`, `1` or `on` in any case adds `/etc/hosts`. `false`, `no`, `0`, `off` or an empty value adds nothing and does not remove earlier sources. Any other value is a path. `/etc/hosts`, whether added by `true` or written as a path, uses standard `IP canonical-name aliases...` syntax; every other path is an OxiDNS-compatible `matcher target...` rule file. All sources are read once in declaration order and merged into one snapshot; a later source replaces an earlier definition of the same exact name or matcher. Duplicate source paths are loaded once.
 
 ```dae
 dns {
@@ -55,10 +55,33 @@ dns {
 
 Absolute paths remain explicit. Relative paths prefer an existing copy below `global.data_dir`, then an existing `/var/share/honk` copy, then an existing working-directory path. A missing path remains below `global.data_dir`; the query path uses the resulting immutable snapshot and performs no file I/O.
 
-Custom matchers are `full:example.com` (or an unprefixed exact name), `domain:example.com` (the name and all label-boundary subdomains), `keyword:text`, and `regexp:pattern`. Matching precedence is exact, longest domain suffix, first matching regexp, then first matching keyword; redefining the same matcher replaces its addresses. Full, domain, and keyword names are ASCII case-insensitive and normalize trailing dots. Regexps remain case-sensitive and run against the lowercase name without a trailing dot; use `(?i)` when a regexp needs case-insensitive matching. Duplicate addresses are removed.
+Custom matchers are `full:example.com` (or an unprefixed exact name), `domain:example.com` (the name and all label-boundary subdomains), `keyword:text`, and `regexp:pattern`. Matching precedence is exact, longest domain suffix, first matching regexp, then first matching keyword; redefining the same matcher replaces its target. Full, domain, and keyword names are ASCII case-insensitive and normalize trailing dots. Regexps remain case-sensitive and run against the lowercase name without a trailing dot; use `(?i)` when a regexp needs case-insensitive matching. Duplicate addresses are removed.
 
-After hard `ipv4only`/`ipv6only` filtering, a known IN-class A or AAAA name takes precedence over request rules (including `reject`), cache lookup, and upstream exchange. If the name exists but has no address in the requested family, honk returns NOERROR/NODATA without querying an upstream. Other classes and qtypes continue through the normal pipeline. Hosts answers use a 60-second TTL and bypass honk's DNS cache.
+A rule file has one matcher followed by one or more IPv4/IPv6 addresses or exactly one alias hostname per line. `#` always starts a comment, and there is no quoting, so a matcher cannot contain whitespace or `#`. An example `hosts.txt`:
 
+```text
+full:api.example.com 192.0.2.10 2001:db8::10
+domain:example.org 192.0.2.20
+keyword:internal 192.0.2.30
+regexp:^(foo|bar)\.example$ 192.0.2.40 # Shared address
+```
+
+After hard `ipv4only`/`ipv6only` filtering, a known IN-class A or AAAA name takes precedence over request rules (including `reject`), cache lookup, and upstream exchange. If an address entry has no address in the requested family, honk returns NOERROR/NODATA without querying an upstream. Other classes and qtypes continue through the normal pipeline. Local address records use a 60-second TTL and hosts answers bypass honk's DNS cache.
+
+As a honk extension to the OxiDNS format, a rule may name exactly one domain instead of addresses. The name then becomes an alias of that domain:
+
+```text
+full:a.example b.example
+domain:corp.example gateway.example
+```
+
+The target is normalized like a matcher name and must be a valid hostname; mixing names with addresses, naming two domains, or an exact name aliasing itself is an invalid rule. An A or AAAA query for an alias resolves the target with the same type through the whole pipeline (hosts, request rules, cache, upstream). The answer contains `CNAME` records from the queried name through any further aliases to the target, followed by the target's CNAME and requested address records. Local alias CNAMEs and local address records use a 60-second TTL; records from the target's answer retain the target's own TTL policy. The composed answer is uncached; the target lookup keeps the caller's cache policy, including an explicit cache bypass.
+
+The derived target query requires exactly one question (`QD=1`), empty answer and authority sections (`AN=NS=0`), and either no additional records or exactly one OPT (`AR=0` or `1`). It replaces QNAME while preserving the transaction ID, all header flags, QTYPE and QCLASS. When present, the OPT keeps its exact class, TTL and option bytes, with its root owner encoded independently of the original question. Any other section shape fails before target I/O; honk does not silently strip records or fall back to querying the original name.
+
+A target NODATA answers NOERROR with the CNAME chain only, and a target NXDOMAIN answers NXDOMAIN with the CNAME chain, as RFC 6604 specifies. Other full 12-bit response codes are returned without answer records: EDNS clients receive the full code, while a code that cannot be represented without EDNS becomes SERVFAIL without records. A failed target lookup fails the query. The composed answer preserves the final target response's `TC` bit, even when the composed packet fits within the client's size limit.
+
+After all sources are merged, every alias target must reach a name that is not an alias within eight aliases: a loop or a longer chain is invalid, and the error names the matcher and target.
 SIGHUP builds a new snapshot. Any unreadable source or invalid custom rule aborts startup; on reload the replacement generation fails before publication and the active generation remains in use.
 
 ## EDNS Client Subnet (`client_subnet`)
