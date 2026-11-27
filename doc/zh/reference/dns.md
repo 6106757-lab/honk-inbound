@@ -178,7 +178,7 @@ dns {
 - 被接管的查询只发往选中的上游，遵守 `strategy` 与 `use_host`，不经过缓存和 response 规则，也不回落：查询失败即物理节点连接或探测连接失败。
 - 被接管的查询不走 `-> follow` 路由：直接发往选中的 `-> direct` 上游，节点域名不会跟随内容组出口。
 - 接管按域名生效，并非端到端的下载目标解析策略。下载为路由选择预先解析 URL 域名属于尽力获取信息；代理下载的 URL 域名仍由代理解析，而承载代理自身的节点服务器解析遵守该规则。显式使用 bootstrap 解析器的下载绕过此 hook。
-- 该规则只能与 `qname()` 组合，且所选上游的每条声明都必须是 `-> direct`，否则校验报错：`subtag-dns-condition`、`subtag-dns-action` 或 `subtag-dns-upstream-route`。
+- 该规则只能与 `qname()` 组合，且所选上游的每条声明都必须是 `-> direct`，否则校验报错：`subtag-dns-condition`、`subtag-dns-action`、`subtag-dns-upstream-route` 或 `subtag-dns-regex`。`regex:` 值在校验时编译，无效正则属于配置错误，不会等到启动才失败。正则 `{n,m}` 量词或 `[…]` 字符类内的逗号不会切分参数，因此 `regex:^a{1,2}$` 不必加引号。
 - 上游自身的域名、ECH 发现和离线 `delay` 子命令仍使用 bootstrap 解析器。
 - 每个 DNS 代次根据订阅 tag 和有序规则预计算节点域名的策略结果，包括未匹配结果。使用这些结果时，原生 flow trace 会以 `not_instrumented` 标记为 `partial`：节点域名的规则决策证据尚未采集。
 
