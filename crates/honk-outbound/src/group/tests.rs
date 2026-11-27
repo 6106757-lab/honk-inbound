@@ -547,7 +547,12 @@ fn test_select_marks_group_active() {
     let n = nid("a");
     let nodes = vec![make_node(n, "a")];
     let alive = Arc::new(AliveDialerSet::new());
-    alive.register_idle_group("g", &[nid("a")], Some(Duration::from_secs(3600)));
+    alive.sync_idle_groups(&[idle_reg(
+        "g",
+        vec![nid("a")],
+        Some(Duration::from_secs(3600)),
+        crate::alive::IdleGroupKind::Automatic,
+    )]);
     let m = GroupManager::with_alive_set(
         &[make_group("g", GroupPolicy::URLTest, vec![n])],
         &nodes,
@@ -559,8 +564,21 @@ fn test_select_marks_group_active() {
     m.select_node("g");
     assert!(!alive.is_group_idle("g"));
 
-    // The parallel-dial path also counts as activity.
-    alive.register_idle_group("g2", &[nid("a")], Some(Duration::from_millis(50)));
+    // The parallel-dial path also counts as activity. Full refresh: keep "g".
+    alive.sync_idle_groups(&[
+        idle_reg(
+            "g",
+            vec![nid("a")],
+            Some(Duration::from_secs(3600)),
+            crate::alive::IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "g2",
+            vec![nid("a")],
+            Some(Duration::from_millis(50)),
+            crate::alive::IdleGroupKind::Automatic,
+        ),
+    ]);
     let m2 = GroupManager::with_alive_set(
         &[make_group("g2", GroupPolicy::URLTest, vec![n])],
         &nodes,
@@ -576,7 +594,12 @@ fn idle_selector_suspends_all_but_selected_member() {
     let (a, b) = (nid("a"), nid("b"));
     let nodes = vec![make_node(a, "a"), make_node(b, "b")];
     let alive = Arc::new(AliveDialerSet::new());
-    alive.register_idle_group("sel", &[a, b], None);
+    alive.sync_idle_groups(&[idle_reg(
+        "sel",
+        vec![a, b],
+        None,
+        crate::alive::IdleGroupKind::Automatic,
+    )]);
     let m = GroupManager::with_alive_set(
         &[make_group("sel", GroupPolicy::Selector, vec![a, b])],
         &nodes,
@@ -2037,7 +2060,12 @@ fn peek_selection_plan_keeps_cold_urltest_idle_and_cache_empty() {
     let nodes = vec![make_node(node_id, "cold")];
     let group = make_group("cold", GroupPolicy::URLTest, vec![node_id]);
     let alive = Arc::new(AliveDialerSet::new());
-    alive.register_idle_group("cold", &[nid("cold")], Some(Duration::from_secs(60)));
+    alive.sync_idle_groups(&[idle_reg(
+        "cold",
+        vec![nid("cold")],
+        Some(Duration::from_secs(60)),
+        crate::alive::IdleGroupKind::Automatic,
+    )]);
     let manager = GroupManager::with_alive_set(&[group], &nodes, Some(Arc::clone(&alive)));
 
     assert!(alive.is_group_idle("cold"));
@@ -2170,9 +2198,20 @@ fn peek_selection_plan_keeps_nested_child_idle_and_only_reads_tcp_mirror() {
     let child = make_group("child", GroupPolicy::URLTest, vec![a, b]);
     let parent = make_subgroup("parent", GroupPolicy::Selector, &["child"]);
     let alive = Arc::new(AliveDialerSet::new());
-    for group in ["child", "parent"] {
-        alive.register_idle_group(group, &[nid("a"), nid("b")], Some(Duration::from_secs(60)));
-    }
+    alive.sync_idle_groups(&[
+        idle_reg(
+            "child",
+            vec![nid("a"), nid("b")],
+            Some(Duration::from_secs(60)),
+            crate::alive::IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "parent",
+            vec![nid("a"), nid("b")],
+            Some(Duration::from_secs(60)),
+            crate::alive::IdleGroupKind::Automatic,
+        ),
+    ]);
     let manager = GroupManager::with_alive_set(&[child, parent], &nodes, Some(Arc::clone(&alive)));
     alive.record_probe_latency(
         nid("a"),
@@ -2973,4 +3012,180 @@ async fn cached_idle_activity_slot_obeys_sync_idle_groups_generation_changes() {
     assert_eq!(woken, std::collections::HashSet::from([a, b]));
     tokio::time::sleep(Duration::from_millis(65)).await;
     assert!(alive.is_group_idle("fb"));
+}
+
+#[test]
+fn selection_after_idle_wake_races_the_stale_fallback_pick() {
+    let (a, b) = (nid("a"), nid("b"));
+    let nodes = vec![make_node(a, "a"), make_node(b, "b")];
+    let alive = Arc::new(AliveDialerSet::new());
+    alive.sync_idle_groups(&[idle_reg(
+        "fb",
+        vec![a, b],
+        // A 10ms timeout lets the test age the group past idle with a
+        // short sleep; see the selection sequence below.
+        Some(Duration::from_millis(10)),
+        crate::alive::IdleGroupKind::Automatic,
+    )]);
+    // Both members carry pre-pause measurements; Fallback picks the first
+    // member (a) and would normally dial it alone.
+    alive.record_probe_latency(
+        a,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(100),
+    );
+    alive.record_probe_latency(
+        b,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(10),
+    );
+    let manager = GroupManager::with_alive_set(
+        &[make_group("fb", GroupPolicy::Fallback, vec![a, b])],
+        &nodes,
+        Some(alive.clone()),
+    );
+
+    // The first selection only activates the group: it was never active,
+    // so its warm measurements are trusted and the pick dials alone.
+    let plan = manager.selection_plan_for_domain("fb", ProbeDomain::Tcp, IpVersion::V4);
+    assert_eq!(plan.mode, SelectionPlanMode::Authoritative);
+    assert_eq!(
+        plan.nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        ["a"]
+    );
+    // Age the group past its timeout, then select again: the wake marks
+    // the members stale and races the pick instead of trusting it alone.
+    std::thread::sleep(Duration::from_millis(20));
+    let plan = manager.selection_plan_for_domain("fb", ProbeDomain::Tcp, IpVersion::V4);
+    assert_eq!(plan.mode, SelectionPlanMode::ColdUrlTest);
+    assert_eq!(
+        plan.nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+
+    // Once a fresh probe lands for the pick, the next selection is
+    // authoritative again and dials the pick alone.
+    alive.record_probe_latency(
+        a,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(100),
+    );
+    let plan = manager.selection_plan_for_domain("fb", ProbeDomain::Tcp, IpVersion::V4);
+    assert_eq!(plan.mode, SelectionPlanMode::Authoritative);
+    assert_eq!(
+        plan.nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        ["a"]
+    );
+}
+
+#[test]
+fn selection_after_idle_wake_races_stale_picks_with_old_measurements() {
+    let (a, b) = (nid("a"), nid("b"));
+    let nodes = vec![make_node(a, "a"), make_node(b, "b")];
+    let alive = Arc::new(AliveDialerSet::new());
+    alive.sync_idle_groups(&[
+        idle_reg(
+            "ut",
+            vec![a, b],
+            // 10ms timeouts let the test age the groups past idle with
+            // short sleeps; see the selection sequence below.
+            Some(Duration::from_millis(10)),
+            crate::alive::IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "sc",
+            vec![a, b],
+            Some(Duration::from_millis(10)),
+            crate::alive::IdleGroupKind::Automatic,
+        ),
+    ]);
+    // Old measurements exist for both members, so the existing all-MAX
+    // Cold branch does not fire: only the wake staleness can race here.
+    alive.record_probe_latency(
+        a,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(100),
+    );
+    alive.record_probe_latency(
+        b,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(10),
+    );
+    let manager = GroupManager::with_alive_set(
+        &[
+            make_group("ut", GroupPolicy::URLTest, vec![a, b]),
+            make_group("sc", GroupPolicy::Score, vec![a, b]),
+        ],
+        &nodes,
+        Some(alive.clone()),
+    );
+
+    // The first selections only activate the groups: neither was active,
+    // so their warm measurements are trusted and each pick dials alone.
+    let plan = manager.selection_plan_for_domain("ut", ProbeDomain::Tcp, IpVersion::V4);
+    assert_eq!(plan.mode, SelectionPlanMode::Authoritative);
+    let plan = manager.selection_plan_for_domain("sc", ProbeDomain::Tcp, IpVersion::V4);
+    assert_eq!(plan.mode, SelectionPlanMode::Authoritative);
+    // Age both groups past their timeout, then select "ut" again: the
+    // wake marks the members stale and races the pick.
+    std::thread::sleep(Duration::from_millis(20));
+    // URLTest picks the lowest latency (b) and races it against a.
+    let plan = manager.selection_plan_for_domain("ut", ProbeDomain::Tcp, IpVersion::V4);
+    assert_eq!(plan.mode, SelectionPlanMode::ColdUrlTest);
+    assert_eq!(
+        plan.nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        ["b", "a"]
+    );
+    alive.record_probe_latency(
+        b,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(10),
+    );
+    let plan = manager.selection_plan_for_domain("ut", ProbeDomain::Tcp, IpVersion::V4);
+    assert_eq!(plan.mode, SelectionPlanMode::Authoritative);
+    assert_eq!(
+        plan.nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        ["b"]
+    );
+
+    // Score also races its stale pick instead of dialing it alone.
+    // Age both groups past their timeout again first: "ut" was just
+    // selected, so without the sleep its activity would keep the
+    // members' other group live and the wake would mark nothing.
+    std::thread::sleep(Duration::from_millis(20));
+    let plan = manager.selection_plan_for_domain("sc", ProbeDomain::Tcp, IpVersion::V4);
+    assert_eq!(plan.mode, SelectionPlanMode::ColdUrlTest);
+    assert_eq!(plan.nodes.len(), 2);
+    let pick = plan.nodes[0].name.clone();
+    alive.record_probe_latency(
+        if pick == "a" { a } else { b },
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(10),
+    );
+    let plan = manager.selection_plan_for_domain("sc", ProbeDomain::Tcp, IpVersion::V4);
+    assert_eq!(plan.mode, SelectionPlanMode::Authoritative);
+    assert_eq!(plan.nodes.len(), 1);
+    assert_eq!(plan.nodes[0].name, pick);
 }

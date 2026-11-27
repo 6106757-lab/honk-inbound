@@ -220,59 +220,6 @@ impl AliveDialerSet {
             .max(1)
     }
 
-    /// Register an automatic group for idle-aware probe suspension.
-    ///
-    /// `members` are the group's direct member NodeIds. `idle_timeout` defaults
-    /// to [`DEFAULT_GROUP_IDLE_TIMEOUT`] when `None`. Replaces any prior entry
-    /// for `group`; config reload uses [`Self::sync_idle_groups`].
-    pub fn register_idle_group(
-        &self,
-        group: &str,
-        members: &[Uuid],
-        idle_timeout: Option<Duration>,
-    ) {
-        let mut idle = self.idle_groups.write();
-        let generation = self.idle_generation.fetch_add(1, Ordering::AcqRel) + 1;
-        let timeout = idle_timeout.unwrap_or(DEFAULT_GROUP_IDLE_TIMEOUT);
-        let last_active_ns =
-            self.preserve_last_active_ns(idle.groups.get(group), IdleGroupKind::Automatic, timeout);
-        if let Some(old) = idle.groups.remove(group) {
-            for member in old.members {
-                if let Some(list) = idle.node_groups.get_mut(&member) {
-                    list.retain(|name| name != group);
-                    if list.is_empty() {
-                        idle.node_groups.remove(&member);
-                    }
-                }
-            }
-        }
-        let mut dedup_members = Vec::with_capacity(members.len());
-        for &member in members {
-            if !dedup_members.contains(&member) {
-                dedup_members.push(member);
-                idle.node_groups
-                    .entry(member)
-                    .or_default()
-                    .push(group.to_string());
-            }
-        }
-        let recovery_members = dedup_non_builtin(&dedup_members);
-        idle.groups.insert(
-            group.to_string(),
-            IdleGroupEntry {
-                members: dedup_members,
-                tcp_recovery_members: recovery_members.clone(),
-                udp_recovery_members: recovery_members,
-                activity: Arc::new(IdleActivitySlot::new(
-                    generation,
-                    IdleGroupKind::Automatic,
-                    timeout,
-                    last_active_ns,
-                )),
-            },
-        );
-    }
-
     /// Replace the whole custom check-URL table (config reload), same
     /// shape as [`AliveDialerSet::sync_idle_groups`]: `groups` is
     /// `(group name, check_url)` for every group that has a custom
@@ -383,21 +330,27 @@ impl AliveDialerSet {
     /// resolves to a builtin, or the tag stays filtered forever.
     pub(crate) fn mark_url_probe_succeeded(&self, node_id: &str, url: &str) {
         let key = (node_id.to_string(), url.to_string());
-        let mut states = self.url_states.write();
-        let e = states.entry(key).or_insert_with(UrlProbeState::new);
-        if e.alive {
-            e.consecutive_failures = 0;
-            e.consecutive_successes = 0;
-            e.cooldown_until = Instant::now();
-        } else {
-            e.consecutive_successes += 1;
-            e.consecutive_failures = 0;
-            if e.consecutive_successes >= RECOVERY_SUCCESSES_NEEDED {
-                e.alive = true;
+        {
+            let mut states = self.url_states.write();
+            let e = states.entry(key).or_insert_with(UrlProbeState::new);
+            if e.alive {
+                e.consecutive_failures = 0;
                 e.consecutive_successes = 0;
                 e.cooldown_until = Instant::now();
+            } else {
+                e.consecutive_successes += 1;
+                e.consecutive_failures = 0;
+                if e.consecutive_successes >= RECOVERY_SUCCESSES_NEEDED {
+                    e.alive = true;
+                    e.consecutive_successes = 0;
+                    e.cooldown_until = Instant::now();
+                }
             }
         }
+        // A URL probe success refreshes the (tag, url) data selection
+        // trusts (the average is fed when the pair is alive; a still-dead
+        // pair is excluded either way), so the wake staleness ends.
+        self.clear_url_stale(node_id, url);
     }
 
     /// Record a failed custom-URL probe: TCP-probe parity — three
@@ -405,18 +358,26 @@ impl AliveDialerSet {
     /// with no permanent stop.
     pub(crate) fn record_url_probe_failure(&self, node_id: &str, url: &str) {
         let key = (node_id.to_string(), url.to_string());
-        let mut states = self.url_states.write();
-        let e = states.entry(key).or_insert_with(UrlProbeState::new);
-        e.consecutive_successes = 0;
-        e.consecutive_failures += 1;
-        let backoff = probe_backoff(
-            self.base_cooldown,
-            self.max_cooldown,
-            e.consecutive_failures,
-        );
-        e.cooldown_until = Instant::now() + backoff;
-        if e.consecutive_failures >= probe_failure_threshold(ProbeDomain::Tcp) {
-            e.alive = false;
+        {
+            let mut states = self.url_states.write();
+            let e = states.entry(key).or_insert_with(UrlProbeState::new);
+            e.consecutive_successes = 0;
+            e.consecutive_failures += 1;
+            let backoff = probe_backoff(
+                self.base_cooldown,
+                self.max_cooldown,
+                e.consecutive_failures,
+            );
+            e.cooldown_until = Instant::now() + backoff;
+            if e.consecutive_failures >= probe_failure_threshold(ProbeDomain::Tcp) {
+                e.alive = false;
+            }
+        }
+        // Only a failure that flips the pair dead refreshes what selection
+        // trusts; a single failure below the threshold leaves the old URL
+        // latency in place, so the data stays stale.
+        if !self.is_alive_for_url(node_id, url) {
+            self.clear_url_stale(node_id, url);
         }
     }
 
@@ -566,19 +527,14 @@ impl AliveDialerSet {
         false
     }
 
-    /// Record activity for an automatic group.
+    /// Authoritative slow path for recording activity for an automatic group
+    /// that also returns the group's [`IdleActivitySlot`] for subsequent
+    /// lock-free refreshes via [`Self::try_touch_activity_slot`].
     ///
     /// When a suspended automatic group becomes active again, health checks
     /// resume and its direct members are probed immediately. `Selector` groups
     /// and groups with `idle_timeout == 0` stay idle without firing per-selection
     /// wake-up probes.
-    pub fn mark_group_active(&self, group: &str) {
-        let _ = self.mark_group_active_slot(group);
-    }
-
-    /// Authoritative slow path for [`Self::mark_group_active`] that also returns
-    /// the group's [`IdleActivitySlot`] for subsequent lock-free refreshes via
-    /// [`Self::try_touch_activity_slot`].
     pub fn mark_group_active_slot(&self, group: &str) -> Option<Arc<IdleActivitySlot>> {
         let idle = self.idle_groups.read();
         let entry = idle.groups.get(group)?;
@@ -594,18 +550,72 @@ impl AliveDialerSet {
         let prev = slot.last_active_ns.fetch_max(now_ns, Ordering::AcqRel);
         if prev == 0 || now_ns.saturating_sub(prev) >= slot.timeout_ns {
             let members = entry.members.clone();
+            // The group's probes were suspended until this wake, so members
+            // whose probes were actually paused now carry stale health data
+            // until a fresh probe lands. Only those members are marked: a
+            // member held fixed by a Selector, or one whose other groups
+            // are still active, never stopped probing, so its data is fresh.
+            // The waking group itself is carved out: `fetch_max` above
+            // already stamped it active.
+            //
+            // A group that was never active (`prev == 0`) is NOT marked:
+            // its probes never ran while it was idle, so any data it holds
+            // was recorded after sync (fresh) or does not exist at all —
+            // and the no-measurements Cold branch already races that case.
+            // Marking a never-active group would race a first selection
+            // whose warm measurements are seconds old, which breaks the
+            // TCP recovery and Score paths that dial the pick alone.
+            // (One known gap: `preserve_last_active_ns` also collapses a
+            // group that was already idle past its timeout at sync time to
+            // `prev == 0`, so its first post-reload selection is not
+            // marked; its probes resume on the wake and refresh the data
+            // within a cycle. See plan §11.)
+            let stale: Vec<Uuid> = if prev == 0 {
+                Vec::new()
+            } else {
+                members
+                    .iter()
+                    .copied()
+                    .filter(|id| {
+                        *id != honk_config::config::BLOCK_NODE_ID
+                            && *id != honk_config::config::DIRECT_NODE_ID
+                            && !self.selected_nodes.read().contains(id)
+                            && idle.node_groups.get(id).is_some_and(|groups| {
+                                groups.iter().all(|name| {
+                                    name == group
+                                        || idle
+                                            .groups
+                                            .get(name)
+                                            .is_some_and(|entry| self.is_entry_idle(entry))
+                                })
+                            })
+                    })
+                    .collect()
+            };
             drop(idle);
+            self.mark_stale(&stale);
             let custom_url = self.group_check_urls.read().get(group).cloned();
             let has_custom_url = if let Some(url) = custom_url {
                 let now = Instant::now();
+                let pinned = self.pinned_url_members_for(group);
+                let mut stale_urls = Vec::new();
                 {
                     let mut url_states = self.url_states.write();
-                    for ((_, state_url), state) in url_states.iter_mut() {
+                    for ((tag, state_url), state) in url_states.iter_mut() {
                         if state_url == &url {
                             state.cooldown_until = now;
+                            // Pinned members keep URL probing while idle,
+                            // so their data is fresh; the rest is stale
+                            // until the wake probe lands. A never-active
+                            // group (`prev == 0`) carries no aged URL data
+                            // either — see the global marker above.
+                            if prev != 0 && !pinned.contains(tag) {
+                                stale_urls.push((tag.clone(), url.clone()));
+                            }
                         }
                     }
                 }
+                self.mark_url_stale(&stale_urls);
                 self.enqueue_url_group_wake(group);
                 true
             } else {
@@ -656,13 +666,69 @@ impl AliveDialerSet {
 
     /// Whether periodic probing of this node is suspended because every
     /// group it belongs to is idle. Nodes outside any group and nodes a
-    /// group holds fixed (see [`Self::set_selected_nodes`]) are never
+    /// group holds fixed (see [`Self::replace_selected_nodes`]) are never
     /// suspended.
     pub fn is_probe_suspended(&self, node_id: Uuid) -> bool {
         if self.selected_nodes.read().contains(&node_id) {
             return false;
         }
         self.is_groups_idle_for_node(node_id)
+    }
+
+    /// Whether this node's health data predates its group's idle wake: its
+    /// probes were suspended until the wake and no fresh probe has landed
+    /// yet. Selection races such members instead of trusting them alone.
+    pub fn is_stale(&self, node_id: Uuid) -> bool {
+        self.stale_members.read().contains_key(&node_id)
+    }
+
+    /// Same as [`Self::is_stale`] for custom-`check_url` groups, keyed by
+    /// the member tag the URL probe state uses.
+    pub fn is_url_stale(&self, tag: &str, url: &str) -> bool {
+        self.stale_url_members
+            .read()
+            .contains_key(&(tag.to_string(), url.to_string()))
+    }
+
+    /// Mark members stale at their group's idle wake (see
+    /// [`Self::mark_group_active_slot`]). Only members whose probes were
+    /// actually suspended may be marked; the caller computes that set.
+    pub(crate) fn mark_stale(&self, members: &[Uuid]) {
+        if members.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut stale = self.stale_members.write();
+        for &member in members {
+            stale.insert(member, now);
+        }
+    }
+
+    /// Mark (tag, url) pairs stale at a custom-`check_url` group's wake.
+    pub(crate) fn mark_url_stale(&self, pairs: &[(String, String)]) {
+        if pairs.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut stale = self.stale_url_members.write();
+        for pair in pairs {
+            stale.insert(pair.clone(), now);
+        }
+    }
+
+    /// Clear a node's staleness once a fresh probe outcome has refreshed
+    /// the data selection trusts (see `record_probe_latency_state` and
+    /// `mark_unavailable_state`).
+    pub(crate) fn clear_stale(&self, node_id: Uuid) {
+        self.stale_members.write().remove(&node_id);
+    }
+
+    /// Clear a (tag, url) pair's staleness once a fresh URL probe outcome
+    /// has refreshed its data.
+    pub(crate) fn clear_url_stale(&self, tag: &str, url: &str) {
+        self.stale_url_members
+            .write()
+            .remove(&(tag.to_string(), url.to_string()));
     }
 
     pub(super) fn needs_idle_recovery(&self, node_id: Uuid, domain: ProbeDomain) -> bool {
@@ -746,7 +812,10 @@ impl AliveDialerSet {
     }
 
     /// Atomically replace the fixed probe-node set and return newly added node
-    /// IDs. Holds only the leaf `selected_nodes` lock.
+    /// IDs. The set holds a manual selection (Selector choice, an automatic
+    /// group's pin) or a non-builtin node `final`; they keep periodic probing
+    /// while idle, so a manually selected dead node can still recover.
+    /// Holds only the leaf `selected_nodes` lock.
     pub fn replace_selected_nodes(&self, nodes: HashSet<Uuid>) -> Vec<Uuid> {
         let mut current = self.selected_nodes.write();
         let added = nodes
@@ -766,17 +835,5 @@ impl AliveDialerSet {
                 self.trigger_probe_node_only(id);
             }
         }
-    }
-
-    /// Replace the nodes groups hold fixed: a manual selection (Selector
-    /// choice, an automatic group's pin) or a non-builtin node `final`. They
-    /// keep periodic probing while idle, so a manually selected dead node can
-    /// still recover. Returns the nodes this took out of idle suspension.
-    pub fn set_selected_nodes(&self, nodes: HashSet<Uuid>) -> Vec<Uuid> {
-        let added = self.replace_selected_nodes(nodes);
-        added
-            .into_iter()
-            .filter(|id| self.is_groups_idle_for_node(*id))
-            .collect()
     }
 }

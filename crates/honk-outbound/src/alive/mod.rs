@@ -439,6 +439,15 @@ pub struct AliveDialerSet {
     /// Nodes a group holds fixed (manual selection or non-builtin node `final`);
     /// they keep periodic probing while their groups are idle.
     selected_nodes: RwLock<HashSet<Uuid>>,
+    /// Members whose health data predates their group's idle wake: their
+    /// probes were suspended until the wake, and no fresh probe has landed
+    /// yet. Keyed by node id, valued by the wake instant (observability
+    /// only — no expiry is derived from it). Selection races such members
+    /// instead of trusting them alone (see `mark_group_active_slot`).
+    stale_members: RwLock<HashMap<Uuid, Instant>>,
+    /// Same staleness as `stale_members`, for custom-`check_url` groups:
+    /// (member tag, check URL) pairs whose URL probe data predates the wake.
+    stale_url_members: RwLock<HashMap<(String, String), Instant>>,
     /// Automatic group name → pinned member tags that keep custom-`check_url`
     /// probing while the group is idle.
     pinned_url_members: RwLock<HashMap<String, HashSet<String>>>,
@@ -530,6 +539,8 @@ impl AliveDialerSet {
             idle_generation: CachePadded(AtomicU64::new(0)),
             idle_groups: RwLock::default(),
             selected_nodes: RwLock::new(HashSet::new()),
+            stale_members: RwLock::new(HashMap::new()),
+            stale_url_members: RwLock::new(HashMap::new()),
             pinned_url_members: RwLock::new(HashMap::new()),
             pending_url_group_wakes: Mutex::new(HashSet::new()),
             url_group_wake_notify: tokio::sync::Notify::new(),
@@ -765,7 +776,7 @@ impl AliveDialerSet {
 
     pub fn remove_node(&self, node_id: Uuid) {
         let mut registered = self.registered.write();
-        registered.remove(&node_id);
+        let removed = registered.remove(&node_id);
         self.states.write().remove(&node_id);
         self.collections.write().remove(&node_id);
         if let Some(observations) = self.health_observations.write().as_mut() {
@@ -783,6 +794,24 @@ impl AliveDialerSet {
         self.last_emergency_tcp.lock().remove(&node_id);
         self.last_emergency_udp.lock().remove(&node_id);
         self.trigger_pending.lock().remove(&node_id);
+        // A removed node must not keep a wake-staleness marker (a later
+        // re-registration starts with fresh probe data), and its pinned
+        // URL membership must go with it. Pins are keyed by member tag,
+        // which is the node name for direct members.
+        self.stale_members.write().remove(&node_id);
+        if let Some(node) = removed {
+            let tag = node.name.clone();
+            {
+                let mut pinned = self.pinned_url_members.write();
+                for members in pinned.values_mut() {
+                    members.remove(&tag);
+                }
+                pinned.retain(|_, members| !members.is_empty());
+            }
+            self.stale_url_members
+                .write()
+                .retain(|(member_tag, _), _| member_tag != &tag);
+        }
     }
 
     /// A link/address/route change invalidates probe backoff that may have

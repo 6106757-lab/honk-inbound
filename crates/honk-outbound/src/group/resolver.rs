@@ -883,7 +883,15 @@ mod native_probe_tests {
             ..Default::default()
         };
         let alive = Arc::new(AliveDialerSet::new());
-        alive.register_idle_group(&group.name, &group.nodes, Some(Duration::from_secs(60)));
+        alive.sync_idle_groups(&[crate::alive::IdleGroupRegistration {
+            name: group.name.clone(),
+            members: group.nodes.clone(),
+            idle_timeout: Some(Duration::from_secs(60)),
+            kind: crate::alive::IdleGroupKind::Automatic,
+            // Config nodes are never builtins, so recovery is the member list.
+            tcp_recovery_members: group.nodes.clone(),
+            udp_recovery_members: group.nodes.clone(),
+        }]);
         let manager = GroupManager::with_alive_set(&[group], &nodes, Some(alive.clone()));
         let member = GroupMember::Group(manager.group("urltest").unwrap());
         assert!(

@@ -164,7 +164,7 @@ async fn reject_http_change(change: fn(&mut Config)) {
         !cp.reload_runtime_config(candidate, Default::default())
             .await
     );
-    cp.alive_set().mark_group_active("score");
+    let _ = cp.alive_set().mark_group_active_slot("score");
     cp.alive_set()
         .run_health_check_cycle(Duration::from_secs(1))
         .await;
@@ -705,7 +705,7 @@ async fn control_plane_idle_probe_lifecycle_startup_restore_reload_and_timeout_h
     assert!(reload.await.unwrap());
 
     // Hot-reloaded `idle_timeout: 0` takes effect immediately without storming.
-    plane.alive_set().mark_group_active("auto");
+    let _ = plane.alive_set().mark_group_active_slot("auto");
     assert!(plane.alive_set().is_group_idle("auto"));
     assert!(trigger_rx.try_recv().is_err());
 
@@ -906,7 +906,7 @@ async fn control_plane_custom_url_selection_under_group_manager_read_does_not_de
     let gm_cell = plane.group_manager().clone();
 
     // Hold a read guard while a writer parks on the write-preferring RwLock.
-    // Reentering `group_manager.read()` from `mark_group_active` would self-deadlock here.
+    // Reentering `group_manager.read()` from `mark_group_active_slot` would self-deadlock here.
     let (writer_ready_tx, writer_ready_rx) = std::sync::mpsc::channel();
     let (writer_done_tx, writer_done_rx) = std::sync::mpsc::channel();
     let gm_read = gm_cell.read();

@@ -543,6 +543,29 @@ impl super::GroupManager {
         })
     }
 
+    /// Whether the picked candidate's health data predates its group's idle
+    /// wake (see `AliveDialerSet::mark_stale`): its probes were suspended
+    /// until the wake and no fresh probe has landed yet. For custom-`check_url`
+    /// groups the TCP pick reads the (tag, url) state, so that staleness is
+    /// what matters; every other pick reads the node's global state.
+    fn candidate_is_stale(
+        &self,
+        candidate: &super::Candidate<'_>,
+        group: &honk_config::group::Group,
+        context: &ScoreSelectionContext,
+    ) -> bool {
+        let Some(alive) = self.alive_set.as_ref() else {
+            return false;
+        };
+        match context.probe_domain {
+            ProbeDomain::Tcp => match group.check_url.as_deref() {
+                Some(url) => alive.is_url_stale(candidate.tag(), url),
+                None => alive.is_stale(candidate.node.id),
+            },
+            _ => alive.is_stale(candidate.node.id),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn normal_candidates_for_target<'a>(
         &'a self,
@@ -731,6 +754,32 @@ impl super::GroupManager {
         observation::chosen(candidate.as_ref());
         if candidate.is_none() {
             observation::reason("selected_member_unavailable");
+        }
+        // A pick whose health data predates its group's idle wake is not
+        // trusted alone: race it against the next candidates instead. The
+        // wake probe lands within a cycle and clears the marker, so this
+        // only lasts until fresh probe data exists. Selector picks are
+        // exempt: the member is the user's explicit choice.
+        let stale_pick = rules.cold_urltest
+            && policy != honk_config::group::GroupPolicy::Selector
+            && candidate
+                .as_ref()
+                .is_some_and(|pick| self.candidate_is_stale(pick, group, context));
+        if stale_pick {
+            let pick = candidate.expect("stale pick checked above");
+            let rest = self.order_by_latency(
+                candidates
+                    .into_iter()
+                    .filter(|c| c.node.id != pick.node.id)
+                    .collect(),
+                context.network,
+                context.health_family,
+                group.check_url.as_deref(),
+            );
+            let mut raced = vec![pick];
+            raced.extend(rest);
+            observation::reason("stale_pick_raced");
+            return (super::SelectionPlanMode::ColdUrlTest, raced, false);
         }
         (
             super::SelectionPlanMode::Authoritative,

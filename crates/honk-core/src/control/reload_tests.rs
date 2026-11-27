@@ -3470,11 +3470,14 @@ fn udp_warm_candidates_do_not_mutate_group_selection_state() {
         ..Default::default()
     };
     let alive = Arc::new(crate::outbound::AliveDialerSet::new());
-    alive.register_idle_group(
-        "cold-urltest",
-        std::slice::from_ref(&cold.id),
-        Some(Duration::from_secs(60)),
-    );
+    alive.sync_idle_groups(&[honk_outbound::alive::IdleGroupRegistration {
+        name: "cold-urltest".into(),
+        members: vec![cold.id],
+        idle_timeout: Some(Duration::from_secs(60)),
+        kind: honk_outbound::alive::IdleGroupKind::Automatic,
+        tcp_recovery_members: vec![cold.id],
+        udp_recovery_members: vec![cold.id],
+    }]);
     let manager =
         GroupManager::with_alive_set(&config.groups, &config.nodes, Some(Arc::clone(&alive)));
     // Advance LB once and set the fallback pin before observing warm-up.
