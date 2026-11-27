@@ -775,6 +775,8 @@ Admission returns 202 with a `queued` operation at once, even while four jobs ar
 
 Results preserve member-to-leaf associations even when execution is deduplicated, actual measurement/family/warmth, and whether current-generation health accepted the result. Raw TCP latency is not HTTP ranking evidence. Cancelled, unavailable and obsolete work does not become a fake unhealthy sample.
 
+A probe that hits the 30-second deadline while still dialing — the node never answered — records an unavailable observation, so the panel shows the node as unavailable instead of leaving its latency blank. A probe that times out after the connection is up only proves the node is slow, so it records no observation and the node stays unknown. This changes only the displayed state and retained history; it does not change group selection.
+
 Selection observations do not advance policy state. If final cleanup fails, the operation fails with `probe_cleanup_failed`: `result` stays null and the completed measurements are in `error.details`.
 
 A child group among the direct members is probed through one selected leaf. Selection can expand descendants; the planner rejects graphs above 256 entries. A Selector without subgroups or `final` is exempt from that planner limit.

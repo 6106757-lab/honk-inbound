@@ -713,7 +713,9 @@ HTTP 使用配置的检查 URL，不跟随重定向。DNS 执行实际 UDP 或�
 
 202 只表示守护进程接管。测量开始前结束的 job 以 `probe_cancelled`、`probe_deadline`、`unsupported_value`（本地解析被拒绝，或节点不能向探测端口转发 UDP）或 `engine_unavailable` 失败。断开 HTTP 不取消任务。
 
-结果保留真实 measurement/family/warmth/时间与健康状态更新是否被当前时期接受。过时代次、取消或期限不伪造成 unhealthy，TCP-connect 不冒充 HTTP 排名样本。最终清理失败时操作以 `probe_cleanup_failed` 失败，`result` 保持 null，已完成的测量放在 `error.details`。
+结果保留真实 measurement/family/warmth/时间与健康状态更新是否被当前时期接受。过时代次、取消或期限不伪造成 unhealthy，TCP-connect 不冒充 HTTP 排名样本。
+
+探测在拨号阶段撞上 30 秒期限——节点始终未应答——记一条 unavailable 观测，面板显示“不可用”而不是留空延迟；连接建立后再超时只证明节点慢，不记观测，节点仍为未知。这只改变显示状态与留存历史，不改变组选择。最终清理失败时操作以 `probe_cleanup_failed` 失败，`result` 保持 null，已完成的测量放在 `error.details`。
 
 直接成员中的子组通过其选中的一个叶子节点探测；选择该叶子可能展开后代，除没有子组且未设置 `final` 的 Selector 外，规划图超过 256 项即拒绝。目标组仍受 64 个成员和 256 行结果限制（更大的组可用 `members` 列表分批，每批最多 64 个 ID），`members: "leaves"` 还会在整组图超过 256 项时被拒绝。
 
