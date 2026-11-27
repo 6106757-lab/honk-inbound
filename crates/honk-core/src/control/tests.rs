@@ -4176,7 +4176,7 @@ async fn udp_stagger_uses_absolute_offsets_bounds_inflight_and_drains_losers() {
         is_eligible: Arc::new(|_| true),
         on_dial_error: {
             let errors = errors.clone();
-            Arc::new(move |_| {
+            Arc::new(move |_, _| {
                 errors.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             })
         },
@@ -4302,7 +4302,7 @@ async fn udp_stagger_drain_counts_error_but_rejection_prevents_winner() {
         is_eligible: Arc::new(|_| true),
         on_dial_error: {
             let errors = errors.clone();
-            Arc::new(move |_| {
+            Arc::new(move |_, _| {
                 errors.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             })
         },
@@ -4360,7 +4360,7 @@ async fn udp_stagger_authoritative_prepares_only_the_current_node_without_delay(
     let callbacks = UdpStaggerCallbacks {
         allows_target: Arc::new(|_| true),
         is_eligible: Arc::new(|_| true),
-        on_dial_error: Arc::new(|_| panic!("authoritative success must not report an error")),
+        on_dial_error: Arc::new(|_, _| panic!("authoritative success must not report an error")),
         on_attempt: {
             let attempts = attempts.clone();
             Arc::new(move || {
@@ -4418,7 +4418,7 @@ async fn udp_stagger_authoritative_failure_preserves_fixed_metric_zeros() {
         is_eligible: Arc::new(|_| true),
         on_dial_error: {
             let errors = errors.clone();
-            Arc::new(move |_| {
+            Arc::new(move |_, _| {
                 errors.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             })
         },
@@ -4477,7 +4477,7 @@ async fn udp_stagger_all_dial_failures_report_health_without_cancellation() {
         is_eligible: Arc::new(|_| true),
         on_dial_error: {
             let errors = errors.clone();
-            Arc::new(move |_| {
+            Arc::new(move |_, _| {
                 errors.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             })
         },
@@ -4543,7 +4543,7 @@ async fn udp_stagger_rechecks_eligibility_before_accepting_prepared_transport() 
                     || !became_ineligible.load(std::sync::atomic::Ordering::SeqCst)
             })
         },
-        on_dial_error: Arc::new(|_| panic!("prepared success is not a dial error")),
+        on_dial_error: Arc::new(|_, _| panic!("prepared success is not a dial error")),
         on_attempt: {
             let attempts = attempts.clone();
             Arc::new(move || {

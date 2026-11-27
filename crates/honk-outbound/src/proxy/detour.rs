@@ -83,11 +83,22 @@ impl DetourDialCtx {
     /// dials): hop 0, deadline three connect timeouts out — the same horizon
     /// the per-candidate dial timeout and the REALITY setup deadline already
     /// use, so a leg entered this way is bounded exactly as its caller is.
-    pub(crate) fn root(connect_timeout: Duration) -> Self {
+    ///
+    /// Public because the control plane (another crate) roots its dial race
+    /// here; the leg-local helpers stay crate-private.
+    pub fn root(connect_timeout: Duration) -> Self {
         Self {
             hop: 0,
             deadline: tokio::time::Instant::now() + connect_timeout * 3,
         }
+    }
+
+    /// A root context on a deadline the caller already owns: hop 0, the
+    /// caller's overall dial deadline. The control plane roots its race
+    /// here, so every leg of the race shares the one deadline the race
+    /// itself is bounded by.
+    pub fn root_at(deadline: tokio::time::Instant) -> Self {
+        Self { hop: 0, deadline }
     }
 
     /// The context the next leg down dials with: one hop further out, the

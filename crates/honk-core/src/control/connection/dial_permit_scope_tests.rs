@@ -155,6 +155,7 @@ async fn ready_pool_hit_does_not_wait_for_physical_dial_permit() {
                 started_on_dial.store(true, std::sync::atomic::Ordering::Release)
             }),
             None,
+            &honk_outbound::proxy::detour::DetourDialCtx::root(Duration::from_secs(1)),
         ),
     )
     .await
@@ -204,6 +205,7 @@ async fn feedback_does_not_start_while_waiting_for_dial_admission() {
                 started_on_dial.store(true, std::sync::atomic::Ordering::Release)
             }),
             None,
+            &honk_outbound::proxy::detour::DetourDialCtx::root(Duration::from_secs(1)),
         ),
     )
     .await;
@@ -393,6 +395,9 @@ async fn marked_direct_dial_skips_bare_pool_and_rejects_retired_completion() {
             .await
     );
     let scope = generation.dial_scope(|| {});
+    // A join! arm borrows the context across the await, so the root needs a
+    // named binding: a temporary would be dropped while still in use.
+    let dial_ctx = honk_outbound::proxy::detour::DetourDialCtx::root(Duration::from_secs(1));
 
     let (result, ()) = tokio::join!(
         ControlPlaneHandle::dial_pooled(
@@ -405,6 +410,7 @@ async fn marked_direct_dial_skips_bare_pool_and_rejects_retired_completion() {
             honk_outbound::proxy::DirectMark::new(0x321),
             &scope,
             None,
+            &dial_ctx,
         ),
         async {
             assert_eq!(

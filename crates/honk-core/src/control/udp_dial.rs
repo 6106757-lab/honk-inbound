@@ -25,7 +25,7 @@ pub(super) type UdpPrepare<T> = Arc<
 pub(super) struct UdpStaggerCallbacks {
     pub(super) allows_target: Arc<dyn Fn(&Node) -> bool + Send + Sync>,
     pub(super) is_eligible: Arc<dyn Fn(&Node) -> bool + Send + Sync>,
-    pub(super) on_dial_error: Arc<dyn Fn(&Node) + Send + Sync>,
+    pub(super) on_dial_error: Arc<dyn Fn(&Node, &anyhow::Error) + Send + Sync>,
     pub(super) on_attempt: Arc<dyn Fn() + Send + Sync>,
     pub(super) on_winner: Arc<dyn Fn() + Send + Sync>,
     pub(super) on_cancellation: Arc<dyn Fn() + Send + Sync>,
@@ -144,7 +144,7 @@ where
                     rejection = Some(error);
                     break 'schedule None;
                 }
-                (callbacks.on_dial_error)(&node);
+                (callbacks.on_dial_error)(&node, &error);
             }
         }
     };
@@ -159,7 +159,7 @@ where
                 if honk_outbound::proxy::is_packet_rejection(&error) {
                     rejection.get_or_insert(error);
                 } else {
-                    (callbacks.on_dial_error)(&node);
+                    (callbacks.on_dial_error)(&node, &error);
                 }
             }
             Ok((_, None)) => cancelled += 1,

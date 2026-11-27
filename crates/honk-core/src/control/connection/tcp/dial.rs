@@ -47,6 +47,10 @@ impl ControlPlaneHandle {
         }
         let ctx = self.clone();
         let outbound = outbound_name.to_string();
+        // One shared deadline for the whole race: every leg of every
+        // candidate dial waits at most what is left of it, so a detour
+        // chain cannot outlive the race that started it.
+        let dial_ctx = honk_outbound::proxy::detour::DetourDialCtx::root_at(dial_deadline);
 
         let mut set = futures::stream::FuturesUnordered::new();
         let started_reporters = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -171,6 +175,7 @@ impl ControlPlaneHandle {
                             direct_mark,
                             &scope,
                             group_detour,
+                            &dial_ctx,
                         );
                         #[cfg(feature = "native-api")]
                         let dial = match &native_observer {
@@ -274,17 +279,44 @@ impl ControlPlaneHandle {
                             rejection = Some(e);
                             break;
                         }
-                        report_dial_failure_if_current(
-                            &runtime_generation,
-                            &ctx.alive_set,
-                            node.id,
-                            ProbeDomain::Tcp,
-                            ipver,
-                        );
-                        let msg = e.to_string();
-                        if msg.starts_with("dial timed out after") {
+                        // A hop-tagged failure blames the front that
+                        // actually failed, not the rider that asked for
+                        // the dial; a setup failure names no node at all,
+                        // so nobody's liveness is charged for it.
+                        match honk_outbound::proxy::failed_hop(&e) {
+                            Some(hop) => {
+                                if let Some(front) = hop.node {
+                                    report_dial_failure_if_current(
+                                        &runtime_generation,
+                                        &ctx.alive_set,
+                                        front,
+                                        ProbeDomain::Tcp,
+                                        ipver,
+                                    );
+                                }
+                            }
+                            None => {
+                                report_dial_failure_if_current(
+                                    &runtime_generation,
+                                    &ctx.alive_set,
+                                    node.id,
+                                    ProbeDomain::Tcp,
+                                    ipver,
+                                );
+                            }
+                        }
+                        // The hop wrapper rewrites the error text, so a
+                        // timeout is recognised by its cause, not by the
+                        // message the outer timer used to mint.
+                        let timed_out = e.chain().any(|cause| {
+                            cause
+                                .downcast_ref::<std::io::Error>()
+                                .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
+                        });
+                        if timed_out {
                             timeout_count += 1;
                         }
+                        let msg = e.to_string();
                         if first_err.is_none() {
                             first_err = Some((msg.clone(), node.name.clone()));
                         }
@@ -381,13 +413,18 @@ impl ControlPlaneHandle {
                             let context = attempt.context().clone();
                             attempt.start_warmup(context)
                         });
+                        // A warm dial is not part of the race, so it
+                        // roots its own context on this dial's timeout.
+                        let dial_ctx =
+                            honk_outbound::proxy::detour::DetourDialCtx::root(connect_timeout);
                         match registry
-                            .dial_runtime(
+                            .dial_runtime_ctx(
                                 Arc::clone(&generation),
                                 node.id,
                                 target,
                                 target_domain.as_deref(),
                                 connect_timeout,
+                                &dial_ctx,
                             )
                             .await
                         {
@@ -556,13 +593,17 @@ impl ControlPlaneHandle {
                         pool_health_family,
                     ))
                 });
+                // A warm dial is not part of the race, so it roots its
+                // own context on this dial's timeout.
+                let dial_ctx = honk_outbound::proxy::detour::DetourDialCtx::root(connect_timeout);
                 match registry
-                    .dial_runtime(
+                    .dial_runtime_ctx(
                         Arc::clone(&generation),
                         node.id,
                         original_dst,
                         target_domain.as_deref(),
                         connect_timeout,
+                        &dial_ctx,
                     )
                     .await
                 {
@@ -678,6 +719,7 @@ impl ControlPlaneHandle {
         direct_mark: Option<honk_outbound::proxy::DirectMark>,
         scope: &Arc<honk_outbound::runtime::DialScope>,
         group_detour: Option<Arc<honk_outbound::proxy::detour::DetourPath>>,
+        ctx: &honk_outbound::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<(crate::proxy::ProxyStream, bool)> {
         anyhow::ensure!(
             !generation.is_shutdown(),
@@ -691,13 +733,14 @@ impl ControlPlaneHandle {
             return scope
                 .scope(async {
                     registry
-                        .dial_runtime_detoured(
+                        .dial_runtime_detoured_ctx(
                             Arc::clone(generation),
                             node.id,
                             target,
                             target_domain,
                             connect_timeout,
                             detour,
+                            ctx,
                         )
                         .await
                         .map(|stream| (stream, true))
@@ -807,12 +850,13 @@ impl ControlPlaneHandle {
             tracing::debug!("Fresh TCP connect to {} for {}", addr, target);
             if generation.get(&node.id).is_some() {
                 registry
-                    .dial_runtime(
+                    .dial_runtime_ctx(
                         Arc::clone(generation),
                         node.id,
                         target,
                         target_domain,
                         connect_timeout,
+                        ctx,
                     )
                     .await
                     .map(|stream| (stream, true))

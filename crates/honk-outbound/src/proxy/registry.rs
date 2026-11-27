@@ -313,6 +313,7 @@ impl ProxyRegistry {
 
     /// [`Self::dial_runtime_detoured`] with the detour dial context threaded
     /// through.
+    #[allow(clippy::too_many_arguments)]
     pub async fn dial_runtime_detoured_ctx(
         &self,
         generation: Arc<crate::runtime::OutboundRuntimeRegistry>,
@@ -523,6 +524,35 @@ impl ProxyRegistry {
         .await
     }
 
+    /// [`Self::dial_udp_transport_runtime`] with the detour dial context
+    /// threaded through.
+    pub async fn dial_udp_transport_runtime_ctx(
+        &self,
+        generation: Arc<crate::runtime::OutboundRuntimeRegistry>,
+        node_id: uuid::Uuid,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        let ctx = *ctx;
+        self.dial_generation(generation, node_id, |runtime, entry| {
+            let packet = Arc::clone(Self::packet_for_runtime(&runtime, entry, target.port())?);
+            Ok(async move {
+                packet
+                    .dial_udp_transport_runtime_ctx(
+                        runtime,
+                        target,
+                        target_domain,
+                        connect_timeout,
+                        &ctx,
+                    )
+                    .await
+            })
+        })
+        .await
+    }
+
     /// Generation-pinned framed UDP transport over a detour a group names.
     /// A detoured flow never borrows a pooled or shared-source carrier, whose
     /// own path would otherwise decide where the packets leave.
@@ -554,6 +584,7 @@ impl ProxyRegistry {
 
     /// [`Self::dial_udp_transport_runtime_detoured`] with the detour dial
     /// context threaded through.
+    #[allow(clippy::too_many_arguments)]
     pub async fn dial_udp_transport_runtime_detoured_ctx(
         &self,
         generation: Arc<crate::runtime::OutboundRuntimeRegistry>,

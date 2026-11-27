@@ -1344,6 +1344,7 @@ impl super::MuxSession for AnyTlsSession {
 
 /// Dial a fresh TLS + AnyTLS session (the `SessionPool::offer` dial
 /// closure and the janitor's prewarm share this).
+#[allow(clippy::too_many_arguments)]
 async fn dial_session(
     node: &Node,
     addr: &str,

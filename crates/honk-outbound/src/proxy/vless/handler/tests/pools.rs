@@ -25,7 +25,13 @@ async fn cancelled_mux_warm_dial_does_not_outlive_its_caller() {
         let pool = Arc::clone(&pool);
         tokio::spawn(VLessHandler::warm_mux_pool(
             pool,
-            move || VLessHandler::dial_h2_session(runtime, std::time::Duration::from_secs(3)),
+            move || {
+                VLessHandler::dial_h2_session(
+                    runtime,
+                    std::time::Duration::from_secs(3),
+                    crate::proxy::detour::DetourDialCtx::root(std::time::Duration::from_secs(3)),
+                )
+            },
             "retired",
         ))
     };
@@ -90,12 +96,13 @@ async fn cancelled_encrypted_ws_handshake_retains_credit_until_bridge_teardown()
     let runtime = generation.get(&node.id).unwrap();
     let handler = VLessHandler::new();
     let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
+    let ctx = crate::proxy::detour::DetourDialCtx::root(std::time::Duration::from_secs(3));
     let mut dial = Box::pin(handler.prepare_retained_base(
         &runtime,
         target,
         None,
         std::time::Duration::from_secs(3),
-        &crate::proxy::detour::DetourDialCtx::root(std::time::Duration::from_secs(3)),
+        &ctx,
     ));
     tokio::select! {
         result = &mut dial => panic!("encrypted handshake completed before cancellation: {:?}", result.map(|(stream, _)| stream)),

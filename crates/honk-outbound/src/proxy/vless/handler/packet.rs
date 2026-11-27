@@ -422,12 +422,7 @@ impl VLessHandler {
                         Self::prepare_mux_udp(
                             pool,
                             move || {
-                                Self::prepare_cool_session(
-                                    dial_runtime,
-                                    active_limit,
-                                    timeout,
-                                    &ctx,
-                                )
+                                Self::prepare_cool_session(dial_runtime, active_limit, timeout, ctx)
                             },
                             move |session, permit| {
                                 cool::open_xudp(session, permit, target, domain, global_id)
@@ -478,7 +473,7 @@ impl VLessHandler {
                         let dial_runtime = Arc::clone(&runtime);
                         Self::prepare_mux_udp(
                             pool,
-                            move || Self::prepare_h2_session(dial_runtime, timeout, &ctx),
+                            move || Self::prepare_h2_session(dial_runtime, timeout, ctx),
                             move |session, permit| async move {
                                 let transport: Arc<dyn MultiTargetTransport> =
                                     session.open_packet(permit, target, domain).await?;
@@ -570,7 +565,7 @@ impl PacketOutbound for VLessHandler {
                 let dial_runtime = Arc::clone(&runtime);
                 Self::prepare_mux_udp(
                     pool,
-                    move || Self::prepare_h2_session(dial_runtime, connect_timeout, &ctx),
+                    move || Self::prepare_h2_session(dial_runtime, connect_timeout, ctx),
                     move |session, permit| async move {
                         let transport: Arc<dyn PacketTransport> =
                             session.open_packet(permit, target, target_domain).await?;
@@ -592,12 +587,7 @@ impl PacketOutbound for VLessHandler {
                 Self::prepare_mux_udp(
                     pool,
                     move || {
-                        Self::prepare_cool_session(
-                            dial_runtime,
-                            active_limit,
-                            connect_timeout,
-                            &ctx,
-                        )
+                        Self::prepare_cool_session(dial_runtime, active_limit, connect_timeout, ctx)
                     },
                     move |session, permit| async move {
                         let transport: Arc<dyn PacketTransport> =
