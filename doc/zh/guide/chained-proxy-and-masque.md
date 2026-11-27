@@ -150,7 +150,7 @@ UDP 拨号前会先筛一遍前置：按（末端协议的 UDP 需求 × 前置�
 
 Shadowsocks 作末端时，TCP 握手在已连通的前置流上跑，不再要求真实 socket；UDP 没有流可骑，走组 detour 的 UDP 仍在拨号前拒绝。Shadowsocks 作前置（carrier）不受影响，仍按原来的直接拨号走。
 
-拨号失败时会按 hop 标出是哪一跳出的错：`detour hop 0` 是末端到第一前置，`detour hop 1` 是第一前置到它的前置，依此类推；目标本身拒绝仍属目标失败，不计 hop。例如 `node back: detour could not reach back.invalid:1234: detour hop 0 (socks-a): dial tcp …` 表示第一前置 socks-a 拨不通。整条链共用一个 deadline，每条 leg 最多等 `min(connect_timeout, 剩余时间)`，静默的第二跳不会烧满自己的超时；detour 成环（A 指 B、B 指 A）时 4 跳即报错 `detour depth exceeds 4`，不再等满拨号超时。失败记在真正出问题的前置头上，不会把末端节点标成不可用。
+拨号失败时会按 hop 标出是哪一跳出的错：`detour hop 0` 是末端到第一前置，`detour hop 1` 是第一前置到它的前置，依此类推；目标本身拒绝仍属目标失败，不计 hop。例如 `node back: detour could not reach back.invalid:1234: detour hop 0 (socks-a): dial tcp …` 表示第一前置 socks-a 拨不通。整条链共用一个 deadline，每条 leg 最多等 `min(connect_timeout, 剩余时间)`，静默的第二跳不会烧满自己的超时；detour 成环（A 指 B、B 指 A）时 4 跳即报错 `detour depth exceeds 4`，不再等满拨号超时。失败记在真正出问题的前置头上，不会把末端节点标成不可用。REALITY 掩码证书重拨仍走同一条 detour leg（同一前置、同一 hop），不产生新 leg。
 
 - 不支持的协议会**拒绝拨号并记日志**，不会静默直连；日志出现 `cannot carry a detour` 时请换协议或去掉该组的 `detour:`。
 - honk 自身发起的流量（DoH、订阅 / geodata 下载）由各自的 `route` / `download_detour` 控制，**不受组 detour 影响**。

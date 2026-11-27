@@ -637,7 +637,7 @@ Standard VMess links use their v2rayN JSON `tls` field instead.
 
 Repeated `security` and recognized `tls` claims must agree, including cross-alias TLS enablement. A later value never overrides an earlier contradiction. VLESS and encoded VMess accept only `tls=0|1`; other schemes retain their handling of unrecognized `tls` text. Trojan and AnyTLS reject explicit plaintext claims rather than silently retaining mandatory TLS.
 
-REALITY is TLS-1.3-only. Its first attempt advertises hybrid `X25519MLKEM768` followed by the preset classic `X25519` share. Only a completed handshake with a non-ed25519 leaf permits one fresh same-peer X25519-only connection; it must still authenticate with the configured REALITY key/HMAC before proxy data is sent.
+REALITY is TLS-1.3-only. Without an explicit `fp`, its first attempt advertises hybrid `X25519MLKEM768` followed by the preset classic `X25519` share; a node with `fp` leads with that fingerprint's key shares instead (Chromium fingerprints lead hybrid, the rest X25519-only). Only a completed handshake with a non-ed25519 leaf on a node without `fp` permits one fresh same-peer X25519-only connection; a node with `fp` does not redial and the mask-certificate error is returned instead. The retry must still authenticate with the configured REALITY key/HMAC before proxy data is sent.
 
 Both attempts share one `3 × connect_timeout` setup deadline and introduce no new setting. This unauthenticated trigger is not server-version detection. Invalid ed25519 HMAC, TLS/IO errors and HRR remain terminal. Each connection seals its ClientHello exactly once, without key/nonce reuse. See [compatibility and authentication boundaries](../design/outbound.md#server-authentication-and-fingerprint-constraints).
 
