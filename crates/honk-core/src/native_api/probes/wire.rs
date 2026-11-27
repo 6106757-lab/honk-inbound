@@ -158,6 +158,7 @@ impl AttemptOutcome {
         result: anyhow::Result<ProbeMeasurement>,
         deadline: Instant,
         cancel: &watch::Receiver<bool>,
+        phase: honk_outbound::urltest::ProbePhase,
     ) -> Self {
         match result {
             Ok(sample) => Self {
@@ -185,11 +186,16 @@ impl AttemptOutcome {
                 };
                 Self {
                     sample: None,
-                    // A probe that ran out of time proves nothing about the
-                    // node (it may only be slow), so it records no
+                    // A deadline in the dial phase means the node never
+                    // answered within the whole probe window, so it records
+                    // an unavailable observation like any other dial failure.
+                    // A deadline after the connection is up proves nothing
+                    // about the node (it may only be slow), so it records no
                     // observation and stays unknown. A cancelled probe or a
                     // local packet refusal says nothing about the node either.
-                    completed: matches!(reason, "probe_failed"),
+                    completed: matches!(reason, "probe_failed")
+                        || (reason == "deadline"
+                            && phase == honk_outbound::urltest::ProbePhase::Dial),
                     error: Some(reason),
                     observed_at: SystemTime::now(),
                     cleanup: Ok(()),
@@ -236,7 +242,12 @@ async fn attempt_wire(
         .await
         .map_err(anyhow::Error::from)
         .and_then(|result| result);
-        return AttemptOutcome::completed(result, deadline, &cancel);
+        return AttemptOutcome::completed(
+            result,
+            deadline,
+            &cancel,
+            honk_outbound::urltest::ProbePhase::Dial,
+        );
     }
     let Some(entry) = state.proxy_registry.find(candidate.node.protocol()) else {
         return AttemptOutcome::refused();
@@ -266,6 +277,10 @@ async fn attempt_wire(
             )
         })
         .or_else(|| plan.registry.detour_for(candidate.node.id));
+    // The phase cell survives the dial future: a deadline drop discards the
+    // future but not the last phase it wrote, so the outcome reader can tell
+    // a dial that never answered from an exchange that only ran slow.
+    let phase = honk_outbound::urltest::ProbePhaseCell::new();
     let operation = async {
         if plan.spec.kind == Kind::Http {
             let timeout = deadline.saturating_duration_since(Instant::now());
@@ -280,6 +295,7 @@ async fn attempt_wire(
                     plan.spec.warmth == Warmth::Cold,
                     timeout,
                     detour.clone(),
+                    Some(phase.clone()),
                 ),
             )
             .await?
@@ -306,6 +322,7 @@ async fn attempt_wire(
                                 .dial_runtime(Arc::clone(&runtime), addr, None, connect_timeout)
                                 .await?
                         };
+                        phase.mark_exchange();
                         tcp_dns(&mut proxy.stream).await
                     }
                     Transport::Udp => {
@@ -333,6 +350,7 @@ async fn attempt_wire(
                                 )
                                 .await?
                         };
+                        phase.mark_exchange();
                         crate::dns::forwarder::udp_dns_probe(transport.as_ref()).await
                     }
                 }
@@ -362,7 +380,7 @@ async fn attempt_wire(
             "manual probe attempt failed: {error:#}"
         );
     }
-    let mut outcome = AttemptOutcome::completed(result, deadline, &cancel);
+    let mut outcome = AttemptOutcome::completed(result, deadline, &cancel, phase.phase());
     drop(runtime);
     // Never cancel this owner boundary: close must drain every factory/driver
     // admitted before the request deadline, even when the HTTP caller is gone.
@@ -396,9 +414,42 @@ mod tests {
         let (cancel, receiver) = watch::channel(false);
         let error = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
         cancel.send_replace(true);
-        let outcome = AttemptOutcome::completed(Err(error), Instant::now(), &receiver);
+        let outcome = AttemptOutcome::completed(
+            Err(error),
+            Instant::now(),
+            &receiver,
+            honk_outbound::urltest::ProbePhase::Dial,
+        );
         assert!(outcome.completed);
         assert_eq!(outcome.error, Some("probe_failed"));
+    }
+
+    #[test]
+    fn deadline_in_dial_phase_records_unavailable() {
+        let (_cancel, receiver) = watch::channel(false);
+        let error = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        let outcome = AttemptOutcome::completed(
+            Err(error),
+            Instant::now(),
+            &receiver,
+            honk_outbound::urltest::ProbePhase::Dial,
+        );
+        assert!(outcome.completed);
+        assert_eq!(outcome.error, Some("deadline"));
+    }
+
+    #[test]
+    fn deadline_in_exchange_phase_stays_unknown() {
+        let (_cancel, receiver) = watch::channel(false);
+        let error = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        let outcome = AttemptOutcome::completed(
+            Err(error),
+            Instant::now(),
+            &receiver,
+            honk_outbound::urltest::ProbePhase::Exchange,
+        );
+        assert!(!outcome.completed);
+        assert_eq!(outcome.error, Some("deadline"));
     }
 
     #[tokio::test]

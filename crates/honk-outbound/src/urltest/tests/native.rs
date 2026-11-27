@@ -67,6 +67,7 @@ async fn native_http1_cold_and_warm_keep_pinned_authority_without_redirects() {
             cold,
             Duration::from_secs(5),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -120,6 +121,7 @@ async fn native_http1_rejects_invalid_responses_but_keeps_validated_close_fallba
             cold,
             Duration::from_secs(2),
             None,
+            None,
         )
         .await;
         assert_eq!(result.is_ok(), succeeds, "cold={cold}: {result:?}");
@@ -155,6 +157,7 @@ async fn http_probe_drop_releases_connection_before_return() {
         addr,
         false,
         Duration::from_secs(5),
+        None,
         None,
     ));
     tokio::select! {
@@ -204,6 +207,7 @@ async fn native_https_keeps_request_sni_on_pinned_dial() {
         true,
         Duration::from_secs(2),
         None,
+        None,
     )
     .await;
     assert!(result.is_err(), "peer intentionally does not complete TLS");
@@ -243,4 +247,81 @@ fn native_cold_runtime_preserves_admission_and_generation_carrier_ceiling() {
         generation.try_ephemeral_guarded(&stale),
         Err(crate::runtime::RuntimeRegistryError::Admission(_))
     ));
+}
+
+#[tokio::test]
+async fn pinned_probe_phase_stays_dial_when_dial_hangs() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    // The dial sleeps longer than the probe timeout, so the probe times out
+    // while still dialing and the phase cell never flips.
+    tokio::spawn(async move {
+        let _held = listener.accept().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+    let mut guard =
+        crate::runtime::NodeRuntime::try_ephemeral_guarded(&make_node("native-phase-dial"))
+            .unwrap();
+    let request = http_probe_request("http://probe.example/check", "GET").unwrap();
+    let phase = ProbePhaseCell::new();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        measure_pinned_http_probe(
+            &guard.runtime(),
+            &PinnedHandler {
+                addr,
+                delay: Duration::from_secs(30),
+            },
+            &request,
+            addr,
+            true,
+            Duration::from_millis(100),
+            None,
+            Some(phase.clone()),
+        ),
+    )
+    .await;
+    assert!(result.is_ok(), "probe must finish on its own timeout");
+    assert!(result.unwrap().is_err());
+    assert_eq!(phase.phase(), ProbePhase::Dial);
+    guard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn pinned_probe_phase_flips_to_exchange_once_dialed() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    // Accept and read the request, then never answer: the exchange stalls
+    // after the dial already finished.
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _ = read_request_head(&mut stream).await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+    let mut guard =
+        crate::runtime::NodeRuntime::try_ephemeral_guarded(&make_node("native-phase-exchange"))
+            .unwrap();
+    let request = http_probe_request("http://probe.example/check", "GET").unwrap();
+    let phase = ProbePhaseCell::new();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        measure_pinned_http_probe(
+            &guard.runtime(),
+            &PinnedHandler {
+                addr,
+                delay: Duration::ZERO,
+            },
+            &request,
+            addr,
+            true,
+            Duration::from_millis(200),
+            None,
+            Some(phase.clone()),
+        ),
+    )
+    .await;
+    assert!(result.is_ok(), "probe must finish on its own timeout");
+    assert!(result.unwrap().is_err());
+    assert_eq!(phase.phase(), ProbePhase::Exchange);
+    guard.close().await.unwrap();
 }

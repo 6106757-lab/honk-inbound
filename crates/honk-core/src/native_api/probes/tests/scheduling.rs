@@ -278,7 +278,7 @@ async fn socks_member(slow: bool) -> Node {
     node
 }
 
-async fn group_plan(members: &[Node]) -> (Arc<NativeState>, PreparedPlan) {
+async fn group_plan(members: &[Node]) -> (Arc<NativeState>, PreparedPlan, uuid::Uuid) {
     let mut config = Config::default();
     let hosts = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(hosts.path(), "authority.example 1.1.1.1\n").unwrap();
@@ -291,6 +291,7 @@ async fn group_plan(members: &[Node]) -> (Arc<NativeState>, PreparedPlan) {
     config.global.tcp_check_url = vec!["http://authority.example:8443/check".into()];
     let state = state(config).await;
     let identity = state.observation.core.catalog.snapshot();
+    let group_id = uuid::Uuid::parse_str(&identity.groups["members"]).unwrap();
     let input = request(
         json!({"type":"group","group_id":identity.groups["members"]}),
         "http",
@@ -301,7 +302,7 @@ async fn group_plan(members: &[Node]) -> (Arc<NativeState>, PreparedPlan) {
         .await
         .unwrap();
     let plan = prepare(plan).await.unwrap();
-    (state, plan)
+    (state, plan, group_id)
 }
 
 #[tokio::test]
@@ -310,7 +311,7 @@ async fn a_slow_member_does_not_starve_later_members_of_the_deadline() {
     for _ in 0..3 {
         members.push(socks_member(false).await);
     }
-    let (state, mut plan) = group_plan(&members).await;
+    let (state, mut plan, group_id) = group_plan(&members).await;
     let (_stop, receiver) = watch::channel(false);
     execute(
         &state,
@@ -327,11 +328,70 @@ async fn a_slow_member_does_not_starve_later_members_of_the_deadline() {
         .map(|row| (row.resolved_leaf_node_id.clone().unwrap(), row))
         .collect();
     let slow = rows[&members[0].id.to_string()];
-    assert_eq!((slow.state, slow.error), ("unknown", Some("deadline")));
+    // The slow member's SOCKS handshake never answers inside the probe
+    // window: a dial-phase deadline records unavailable, not unknown.
+    assert_eq!((slow.state, slow.error), ("unavailable", Some("deadline")));
+    assert!(slow.health_updated);
+    let observations = state.alive_set.group_health_observations(group_id);
+    let slow_observations: Vec<_> = observations
+        .iter()
+        .filter(|observation| observation.node_id == members[0].id)
+        .collect();
+    assert_eq!(slow_observations.len(), 1);
+    assert_eq!(
+        slow_observations[0].observation.state,
+        honk_outbound::alive::HealthState::Unavailable
+    );
     for member in &members[1..] {
         let row = rows[&member.id.to_string()];
         assert_eq!((row.state, row.error), ("healthy", None));
     }
+}
+
+async fn anytls_member() -> Node {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let node = Node::from_share_link(&format!(
+        "anytls://secret@127.0.0.1:{port}?insecure=1&sni=example.com#anytls-slow"
+    ))
+    .unwrap();
+    // Accept and hold every connection without answering: the AnyTLS TLS
+    // handshake never completes, so the probe dies on its deadline while
+    // still dialing.
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            held.push(socket);
+        }
+    });
+    node
+}
+
+#[tokio::test]
+async fn a_silent_anytls_member_reports_unavailable_on_deadline() {
+    let members = vec![anytls_member().await];
+    let (state, mut plan, group_id) = group_plan(&members).await;
+    let (_stop, receiver) = watch::channel(false);
+    execute(
+        &state,
+        &mut plan,
+        Instant::now() + Duration::from_secs(1),
+        receiver,
+    )
+    .await
+    .unwrap();
+    assert_eq!(plan.result.results.len(), 1);
+    let row = &plan.result.results[0];
+    // The handshake hang is a dial-phase deadline: unavailable, not "-".
+    assert_eq!((row.state, row.error), ("unavailable", Some("deadline")));
+    assert!(row.health_updated);
+    let observations = state.alive_set.group_health_observations(group_id);
+    assert_eq!(observations.len(), 1);
+    assert_eq!(
+        observations[0].observation.state,
+        honk_outbound::alive::HealthState::Unavailable
+    );
 }
 
 #[tokio::test]
@@ -342,7 +402,7 @@ async fn members_beyond_the_concurrency_bound_still_report_deadline_or_cancelled
     }
     members.push(socks_member(false).await);
 
-    let (state, mut plan) = group_plan(&members).await;
+    let (state, mut plan, _group_id) = group_plan(&members).await;
     let (_stop, receiver) = watch::channel(false);
     execute(
         &state,
@@ -353,14 +413,25 @@ async fn members_beyond_the_concurrency_bound_still_report_deadline_or_cancelled
     .await
     .unwrap();
     assert_eq!(plan.result.results.len(), members.len());
-    assert!(
-        plan.result
-            .results
-            .iter()
-            .all(|row| row.state == "unknown" && row.error == Some("deadline"))
-    );
+    let rows: HashMap<_, _> = plan
+        .result
+        .results
+        .iter()
+        .map(|row| (row.resolved_leaf_node_id.clone().unwrap(), row))
+        .collect();
+    // Members that started dialing die in the dial phase: unavailable.
+    for member in &members[..honk_outbound::urltest::URLTEST_MAX_CONCURRENT] {
+        let row = rows[&member.id.to_string()];
+        assert_eq!((row.state, row.error), ("unavailable", Some("deadline")));
+    }
+    // The member past the concurrency bound never started: no phase to
+    // read, so it stays unknown.
+    let fast = rows[&members[honk_outbound::urltest::URLTEST_MAX_CONCURRENT]
+        .id
+        .to_string()];
+    assert_eq!((fast.state, fast.error), ("unknown", Some("deadline")));
 
-    let (state, mut plan) = group_plan(&members).await;
+    let (state, mut plan, _group_id) = group_plan(&members).await;
     let (stop, receiver) = watch::channel(false);
     let canceller = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(100)).await;
