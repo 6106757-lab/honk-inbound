@@ -195,9 +195,9 @@ pub struct DetourPath {
     proxies: Arc<ProxyRegistry>,
     generation: Arc<OutboundRuntimeRegistry>,
     target: DetourTarget,
-    /// Whether the node riding this path is itself MASQUE. Only a group
-    /// reaches this field: a node target is judged when it is bound, but a
-    /// group gives no answer until the dial asks.
+    /// Whether the node riding this path is itself MASQUE. A node target is
+    /// judged when it is bound, and again at dial time for a group detour
+    /// naming a node; a group gives no answer until the dial asks.
     rider_is_masque: bool,
 }
 
@@ -214,16 +214,22 @@ impl std::fmt::Debug for DetourPath {
 
 impl DetourPath {
     /// Pin a detour to the generation whose node set named it.
+    ///
+    /// The rider comes along because the pair cannot be judged from the
+    /// target alone: a MASQUE rider must not nest tunnels through a MASQUE
+    /// front, and a node target is only judged at bind time for a node's own
+    /// detour, not for a group detour naming a node.
     pub fn new(
         proxies: Arc<ProxyRegistry>,
         generation: Arc<OutboundRuntimeRegistry>,
         node_id: uuid::Uuid,
+        rider: NodeProtocol,
     ) -> Self {
         Self {
             proxies,
             generation,
             target: DetourTarget::Node(node_id),
-            rider_is_masque: false,
+            rider_is_masque: rider == NodeProtocol::Masque,
         }
     }
 
@@ -307,7 +313,22 @@ impl DetourPath {
     /// through the node that came back, so one dial is one selection.
     pub(crate) fn resolve(&self, domain: ProbeDomain) -> anyhow::Result<uuid::Uuid> {
         match &self.target {
-            DetourTarget::Node(node_id) => Ok(*node_id),
+            DetourTarget::Node(node_id) => {
+                // A group detour naming a node is judged here, at dial time:
+                // the bind-time check only covers a node's own detour. A
+                // front the generation no longer holds stays pass-through;
+                // the dial fails on it later, as before.
+                if self.rider_is_masque
+                    && let Some(runtime) = self.generation.get(node_id)
+                    && runtime.node.protocol() == NodeProtocol::Masque
+                {
+                    anyhow::bail!(
+                        "detour node {:?} is MASQUE and would nest tunnels",
+                        self.target_description()
+                    );
+                }
+                Ok(*node_id)
+            }
             DetourTarget::Group { name, manager } => {
                 let node = manager
                     .select_node_for_domain(name, domain, IpVersion::V4)
@@ -351,6 +372,15 @@ impl DetourPath {
                     )
                 })?;
                 let front = &runtime.node;
+                // The pair is judged before capability: a MASQUE rider must
+                // not nest tunnels through a MASQUE front, the same ban the
+                // group branch enforces by skipping the front.
+                if self.rider_is_masque && front.protocol() == NodeProtocol::Masque {
+                    anyhow::bail!(
+                        "detour node {:?} is MASQUE and would nest tunnels",
+                        front.name
+                    );
+                }
                 if !crate::descriptor::node_carries_udp(front)
                     || !crate::descriptor::udp_target_allowed(front, target.port())
                 {
@@ -658,6 +688,7 @@ mod tests {
             Arc::new(ProxyRegistry::new()),
             Arc::clone(&generation),
             uuid::Uuid::new_v4(),
+            NodeProtocol::SS,
         );
         let mut node = node_named("back");
         node.detour = Some("front".into());
@@ -670,7 +701,12 @@ mod tests {
     fn the_path_is_pinned_to_one_node() {
         let generation = Arc::new(OutboundRuntimeRegistry::build(&[]).unwrap());
         let node_id = uuid::Uuid::new_v4();
-        let path = DetourPath::new(Arc::new(ProxyRegistry::new()), generation, node_id);
+        let path = DetourPath::new(
+            Arc::new(ProxyRegistry::new()),
+            generation,
+            node_id,
+            NodeProtocol::Trojan,
+        );
         assert!(
             format!("{path:?}").contains(&node_id.to_string()),
             "the debug form names the node it rides: {path:?}"
@@ -932,6 +968,128 @@ mod tests {
         );
     }
 
+    /// A node front has no next member, so the nest ban is a refusal, not a
+    /// skip: a MASQUE front for a MASQUE rider fails the UDP dial here.
+    #[test]
+    fn udp_carrier_refuses_a_masque_node_front_for_a_masque_rider() {
+        let masque = masque_node("masque-front");
+        let generation =
+            Arc::new(OutboundRuntimeRegistry::build(std::slice::from_ref(&masque)).unwrap());
+        let path = DetourPath::new(
+            Arc::new(ProxyRegistry::new()),
+            Arc::clone(&generation),
+            masque.id,
+            NodeProtocol::Masque,
+        );
+        let error = path
+            .resolve_udp_carrier("1.2.3.4:443".parse().unwrap())
+            .expect_err("a MASQUE node front cannot carry a MASQUE rider")
+            .to_string();
+        assert!(
+            error.contains("would nest tunnels"),
+            "the refusal names the nest ban: {error}"
+        );
+
+        let trojan_rider = DetourPath::new(
+            Arc::new(ProxyRegistry::new()),
+            Arc::clone(&generation),
+            masque.id,
+            NodeProtocol::Trojan,
+        );
+        assert_eq!(
+            trojan_rider
+                .resolve_udp_carrier("1.2.3.4:443".parse().unwrap())
+                .unwrap(),
+            masque.id,
+            "a non-MASQUE rider still uses the MASQUE front"
+        );
+
+        let socks = Node::from_share_link("socks5://127.0.0.1:1080#socks").unwrap();
+        let generation =
+            Arc::new(OutboundRuntimeRegistry::build(std::slice::from_ref(&socks)).unwrap());
+        let path = DetourPath::new(
+            Arc::new(ProxyRegistry::new()),
+            Arc::clone(&generation),
+            socks.id,
+            NodeProtocol::Masque,
+        );
+        assert_eq!(
+            path.resolve_udp_carrier("1.2.3.4:443".parse().unwrap())
+                .unwrap(),
+            socks.id,
+            "a MASQUE rider still uses a non-MASQUE front"
+        );
+    }
+
+    /// The TCP arm of the same ban: a MASQUE node front for a MASQUE rider
+    /// refuses at resolution, before any dial.
+    #[test]
+    fn tcp_resolve_refuses_a_masque_node_front_for_a_masque_rider() {
+        let masque = masque_node("masque-front");
+        let generation =
+            Arc::new(OutboundRuntimeRegistry::build(std::slice::from_ref(&masque)).unwrap());
+        let path = DetourPath::new(
+            Arc::new(ProxyRegistry::new()),
+            Arc::clone(&generation),
+            masque.id,
+            NodeProtocol::Masque,
+        );
+        let error = path
+            .resolve(ProbeDomain::Tcp)
+            .expect_err("a MASQUE node front cannot carry a MASQUE rider")
+            .to_string();
+        assert!(
+            error.contains("would nest tunnels"),
+            "the refusal names the nest ban: {error}"
+        );
+
+        let trojan_rider = DetourPath::new(
+            Arc::new(ProxyRegistry::new()),
+            Arc::clone(&generation),
+            masque.id,
+            NodeProtocol::Trojan,
+        );
+        assert_eq!(
+            trojan_rider.resolve(ProbeDomain::Tcp).unwrap(),
+            masque.id,
+            "a non-MASQUE rider still uses the MASQUE front"
+        );
+    }
+
+    /// The group-branch TCP arm, the last untested nest arm: a group whose
+    /// selected front is MASQUE refuses a MASQUE rider at resolution.
+    #[test]
+    fn tcp_resolve_refuses_a_masque_group_front_for_a_masque_rider() {
+        use honk_config::node::{Group, GroupPolicy};
+
+        let masque = masque_node("masque-front");
+        let group = Group {
+            name: "fronts".into(),
+            policy: GroupPolicy::URLTest,
+            nodes: vec![masque.id],
+            ..Default::default()
+        };
+        let manager = Arc::new(GroupManager::new(
+            std::slice::from_ref(&group),
+            std::slice::from_ref(&masque),
+        ));
+        let path = DetourPath::to_group(
+            Arc::new(ProxyRegistry::new()),
+            Arc::new(OutboundRuntimeRegistry::build(&[]).unwrap()),
+            "fronts",
+            Arc::clone(&manager),
+            NodeProtocol::Masque,
+        );
+        let error = path
+            .resolve(ProbeDomain::Tcp)
+            .expect_err("a MASQUE group front cannot carry a MASQUE rider")
+            .to_string();
+        assert!(
+            error.contains("would nest tunnels"),
+            "the refusal names the nest ban: {error}"
+        );
+    }
+
     /// A node front has no next member: a screened-out front fails the dial
     /// at resolution, a capable one is returned as-is.
     #[test]
@@ -950,6 +1108,7 @@ mod tests {
             Arc::new(ProxyRegistry::new()),
             Arc::clone(&generation),
             reject.id,
+            NodeProtocol::VLess,
         );
         let error = path
             .resolve_udp_carrier("1.2.3.4:443".parse().unwrap())
@@ -972,6 +1131,7 @@ mod tests {
             Arc::new(ProxyRegistry::new()),
             Arc::clone(&generation),
             socks.id,
+            NodeProtocol::Socks5,
         );
         assert_eq!(
             path.resolve_udp_carrier("1.2.3.4:443".parse().unwrap())
@@ -1320,6 +1480,7 @@ mod tests {
             Arc::new(ProxyRegistry::default_resolver().unwrap()),
             Arc::clone(&generation),
             front.id,
+            NodeProtocol::SS,
         );
         let mut back = node_named("back");
         back.host = "back.invalid".to_string();
@@ -1474,6 +1635,7 @@ mod tests {
             Arc::new(ProxyRegistry::default_resolver().unwrap()),
             Arc::clone(&generation),
             front.id,
+            NodeProtocol::Socks5,
         );
 
         let error = connect_server(
@@ -1527,9 +1689,15 @@ mod tests {
             Arc::clone(&proxies),
             Arc::clone(&generation),
             f2.id,
+            NodeProtocol::Socks5,
         ));
         assert!(generation.bind_detour(f1.id, Arc::clone(&path_to_f2)));
-        let path_to_f1 = DetourPath::new(proxies, Arc::clone(&generation), f1.id);
+        let path_to_f1 = DetourPath::new(
+            proxies,
+            Arc::clone(&generation),
+            f1.id,
+            NodeProtocol::Socks5,
+        );
 
         let started = std::time::Instant::now();
         let error = connect_server(
@@ -1572,6 +1740,25 @@ mod tests {
         }
     }
 
+    /// A MASQUE node with no `ip`/`ipv6` configured: dialing it bails at the
+    /// ADDRESS_ASSIGN check before any handshake, which is what makes a
+    /// refused dial fail fast in tests.
+    fn masque_node(name: &str) -> Node {
+        let mut node = Node {
+            name: name.to_string(),
+            address: "127.0.0.1:443".into(),
+            host: "127.0.0.1".into(),
+            port: 443,
+            outbound: honk_config::node::OutboundConfig::Masque(honk_config::node::MasqueConfig {
+                network: Some("quic".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        node.id = node.derive_id();
+        node
+    }
+
     /// A UDP leg at the depth cap refuses before dialling: the cap is a leg
     /// property, not a TCP-only one.
     #[tokio::test]
@@ -1583,6 +1770,7 @@ mod tests {
             Arc::new(ProxyRegistry::default_resolver().unwrap()),
             Arc::clone(&generation),
             front.id,
+            NodeProtocol::Trojan,
         );
         let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
         let error = path
@@ -1623,9 +1811,15 @@ mod tests {
             Arc::clone(&proxies),
             Arc::clone(&generation),
             f2.id,
+            NodeProtocol::Trojan,
         ));
         assert!(generation.bind_detour(f1.id, Arc::clone(&path_to_f2)));
-        let path_to_f1 = DetourPath::new(proxies, Arc::clone(&generation), f1.id);
+        let path_to_f1 = DetourPath::new(
+            proxies,
+            Arc::clone(&generation),
+            f1.id,
+            NodeProtocol::Trojan,
+        );
 
         let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
         let started = std::time::Instant::now();
@@ -1670,6 +1864,7 @@ mod tests {
             Arc::new(ProxyRegistry::default_resolver().unwrap()),
             Arc::clone(&generation),
             front.id,
+            NodeProtocol::Trojan,
         );
         let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
         let error = path
@@ -1717,11 +1912,13 @@ mod tests {
             Arc::clone(&proxies),
             Arc::clone(&generation),
             a.id,
+            NodeProtocol::Socks5,
         ));
         let path_to_b = Arc::new(DetourPath::new(
             Arc::clone(&proxies),
             Arc::clone(&generation),
             b.id,
+            NodeProtocol::Socks5,
         ));
         assert!(generation.bind_detour(a.id, Arc::clone(&path_to_b)));
         assert!(generation.bind_detour(b.id, Arc::clone(&path_to_a)));

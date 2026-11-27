@@ -356,6 +356,7 @@ fn dns_fork_carries_the_detour_bindings() {
         Arc::new(ProxyRegistry::new()),
         Arc::clone(&generation),
         front.id,
+        honk_config::types::NodeProtocol::AnyTLS,
     );
     assert!(generation.bind_detour(back.id, Arc::new(path)));
     assert!(generation.get(&back.id).unwrap().detour().is_some());
@@ -847,6 +848,7 @@ mod fallible_factory_tests {
             Arc::clone(&proxies),
             Arc::clone(&registry),
             first,
+            honk_config::types::NodeProtocol::AnyTLS,
         )));
         assert!(format!("{:?}", runtime.detour()).contains(&first.to_string()));
 
@@ -854,6 +856,7 @@ mod fallible_factory_tests {
             Arc::clone(&proxies),
             Arc::clone(&registry),
             second,
+            honk_config::types::NodeProtocol::AnyTLS,
         )));
         let bound = runtime.detour().expect("the detour stays bound");
         let debug = format!("{bound:?}");

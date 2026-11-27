@@ -1582,6 +1582,7 @@ async fn obfs_rides_a_detour_but_port_hopping_cannot() {
         std::sync::Arc::new(crate::proxy::ProxyRegistry::new()),
         generation,
         uuid::Uuid::new_v4(),
+        honk_config::types::NodeProtocol::Hysteria2,
     ));
     Hysteria2Handler::new()
         .build_client(&node, None, Some(&path))

@@ -34,6 +34,7 @@ async fn h2_and_cool_nodes_refuse_a_group_detour() {
             Arc::new(crate::proxy::ProxyRegistry::new()),
             Arc::clone(&generation),
             uuid::Uuid::new_v4(),
+            honk_config::types::NodeProtocol::VLess,
         ));
         let error = VLessHandler::new()
             .dial_runtime_detoured_ctx(
