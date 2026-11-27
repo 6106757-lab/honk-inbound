@@ -485,12 +485,28 @@ impl Hy2Client {
         &self,
         connect_timeout: Duration,
     ) -> anyhow::Result<(quinn::Connection, Arc<Hy2ConnState>)> {
+        self.connection_ctx(
+            connect_timeout,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
+    }
+
+    async fn connection_ctx(
+        &self,
+        connect_timeout: Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<(quinn::Connection, Arc<Hy2ConnState>)> {
         let password = &self.password;
         let rx_bytes_per_second = self.rx_bytes_per_second;
         self.quic
-            .connection_with_metrics(connect_timeout, move |conn| async move {
-                authenticate(&conn, password, rx_bytes_per_second, connect_timeout).await
-            })
+            .connection_with_metrics_ctx(
+                connect_timeout,
+                move |conn| async move {
+                    authenticate(&conn, password, rx_bytes_per_second, connect_timeout).await
+                },
+                ctx,
+            )
             .await
     }
 }
@@ -728,15 +744,34 @@ impl Hysteria2Handler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
+        self.dial_via_client_ctx(
+            client,
+            target,
+            target_domain,
+            connect_timeout,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
+    }
+
+    async fn dial_via_client_ctx(
+        &self,
+        client: Arc<Hy2Client>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<ProxyStream> {
         let addr = target_string(target, target_domain);
         if addr.len() as u64 > MAX_ADDRESS_LENGTH {
             anyhow::bail!("Hysteria2: target address too long");
         }
+        let ctx = *ctx;
         let stream = crate::quic::dial_quic_stream(
             &client.quic,
             |timeout| {
                 let client = Arc::clone(&client);
-                async move { client.connection(timeout).await }
+                async move { client.connection_ctx(timeout, &ctx).await }
             },
             connect_timeout,
             move |conn| async move { conn.open_bi().await.context("Hysteria2: open stream") },
@@ -759,7 +794,25 @@ impl Hysteria2Handler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<Hy2UdpTransport>> {
-        let (conn, state) = client.connection(connect_timeout).await?;
+        self.udp_transport_via_client_ctx(
+            client,
+            target,
+            target_domain,
+            connect_timeout,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
+    }
+
+    async fn udp_transport_via_client_ctx(
+        &self,
+        client: Arc<Hy2Client>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<Arc<Hy2UdpTransport>> {
+        let (conn, state) = client.connection_ctx(connect_timeout, ctx).await?;
         if state.udp_disabled {
             anyhow::bail!("Hysteria2: UDP disabled by server");
         }
@@ -845,8 +898,26 @@ impl TcpOutbound for Hysteria2Handler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
+        self.dial_runtime_ctx(
+            runtime,
+            target,
+            target_domain,
+            connect_timeout,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
+    }
+
+    async fn dial_runtime_ctx(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<ProxyStream> {
         let client = self.client_for_runtime(&runtime).await?;
-        self.dial_via_client(client, target, target_domain, connect_timeout)
+        self.dial_via_client_ctx(client, target, target_domain, connect_timeout, ctx)
             .await
     }
 
@@ -858,8 +929,28 @@ impl TcpOutbound for Hysteria2Handler {
         connect_timeout: Duration,
         detour: &Arc<DetourPath>,
     ) -> anyhow::Result<ProxyStream> {
+        self.dial_runtime_detoured_ctx(
+            runtime,
+            target,
+            target_domain,
+            connect_timeout,
+            detour,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
+    }
+
+    async fn dial_runtime_detoured_ctx(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        detour: &Arc<DetourPath>,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<ProxyStream> {
         crate::quic::fronted_quic_dial!(self, runtime, detour, |client| {
-            self.dial_via_client(client, target, target_domain, connect_timeout)
+            self.dial_via_client_ctx(client, target, target_domain, connect_timeout, ctx)
                 .await
         })
     }
@@ -887,7 +978,13 @@ impl PacketOutbound for Hysteria2Handler {
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         let client = self.build_client(node, None, None).await?;
         Ok(self
-            .udp_transport_via_client(client, target, target_domain, connect_timeout)
+            .udp_transport_via_client_ctx(
+                client,
+                target,
+                target_domain,
+                connect_timeout,
+                &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+            )
             .await?)
     }
 
@@ -898,9 +995,27 @@ impl PacketOutbound for Hysteria2Handler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        self.dial_udp_transport_runtime_ctx(
+            runtime,
+            target,
+            target_domain,
+            connect_timeout,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
+    }
+
+    async fn dial_udp_transport_runtime_ctx(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         let client = self.client_for_runtime(&runtime).await?;
         Ok(self
-            .udp_transport_via_client(client, target, target_domain, connect_timeout)
+            .udp_transport_via_client_ctx(client, target, target_domain, connect_timeout, ctx)
             .await?)
     }
 
@@ -912,9 +1027,29 @@ impl PacketOutbound for Hysteria2Handler {
         connect_timeout: Duration,
         detour: &Arc<DetourPath>,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        self.dial_udp_transport_runtime_detoured_ctx(
+            runtime,
+            target,
+            target_domain,
+            connect_timeout,
+            detour,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
+    }
+
+    async fn dial_udp_transport_runtime_detoured_ctx(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        detour: &Arc<DetourPath>,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         crate::quic::fronted_quic_dial!(self, runtime, detour, |client| {
             Ok(self
-                .udp_transport_via_client(client, target, target_domain, connect_timeout)
+                .udp_transport_via_client_ctx(client, target, target_domain, connect_timeout, ctx)
                 .await?)
         })
     }

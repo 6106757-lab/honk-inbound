@@ -91,6 +91,7 @@ pub async fn open_h3(
     slot: usize,
     backend: TunnelBackend,
     detour: Option<&crate::proxy::detour::DetourPath>,
+    ctx: &crate::proxy::detour::DetourDialCtx,
 ) -> anyhow::Result<MasqueTunnel> {
     let config = node
         .masque()
@@ -116,7 +117,7 @@ pub async fn open_h3(
         .clone()
         .unwrap_or_else(|| DEFAULT_SNI.to_string());
     let (established, endpoint) =
-        race_quic_connection(node, endpoints, &sni, connect_timeout, detour).await?;
+        race_quic_connection(node, endpoints, &sni, connect_timeout, detour, ctx).await?;
     let connection = established.connection;
     let quinn_endpoint = established.endpoint;
     let packet_endpoint = established.packet;
@@ -334,6 +335,7 @@ async fn race_quic_connection(
     sni: &str,
     connect_timeout: Duration,
     detour: Option<&crate::proxy::detour::DetourPath>,
+    ctx: &crate::proxy::detour::DetourDialCtx,
 ) -> anyhow::Result<(EstablishedQuic, SocketAddr)> {
     // Resolve the front once for the whole race: a group front selected per
     // attempt would burn one round-robin turn per address tried, and the
@@ -343,13 +345,17 @@ async fn race_quic_connection(
             let first = endpoints.first().copied().ok_or_else(|| {
                 anyhow::anyhow!("masque node {}: no resolved address to dial", node.name)
             })?;
-            Some(path.resolve_udp_carrier(first)?)
+            Some(
+                path.resolve_udp_carrier(first)
+                    .map_err(|error| path.wrap_setup_error(error, ctx.hop))?,
+            )
         }
         None => None,
     };
+    let ctx = *ctx;
     crate::address_race::race_resolved_addrs(endpoints, |endpoint| async move {
         let established =
-            quic_connection_to(node, endpoint, sni, connect_timeout, detour, carrier).await?;
+            quic_connection_to(node, endpoint, sni, connect_timeout, detour, carrier, &ctx).await?;
         Ok((established, endpoint))
     })
     .await
@@ -370,6 +376,7 @@ async fn quic_connection_to(
     connect_timeout: Duration,
     detour: Option<&crate::proxy::detour::DetourPath>,
     carrier: Option<uuid::Uuid>,
+    ctx: &crate::proxy::detour::DetourDialCtx,
 ) -> anyhow::Result<EstablishedQuic> {
     let client = build_client_config(node, detour.is_some())?;
     // A detour cannot give us a real UDP socket, but it can give us a framed
@@ -379,7 +386,7 @@ async fn quic_connection_to(
     let (quinn_endpoint, packet_endpoint) = match (detour, carrier) {
         (Some(path), Some(carrier)) => {
             let transport = path
-                .connect_udp_via(carrier, endpoint, Some(node.host()), connect_timeout)
+                .connect_udp_via(carrier, endpoint, Some(node.host()), connect_timeout, ctx)
                 .await
                 .map_err(|error| {
                     anyhow::anyhow!(

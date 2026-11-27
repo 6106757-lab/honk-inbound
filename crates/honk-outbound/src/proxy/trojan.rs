@@ -51,11 +51,12 @@ impl TrojanHandler {
         target_domain: Option<&str>,
         tcp: Option<TcpStream>,
         connect_timeout: std::time::Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<ProxyStream> {
         let password = node.trojan().unwrap().password.as_deref().unwrap_or("");
         let header = Self::build_request_header(password, target, target_domain)?;
         let (mut stream, preparation) =
-            Self::prepare_transport(node, runtime, tcp, connect_timeout).await?;
+            Self::prepare_transport(node, runtime, tcp, connect_timeout, ctx).await?;
         preparation.commit()?;
         super::transport::write_request(&mut stream, &header).await?;
         Ok(ProxyStream {
@@ -78,6 +79,7 @@ impl TrojanHandler {
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
         detour: &Arc<crate::proxy::detour::DetourPath>,
+        ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<ProxyStream> {
         let password = node.trojan().unwrap().password.as_deref().unwrap_or("");
         let header = Self::build_request_header(password, target, target_domain)?;
@@ -86,6 +88,7 @@ impl TrojanHandler {
             None,
             connect_timeout,
             Some(detour),
+            ctx,
         )
         .await?;
         preparation.commit()?;
@@ -103,8 +106,9 @@ impl TrojanHandler {
         target: SocketAddr,
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        Self::prepare_udp_stream(node, runtime, target, target_domain, connect_timeout)
+        Self::prepare_udp_stream(node, runtime, target, target_domain, connect_timeout, ctx)
             .await?
             .commit()
             .await
@@ -120,6 +124,7 @@ impl TrojanHandler {
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
         detour: &Arc<crate::proxy::detour::DetourPath>,
+        ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         if !crate::descriptor::network_allows_udp(node) {
             anyhow::bail!(
@@ -132,6 +137,7 @@ impl TrojanHandler {
             None,
             connect_timeout,
             Some(detour),
+            ctx,
         )
         .await?;
         preparation.commit()?;
@@ -143,6 +149,7 @@ impl TrojanHandler {
         runtime: Option<&Arc<crate::runtime::NodeRuntime>>,
         tcp: Option<TcpStream>,
         timeout: std::time::Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<(
         Box<dyn AsyncReadWrite>,
         super::transport::TransportPreparation,
@@ -155,11 +162,12 @@ impl TrojanHandler {
                     tcp,
                     timeout,
                     detour.as_deref(),
+                    ctx,
                 )
                 .await
             }
             None => Ok((
-                super::transport::wrap_transport(node, tcp, timeout, None).await?,
+                super::transport::wrap_transport(node, tcp, timeout, None, ctx).await?,
                 super::transport::TransportPreparation::none(),
             )),
         }
@@ -171,9 +179,10 @@ impl TrojanHandler {
         target: SocketAddr,
         domain: Option<&str>,
         timeout: std::time::Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<PreparedUdpTransport> {
         let (transport, preparation) =
-            Self::open_udp_stream(node, runtime, target, domain, timeout).await?;
+            Self::open_udp_stream(node, runtime, target, domain, timeout, ctx).await?;
         Ok(Self::commit_udp_stream(
             transport as Arc<dyn PacketTransport>,
             preparation,
@@ -189,8 +198,15 @@ impl TrojanHandler {
         domain: Option<&str>,
         timeout: std::time::Duration,
     ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
-        let (transport, preparation) =
-            Self::open_udp_stream(&runtime.node, Some(runtime), target, domain, timeout).await?;
+        let (transport, preparation) = Self::open_udp_stream(
+            &runtime.node,
+            Some(runtime),
+            target,
+            domain,
+            timeout,
+            &crate::proxy::detour::DetourDialCtx::root(timeout),
+        )
+        .await?;
         Ok(Self::commit_udp_stream(
             transport as Arc<dyn MultiTargetTransport>,
             preparation,
@@ -203,6 +219,7 @@ impl TrojanHandler {
         target: SocketAddr,
         domain: Option<&str>,
         timeout: std::time::Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<(
         Arc<TrojanUdpTransport>,
         super::transport::TransportPreparation,
@@ -213,7 +230,8 @@ impl TrojanHandler {
                 node.network()
             );
         }
-        let (control, preparation) = Self::prepare_transport(node, runtime, None, timeout).await?;
+        let (control, preparation) =
+            Self::prepare_transport(node, runtime, None, timeout, ctx).await?;
         let transport = Self::finish_udp_stream(node, target, domain, control).await?;
         Ok((transport, preparation))
     }
@@ -265,7 +283,16 @@ impl TcpOutbound for TrojanHandler {
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<ProxyStream> {
-        Self::dial_stream(node, None, target, target_domain, None, connect_timeout).await
+        Self::dial_stream(
+            node,
+            None,
+            target,
+            target_domain,
+            None,
+            connect_timeout,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
     }
 
     async fn dial_with_tcp(
@@ -283,6 +310,7 @@ impl TcpOutbound for TrojanHandler {
             target_domain,
             Some(tcp),
             connect_timeout,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
         )
         .await
     }
@@ -294,6 +322,24 @@ impl TcpOutbound for TrojanHandler {
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<ProxyStream> {
+        self.dial_runtime_ctx(
+            runtime,
+            target,
+            target_domain,
+            connect_timeout,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
+    }
+
+    async fn dial_runtime_ctx(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<ProxyStream> {
         Self::dial_stream(
             &runtime.node,
             Some(&runtime),
@@ -301,6 +347,7 @@ impl TcpOutbound for TrojanHandler {
             target_domain,
             None,
             connect_timeout,
+            ctx,
         )
         .await
     }
@@ -313,6 +360,26 @@ impl TcpOutbound for TrojanHandler {
         connect_timeout: std::time::Duration,
         detour: &Arc<crate::proxy::detour::DetourPath>,
     ) -> anyhow::Result<ProxyStream> {
+        self.dial_runtime_detoured_ctx(
+            runtime,
+            target,
+            target_domain,
+            connect_timeout,
+            detour,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
+    }
+
+    async fn dial_runtime_detoured_ctx(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+        detour: &Arc<crate::proxy::detour::DetourPath>,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<ProxyStream> {
         Self::dial_stream_detoured(
             &runtime.node,
             &runtime,
@@ -320,6 +387,7 @@ impl TcpOutbound for TrojanHandler {
             target_domain,
             connect_timeout,
             detour,
+            ctx,
         )
         .await
     }
@@ -349,7 +417,15 @@ impl PacketOutbound for TrojanHandler {
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        Self::dial_udp_stream(node, None, target, target_domain, connect_timeout).await
+        Self::dial_udp_stream(
+            node,
+            None,
+            target,
+            target_domain,
+            connect_timeout,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
     }
 
     async fn dial_udp_transport_runtime(
@@ -365,6 +441,7 @@ impl PacketOutbound for TrojanHandler {
             target,
             target_domain,
             connect_timeout,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
         )
         .await
     }
@@ -377,6 +454,26 @@ impl PacketOutbound for TrojanHandler {
         connect_timeout: std::time::Duration,
         detour: &Arc<crate::proxy::detour::DetourPath>,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        self.dial_udp_transport_runtime_detoured_ctx(
+            runtime,
+            target,
+            target_domain,
+            connect_timeout,
+            detour,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
+    }
+
+    async fn dial_udp_transport_runtime_detoured_ctx(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+        detour: &Arc<crate::proxy::detour::DetourPath>,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         Self::dial_udp_stream_detoured(
             &runtime.node,
             &runtime,
@@ -384,6 +481,7 @@ impl PacketOutbound for TrojanHandler {
             target_domain,
             connect_timeout,
             detour,
+            ctx,
         )
         .await
     }
@@ -401,6 +499,7 @@ impl PacketOutbound for TrojanHandler {
             target,
             target_domain,
             connect_timeout,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
         )
         .await
     }

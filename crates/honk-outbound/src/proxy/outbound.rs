@@ -167,6 +167,21 @@ pub trait PacketOutbound: Send + Sync {
         .await
     }
 
+    /// [`Self::dial_udp_transport_runtime`] with the detour dial context
+    /// threaded through. The default forwards to
+    /// [`Self::dial_udp_transport_runtime`].
+    async fn dial_udp_transport_runtime_ctx(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        _ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        self.dial_udp_transport_runtime(runtime, target, target_domain, connect_timeout)
+            .await
+    }
+
     /// UDP counterpart of [`TcpOutbound::dial_runtime_detoured`].
     ///
     /// A group's detour names the path this one flow must take, independent of
@@ -202,8 +217,14 @@ pub trait PacketOutbound: Send + Sync {
         detour: &Arc<crate::proxy::detour::DetourPath>,
         _ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        self.dial_udp_transport_runtime_detoured(runtime, target, target_domain, connect_timeout, detour)
-            .await
+        self.dial_udp_transport_runtime_detoured(
+            runtime,
+            target,
+            target_domain,
+            connect_timeout,
+            detour,
+        )
+        .await
     }
 
     /// UDP counterpart of [`TcpOutbound::dial_runtime_marked`].

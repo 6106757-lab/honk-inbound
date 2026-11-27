@@ -95,6 +95,7 @@ async fn cancelled_encrypted_ws_handshake_retains_credit_until_bridge_teardown()
         target,
         None,
         std::time::Duration::from_secs(3),
+        &crate::proxy::detour::DetourDialCtx::root(std::time::Duration::from_secs(3)),
     ));
     tokio::select! {
         result = &mut dial => panic!("encrypted handshake completed before cancellation: {:?}", result.map(|(stream, _)| stream)),

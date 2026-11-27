@@ -266,6 +266,7 @@ impl VLessHandler {
         target: SocketAddr,
         domain: Option<&str>,
         timeout: std::time::Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<(
         Arc<VlessUotTransport>,
         crate::proxy::transport::TransportPreparation,
@@ -281,7 +282,7 @@ impl VLessHandler {
         )?;
         let request = crate::proxy::uot::request(false, target, domain)?;
         let (stream, preparation) = self
-            .prepare_retained_carrier(runtime, uuid, header, timeout)
+            .prepare_retained_carrier(runtime, uuid, header, timeout, ctx)
             .await?;
         Ok((
             Arc::new(VlessUotTransport::new(stream, target, domain, request)),
@@ -296,6 +297,7 @@ impl VLessHandler {
         target: SocketAddr,
         domain: Option<&str>,
         timeout: std::time::Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<PreparedUdpTransport> {
         let vless = runtime.node.vless().unwrap();
         let uuid = Self::parse_uuid(vless.uuid.as_deref().unwrap_or(""))?;
@@ -311,7 +313,7 @@ impl VLessHandler {
             header_domain,
             vless.wire_flow(),
         )?;
-        let operation = self.prepare_retained_carrier(&runtime, uuid, header, timeout);
+        let operation = self.prepare_retained_carrier(&runtime, uuid, header, timeout, ctx);
         let (stream, preparation) = if path == VlessUdpPath::Native {
             crate::runtime::flow_observation::request_write(std::pin::pin!(operation)).await?
         } else {
@@ -394,12 +396,15 @@ impl VLessHandler {
         global_id: [u8; 8],
     ) -> anyhow::Result<PreparedUdpTransport<VlessXudpTransport>> {
         // This large cold handshake must not inflate each task-scope poll frame.
+        // No caller-named detour reaches a source-scoped UDP dial, so the
+        // carrier underneath starts at hop 0 on the node's own detour.
+        let ctx = crate::proxy::detour::DetourDialCtx::root(timeout);
         runtime
             .scope_tasks(Box::pin(async {
                 match Self::udp_path(&runtime.node, target.port())? {
                     VlessUdpPath::Xudp => {
                         let (stream, preparation) = Self::new()
-                            .prepare_retained_mux_carrier(&runtime, timeout)
+                            .prepare_retained_mux_carrier(&runtime, timeout, &ctx)
                             .await?;
                         let transport =
                             cool::connect_single_xudp(stream, target, domain, global_id).await?;
@@ -416,7 +421,14 @@ impl VLessHandler {
                         let dial_runtime = Arc::clone(&runtime);
                         Self::prepare_mux_udp(
                             pool,
-                            move || Self::prepare_cool_session(dial_runtime, active_limit, timeout),
+                            move || {
+                                Self::prepare_cool_session(
+                                    dial_runtime,
+                                    active_limit,
+                                    timeout,
+                                    &ctx,
+                                )
+                            },
                             move |session, permit| {
                                 cool::open_xudp(session, permit, target, domain, global_id)
                             },
@@ -446,12 +458,15 @@ impl VLessHandler {
         domain: Option<&str>,
         timeout: std::time::Duration,
     ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
+        // No caller-named detour reaches a source-scoped UDP dial, so the
+        // carrier underneath starts at hop 0 on the node's own detour.
+        let ctx = crate::proxy::detour::DetourDialCtx::root(timeout);
         runtime
             .scope_tasks(Box::pin(async {
                 match Self::udp_path(&runtime.node, target.port())? {
                     VlessUdpPath::UotV2 => {
                         let (transport, preparation) = Self::new()
-                            .prepare_uot_transport(&runtime, target, domain, timeout)
+                            .prepare_uot_transport(&runtime, target, domain, timeout, &ctx)
                             .await?;
                         Ok(publish_on_commit(
                             transport as Arc<dyn MultiTargetTransport>,
@@ -463,7 +478,7 @@ impl VLessHandler {
                         let dial_runtime = Arc::clone(&runtime);
                         Self::prepare_mux_udp(
                             pool,
-                            move || Self::prepare_h2_session(dial_runtime, timeout),
+                            move || Self::prepare_h2_session(dial_runtime, timeout, &ctx),
                             move |session, permit| async move {
                                 let transport: Arc<dyn MultiTargetTransport> =
                                     session.open_packet(permit, target, domain).await?;
@@ -511,6 +526,7 @@ impl PacketOutbound for VLessHandler {
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         let path = Self::udp_path(node, target.port())?;
         let owner = crate::runtime::NodeRuntime::try_ephemeral_guarded(node)?;
+        let ctx = crate::proxy::detour::DetourDialCtx::root(connect_timeout);
         let transport = self
             .open_udp(
                 owner.runtime(),
@@ -518,6 +534,7 @@ impl PacketOutbound for VLessHandler {
                 target,
                 target_domain,
                 connect_timeout,
+                &ctx,
             )
             .await?;
         Ok(crate::proxy::packet_transport_with_owner(transport, owner))
@@ -531,7 +548,8 @@ impl PacketOutbound for VLessHandler {
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         let path = Self::udp_path(&runtime.node, target.port())?;
-        self.open_udp(runtime, path, target, target_domain, connect_timeout)
+        let ctx = crate::proxy::detour::DetourDialCtx::root(connect_timeout);
+        self.open_udp(runtime, path, target, target_domain, connect_timeout, &ctx)
             .await
     }
 
@@ -543,13 +561,16 @@ impl PacketOutbound for VLessHandler {
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<PreparedUdpTransport> {
         let path = Self::udp_path(&runtime.node, target.port())?;
+        // No caller-named detour reaches a speculative UDP dial, so the
+        // carrier underneath starts at hop 0 on the node's own detour.
+        let ctx = crate::proxy::detour::DetourDialCtx::root(connect_timeout);
         match path {
             VlessUdpPath::H2 => {
                 let pool = runtime.vless_h2_pool()?;
                 let dial_runtime = Arc::clone(&runtime);
                 Self::prepare_mux_udp(
                     pool,
-                    move || Self::prepare_h2_session(dial_runtime, connect_timeout),
+                    move || Self::prepare_h2_session(dial_runtime, connect_timeout, &ctx),
                     move |session, permit| async move {
                         let transport: Arc<dyn PacketTransport> =
                             session.open_packet(permit, target, target_domain).await?;
@@ -570,7 +591,14 @@ impl PacketOutbound for VLessHandler {
                 let dial_runtime = Arc::clone(&runtime);
                 Self::prepare_mux_udp(
                     pool,
-                    move || Self::prepare_cool_session(dial_runtime, active_limit, connect_timeout),
+                    move || {
+                        Self::prepare_cool_session(
+                            dial_runtime,
+                            active_limit,
+                            connect_timeout,
+                            &ctx,
+                        )
+                    },
                     move |session, permit| async move {
                         let transport: Arc<dyn PacketTransport> =
                             session.open_packet(permit, target, target_domain).await?;
@@ -586,7 +614,7 @@ impl PacketOutbound for VLessHandler {
             }
             VlessUdpPath::UotV2 => {
                 let (transport, preparation) = self
-                    .prepare_uot_transport(&runtime, target, target_domain, connect_timeout)
+                    .prepare_uot_transport(&runtime, target, target_domain, connect_timeout, &ctx)
                     .await?;
                 Ok(publish_on_commit(
                     transport as Arc<dyn PacketTransport>,
@@ -594,8 +622,15 @@ impl PacketOutbound for VLessHandler {
                 ))
             }
             VlessUdpPath::Native | VlessUdpPath::Xudp => {
-                self.prepare_protocol_udp(runtime, path, target, target_domain, connect_timeout)
-                    .await
+                self.prepare_protocol_udp(
+                    runtime,
+                    path,
+                    target,
+                    target_domain,
+                    connect_timeout,
+                    &ctx,
+                )
+                .await
             }
         }
     }

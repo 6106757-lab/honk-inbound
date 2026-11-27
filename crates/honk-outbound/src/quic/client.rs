@@ -196,15 +196,34 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
         F: FnOnce(Connection) -> Fut,
         Fut: Future<Output = anyhow::Result<C>>,
     {
-        self.task_scope
-            .scope(self.connection_with_inner(connect_timeout, setup, |_, _| {}))
-            .await
+        self.connection_with_ctx(
+            connect_timeout,
+            setup,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
     }
 
-    pub(crate) async fn connection_with_metrics<F, Fut>(
+    pub async fn connection_with_ctx<F, Fut>(
         &self,
         connect_timeout: Duration,
         setup: F,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<(Connection, Arc<C>)>
+    where
+        F: FnOnce(Connection) -> Fut,
+        Fut: Future<Output = anyhow::Result<C>>,
+    {
+        self.task_scope
+            .scope(self.connection_with_inner(connect_timeout, setup, |_, _| {}, ctx))
+            .await
+    }
+
+    pub(crate) async fn connection_with_metrics_ctx<F, Fut>(
+        &self,
+        connect_timeout: Duration,
+        setup: F,
+        ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<(Connection, Arc<C>)>
     where
         C: QuicConnState,
@@ -212,11 +231,14 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
         Fut: Future<Output = anyhow::Result<C>>,
     {
         self.task_scope
-            .scope(
-                self.connection_with_inner(connect_timeout, setup, |ctx, _| {
+            .scope(self.connection_with_inner(
+                connect_timeout,
+                setup,
+                |ctx, _| {
                     ctx.enable_telemetry();
-                }),
-            )
+                },
+                ctx,
+            ))
             .await
     }
 
@@ -225,6 +247,7 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
         connect_timeout: Duration,
         setup: F,
         mut on_publish: H,
+        ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<(Connection, Arc<C>)>
     where
         F: FnOnce(Connection) -> Fut,
@@ -279,12 +302,15 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
         // address is still a choice: race the handshake across every resolved
         // address the way the direct path does, and keep the transport the
         // winner came back on.
+        let ctx = *ctx;
         let (conn, dial_endpoint, ipv6) = match self.detour.as_deref() {
             Some(path) => {
                 // Resolve the front once for the whole race: a group front
                 // selected per attempt would burn one round-robin turn per
                 // address tried, and the attempts could ride different fronts.
-                let carrier = path.resolve_udp_carrier(addrs[0])?;
+                let carrier = path
+                    .resolve_udp_carrier(addrs[0])
+                    .map_err(|error| path.wrap_setup_error(error, ctx.hop))?;
                 let raced = crate::address_race::race_resolved_addrs(&addrs, |server_addr| {
                     let selection = selection.as_ref();
                     async move {
@@ -294,6 +320,7 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
                             server_addr,
                             selection,
                             connect_timeout,
+                            &ctx,
                         )
                         .await
                     }
@@ -482,6 +509,7 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
         server_addr: SocketAddr,
         selection: Option<&crate::runtime::flow_observation::LookupSelection>,
         connect_timeout: Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<(Connection, DialEndpoint, bool)> {
         if let Some(selection) = selection {
             selection.selected_ip(server_addr.ip());
@@ -492,6 +520,7 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
                 server_addr,
                 Some(self.server_host.as_str()),
                 connect_timeout,
+                ctx,
             )
             .await
             .with_context(|| crate::proxy::detour::udp_carry_context(server_addr))?;

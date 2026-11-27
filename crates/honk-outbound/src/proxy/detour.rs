@@ -375,22 +375,104 @@ impl DetourPath {
         &self,
         target: SocketAddr,
         timeout: Duration,
+        ctx: &DetourDialCtx,
     ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
-        let node_id = self.resolve(ProbeDomain::Tcp)?;
-        self.connect_via(node_id, target, timeout).await
+        let node_id = self
+            .resolve(ProbeDomain::Tcp)
+            .map_err(|error| self.wrap_setup_error(error, ctx.hop))?;
+        self.connect_via(node_id, target, timeout, ctx).await
+    }
+
+    /// Wrap a front dial failure per the leg rules: an error that already
+    /// names its hop, or a target refusal, passes through untouched; anything
+    /// else is this leg's failure, tagged with its hop and its front.
+    fn wrap_leg_error(
+        &self,
+        error: anyhow::Error,
+        hop: usize,
+        node_id: uuid::Uuid,
+    ) -> anyhow::Error {
+        if crate::proxy::failed_hop(&error).is_some() || crate::proxy::target_failure(&error) {
+            return error;
+        }
+        let node_name = self
+            .generation
+            .get(&node_id)
+            .map(|runtime| runtime.node.name.clone())
+            .unwrap_or_else(|| node_id.to_string());
+        crate::proxy::DetourHopFailure {
+            hop,
+            node: Some(node_id),
+            node_name,
+            error,
+        }
+        .into()
+    }
+
+    /// Wrap a failure that happened before any front was chosen: the leg
+    /// never started, so there is no node to blame, but the hop still says
+    /// where in the chain the setup gave up.
+    pub(crate) fn wrap_setup_error(&self, error: anyhow::Error, hop: usize) -> anyhow::Error {
+        if crate::proxy::failed_hop(&error).is_some() {
+            return error;
+        }
+        crate::proxy::DetourHopFailure {
+            hop,
+            node: None,
+            node_name: self.target_description(),
+            error,
+        }
+        .into()
     }
 
     /// Open a stream to `target` through the already-resolved front node.
+    ///
+    /// This is the one TCP leg point: `connect` and `connect_raced` both
+    /// funnel through here, so the depth cap, the shared-deadline budget and
+    /// the hop tagging each live in exactly one place. The leg dial is
+    /// wrapped in its budget as a hard timeout — the timeout parameter alone
+    /// cannot bound a front that accepts the connection and then goes silent
+    /// (a SOCKS5 handshake, for one, has fixed per-step timeouts of its own).
     pub(crate) async fn connect_via(
         &self,
         node_id: uuid::Uuid,
         target: SocketAddr,
         timeout: Duration,
+        ctx: &DetourDialCtx,
     ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
-        let stream = self
-            .proxies
-            .dial_runtime(Arc::clone(&self.generation), node_id, target, None, timeout)
-            .await?;
+        if ctx.hop >= MAX_DETOUR_HOPS {
+            anyhow::bail!(crate::proxy::DetourHopFailure {
+                hop: ctx.hop,
+                node: None,
+                node_name: self.target_description(),
+                error: anyhow::anyhow!("detour depth exceeds {MAX_DETOUR_HOPS}"),
+            });
+        }
+        let budget = ctx.budget(timeout);
+        let timed_out = || {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("detour leg dial timed out after {budget:?}"),
+            )
+        };
+        if budget.is_zero() {
+            return Err(self.wrap_leg_error(timed_out().into(), ctx.hop, node_id));
+        }
+        let child = ctx.child();
+        let dial = self.proxies.dial_runtime_ctx(
+            Arc::clone(&self.generation),
+            node_id,
+            target,
+            None,
+            budget,
+            &child,
+        );
+        let stream = match tokio::time::timeout(budget, dial).await {
+            Ok(result) => result.map_err(|error| self.wrap_leg_error(error, ctx.hop, node_id))?,
+            Err(_elapsed) => {
+                return Err(self.wrap_leg_error(timed_out().into(), ctx.hop, node_id));
+            }
+        };
         Ok(stream.stream)
     }
 
@@ -407,18 +489,24 @@ impl DetourPath {
         &self,
         endpoints: &[SocketAddr],
         timeout: Duration,
+        ctx: &DetourDialCtx,
     ) -> anyhow::Result<(Box<dyn AsyncReadWrite>, SocketAddr)> {
-        let node_id = self.resolve(ProbeDomain::Tcp)?;
+        let node_id = self
+            .resolve(ProbeDomain::Tcp)
+            .map_err(|error| self.wrap_setup_error(error, ctx.hop))?;
         crate::address_race::race_resolved_addrs(endpoints, |endpoint| {
             let this = self;
+            let ctx = *ctx;
             async move {
-                this.connect_via(node_id, endpoint, timeout)
+                this.connect_via(node_id, endpoint, timeout, &ctx)
                     .await
                     .map(|stream| (stream, endpoint))
             }
         })
         .await
-        .ok_or_else(|| anyhow::anyhow!("no resolved address to dial"))?
+        .ok_or_else(|| {
+            self.wrap_setup_error(anyhow::anyhow!("no resolved address to dial"), ctx.hop)
+        })?
     }
 
     /// Open a framed UDP transport to `target` through the already-resolved
@@ -430,17 +518,43 @@ impl DetourPath {
         target: SocketAddr,
         target_domain: Option<&str>,
         timeout: Duration,
+        ctx: &DetourDialCtx,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        self.proxies
-            .dial_udp_transport_runtime(
-                Arc::clone(&self.generation),
-                node_id,
-                target,
-                target_domain,
-                timeout,
+        let budget = ctx.budget(timeout);
+        let timed_out = || {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("detour leg dial timed out after {budget:?}"),
             )
-            .await
+        };
+        if budget.is_zero() {
+            return Err(self.wrap_leg_error(timed_out().into(), ctx.hop, node_id));
+        }
+        let dial = self.proxies.dial_udp_transport_runtime(
+            Arc::clone(&self.generation),
+            node_id,
+            target,
+            target_domain,
+            budget,
+        );
+        match tokio::time::timeout(budget, dial).await {
+            Ok(result) => result.map_err(|error| self.wrap_leg_error(error, ctx.hop, node_id)),
+            Err(_elapsed) => Err(self.wrap_leg_error(timed_out().into(), ctx.hop, node_id)),
+        }
     }
+}
+
+/// Wrap a named-but-unbound detour refusal as a setup failure of this leg:
+/// the dial never started, so there is no front to blame, but the hop still
+/// says where in the chain the setup gave up.
+pub(crate) fn wrap_unbound_detour(error: anyhow::Error, node: &Node, hop: usize) -> anyhow::Error {
+    crate::proxy::DetourHopFailure {
+        hop,
+        node: None,
+        node_name: node.detour_name().unwrap_or("detour").to_string(),
+        error,
+    }
+    .into()
 }
 
 /// Open the connection to a node's own server: through its detour when the
@@ -455,17 +569,20 @@ pub(crate) async fn connect_server(
     node: &Node,
     detour: Option<&DetourPath>,
     connect_timeout: Duration,
+    ctx: &DetourDialCtx,
 ) -> anyhow::Result<crate::transport_quality::tcp::Carrier> {
-    ensure_bound(node, detour)?;
+    ensure_bound(node, detour).map_err(|error| wrap_unbound_detour(error, node, ctx.hop))?;
     let address = crate::proxy::transport::endpoint_address(node);
     let Some(path) = detour else {
         return Ok(crate::transport_quality::tcp::Carrier::Socket(
             crate::util::connect_outbound(&address, connect_timeout).await?,
         ));
     };
-    let endpoints = resolve_endpoints(&address).await?;
+    let endpoints = resolve_endpoints(&address)
+        .await
+        .map_err(|error| path.wrap_setup_error(error, ctx.hop))?;
     let (stream, _) = path
-        .connect_raced(&endpoints, connect_timeout)
+        .connect_raced(&endpoints, connect_timeout, ctx)
         .await
         .map_err(|error| {
             anyhow::anyhow!(
@@ -1062,7 +1179,13 @@ mod tests {
         back.detour = Some("direct".into());
         back.id = back.derive_id();
 
-        let dialed = connect_server(&back, Some(&path), Duration::from_secs(5)).await;
+        let dialed = connect_server(
+            &back,
+            Some(&path),
+            Duration::from_secs(5),
+            &DetourDialCtx::root(Duration::from_secs(5)),
+        )
+        .await;
         crate::bootstrap::set_global(None);
         let mut carrier = dialed
             .expect("detour dial reaches the live address although the first resolved one refuses");
@@ -1139,7 +1262,13 @@ mod tests {
             back.protocol(),
         );
 
-        let dialed = connect_server(&back, Some(&path), Duration::from_secs(5)).await;
+        let dialed = connect_server(
+            &back,
+            Some(&path),
+            Duration::from_secs(5),
+            &DetourDialCtx::root(Duration::from_secs(5)),
+        )
+        .await;
         crate::bootstrap::set_global(None);
         let mut carrier = dialed.expect(
             "detour dial through a group front reaches the live address although the first resolved one refuses",

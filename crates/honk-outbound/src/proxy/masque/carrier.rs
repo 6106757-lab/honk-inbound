@@ -33,6 +33,7 @@ pub async fn open_tunnel(
     detour: Option<&DetourPath>,
     slot: usize,
     backend: TunnelBackend,
+    ctx: &crate::proxy::detour::DetourDialCtx,
 ) -> anyhow::Result<MasqueTunnel> {
     let config = node
         .masque()
@@ -40,8 +41,8 @@ pub async fn open_tunnel(
     // `MasqueConfig::network()` has already collapsed `h3`/`http3`/`quic`
     // into one value and defaults an absent setting to `h2`.
     match config.network() {
-        "h2" => open_h2(node, connect_timeout, detour, slot, backend).await,
-        "quic" => open_quic(node, connect_timeout, detour, slot, backend).await,
+        "h2" => open_h2(node, connect_timeout, detour, slot, backend, ctx).await,
+        "quic" => open_quic(node, connect_timeout, detour, slot, backend, ctx).await,
         other => anyhow::bail!("masque node {}: unsupported network {other:?}", node.name),
     }
 }
@@ -59,16 +60,23 @@ async fn open_quic(
     detour: Option<&DetourPath>,
     slot: usize,
     backend: TunnelBackend,
+    ctx: &crate::proxy::detour::DetourDialCtx,
 ) -> anyhow::Result<MasqueTunnel> {
     // A node that names a detour must ride it. `ensure_bound` also refuses a
     // named-but-unbound detour, which would otherwise dial the direct path and
     // quietly bypass the front node.
-    crate::proxy::detour::ensure_bound(node, detour)?;
+    crate::proxy::detour::ensure_bound(node, detour)
+        .map_err(|error| crate::proxy::detour::wrap_unbound_detour(error, node, ctx.hop))?;
     let config = node
         .masque()
         .ok_or_else(|| anyhow::anyhow!("masque node {} has no masque config", node.name))?;
     let address = endpoint_address(node);
-    let endpoints = resolve_endpoints(&address).await?;
+    let endpoints = resolve_endpoints(&address)
+        .await
+        .map_err(|error| match detour {
+            Some(path) => path.wrap_setup_error(error, ctx.hop),
+            None => error,
+        })?;
     let mtu = config.mtu.map(u32::from).unwrap_or(DEFAULT_MTU);
     let tun_name = tun_name(node, slot);
     let preferred = tunnel_addresses(node);
@@ -86,6 +94,7 @@ async fn open_quic(
         slot,
         backend,
         detour,
+        ctx,
     )
     .await
 }
@@ -97,10 +106,12 @@ async fn open_h2(
     detour: Option<&DetourPath>,
     slot: usize,
     backend: TunnelBackend,
+    ctx: &crate::proxy::detour::DetourDialCtx,
 ) -> anyhow::Result<MasqueTunnel> {
     // Same binding contract as the h3 path: reject a named-but-unbound
     // detour instead of silently dialling direct.
-    crate::proxy::detour::ensure_bound(node, detour)?;
+    crate::proxy::detour::ensure_bound(node, detour)
+        .map_err(|error| crate::proxy::detour::wrap_unbound_detour(error, node, ctx.hop))?;
     let config = node
         .masque()
         .ok_or_else(|| anyhow::anyhow!("masque node {} has no masque config", node.name))?;
@@ -109,9 +120,11 @@ async fn open_h2(
     // `dialer-proxy`; `ensure_bound` only guards the unbound case.
     let tcp = match detour {
         Some(dialer) => {
-            let endpoints = resolve_endpoints(&address).await?;
+            let endpoints = resolve_endpoints(&address)
+                .await
+                .map_err(|error| dialer.wrap_setup_error(error, ctx.hop))?;
             let (stream, _) = dialer
-                .connect_raced(&endpoints, connect_timeout)
+                .connect_raced(&endpoints, connect_timeout, ctx)
                 .await
                 .map_err(|error| {
                     anyhow::anyhow!(

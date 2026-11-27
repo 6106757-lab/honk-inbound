@@ -151,21 +151,37 @@ impl JuicityClient {
         &self,
         connect_timeout: Duration,
     ) -> anyhow::Result<(quinn::Connection, Arc<JuicityConnState>)> {
+        self.connection_ctx(
+            connect_timeout,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
+    }
+
+    async fn connection_ctx(
+        &self,
+        connect_timeout: Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<(quinn::Connection, Arc<JuicityConnState>)> {
         let uuid = self.uuid;
         let password = &self.password;
         self.quic
-            .connection_with_metrics(connect_timeout, move |conn| async move {
-                let auth_stream = crate::quic::exporter_auth(
-                    &conn,
-                    &uuid,
-                    password,
-                    JUICITY_VERSION,
-                    false,
-                    AUTH_GRACE,
-                )
-                .await?;
-                Ok(JuicityConnState::new(conn, auth_stream))
-            })
+            .connection_with_metrics_ctx(
+                connect_timeout,
+                move |conn| async move {
+                    let auth_stream = crate::quic::exporter_auth(
+                        &conn,
+                        &uuid,
+                        password,
+                        JUICITY_VERSION,
+                        false,
+                        AUTH_GRACE,
+                    )
+                    .await?;
+                    Ok(JuicityConnState::new(conn, auth_stream))
+                },
+                ctx,
+            )
             .await
     }
 }
@@ -276,12 +292,31 @@ impl JuicityHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
+        self.dial_via_client_ctx(
+            client,
+            target,
+            target_domain,
+            connect_timeout,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
+    }
+
+    async fn dial_via_client_ctx(
+        &self,
+        client: Arc<JuicityClient>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<ProxyStream> {
         let addr = JuiceAddr::new(target, target_domain)?;
+        let ctx = *ctx;
         let stream = crate::quic::dial_quic_stream(
             &client.quic,
             |timeout| {
                 let client = Arc::clone(&client);
-                async move { client.connection(timeout).await }
+                async move { client.connection_ctx(timeout, &ctx).await }
             },
             connect_timeout,
             move |conn| {
@@ -307,10 +342,30 @@ impl JuicityHandler {
         connect_timeout: Duration,
         observe_open: bool,
     ) -> anyhow::Result<Arc<JuicityUdpTransport>> {
+        self.udp_transport_via_client_ctx(
+            client,
+            target,
+            target_domain,
+            connect_timeout,
+            observe_open,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
+    }
+
+    async fn udp_transport_via_client_ctx(
+        &self,
+        client: Arc<JuicityClient>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        observe_open: bool,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<Arc<JuicityUdpTransport>> {
         let stream_addr = JuiceAddr::new(target, target_domain)?;
         let mut last_error = None;
         for _ in 0..2 {
-            let (conn, state) = client.connection(connect_timeout).await?;
+            let (conn, state) = client.connection_ctx(connect_timeout, ctx).await?;
             state.touch();
             let observation = crate::session::ObservedSessionOpen::start();
             match Self::open_stream(&conn, NETWORK_UDP, &stream_addr, observe_open).await {
@@ -358,7 +413,14 @@ impl JuicityHandler {
         if !speculative {
             let client = self.client_for_runtime(&runtime).await?;
             let transport = self
-                .udp_transport_via_client(client, target, target_domain, connect_timeout, false)
+                .udp_transport_via_client_ctx(
+                    client,
+                    target,
+                    target_domain,
+                    connect_timeout,
+                    false,
+                    &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+                )
                 .await?;
             return Ok(PreparedUdpTransport::ready(
                 transport as Arc<dyn MultiTargetTransport>,
@@ -374,7 +436,14 @@ impl JuicityHandler {
             .await?;
         super::prepare_detached_quic_transport(runtime, client, |client| async move {
             let transport = self
-                .udp_transport_via_client(client, target, target_domain, connect_timeout, false)
+                .udp_transport_via_client_ctx(
+                    client,
+                    target,
+                    target_domain,
+                    connect_timeout,
+                    false,
+                    &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+                )
                 .await?;
             Ok(transport as Arc<dyn MultiTargetTransport>)
         })
@@ -427,8 +496,26 @@ impl TcpOutbound for JuicityHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
+        self.dial_runtime_ctx(
+            runtime,
+            target,
+            target_domain,
+            connect_timeout,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
+    }
+
+    async fn dial_runtime_ctx(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<ProxyStream> {
         let client = self.client_for_runtime(&runtime).await?;
-        self.dial_via_client(client, target, target_domain, connect_timeout)
+        self.dial_via_client_ctx(client, target, target_domain, connect_timeout, ctx)
             .await
     }
 
@@ -440,8 +527,28 @@ impl TcpOutbound for JuicityHandler {
         connect_timeout: Duration,
         detour: &Arc<DetourPath>,
     ) -> anyhow::Result<ProxyStream> {
+        self.dial_runtime_detoured_ctx(
+            runtime,
+            target,
+            target_domain,
+            connect_timeout,
+            detour,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
+    }
+
+    async fn dial_runtime_detoured_ctx(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        detour: &Arc<DetourPath>,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<ProxyStream> {
         crate::quic::fronted_quic_dial!(self, runtime, detour, |client| {
-            self.dial_via_client(client, target, target_domain, connect_timeout)
+            self.dial_via_client_ctx(client, target, target_domain, connect_timeout, ctx)
                 .await
         })
     }
@@ -484,7 +591,14 @@ impl PacketOutbound for JuicityHandler {
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         let client = self.build_client(node, None, None).await?;
         Ok(self
-            .udp_transport_via_client(client, target, target_domain, connect_timeout, true)
+            .udp_transport_via_client_ctx(
+                client,
+                target,
+                target_domain,
+                connect_timeout,
+                true,
+                &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+            )
             .await?)
     }
 
@@ -495,9 +609,27 @@ impl PacketOutbound for JuicityHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        self.dial_udp_transport_runtime_ctx(
+            runtime,
+            target,
+            target_domain,
+            connect_timeout,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
+    }
+
+    async fn dial_udp_transport_runtime_ctx(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         let client = self.client_for_runtime(&runtime).await?;
         Ok(self
-            .udp_transport_via_client(client, target, target_domain, connect_timeout, true)
+            .udp_transport_via_client_ctx(client, target, target_domain, connect_timeout, true, ctx)
             .await?)
     }
 
@@ -509,9 +641,36 @@ impl PacketOutbound for JuicityHandler {
         connect_timeout: Duration,
         detour: &Arc<DetourPath>,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        self.dial_udp_transport_runtime_detoured_ctx(
+            runtime,
+            target,
+            target_domain,
+            connect_timeout,
+            detour,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
+    }
+
+    async fn dial_udp_transport_runtime_detoured_ctx(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        detour: &Arc<DetourPath>,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         crate::quic::fronted_quic_dial!(self, runtime, detour, |client| {
             Ok(self
-                .udp_transport_via_client(client, target, target_domain, connect_timeout, true)
+                .udp_transport_via_client_ctx(
+                    client,
+                    target,
+                    target_domain,
+                    connect_timeout,
+                    true,
+                    ctx,
+                )
                 .await?)
         })
     }

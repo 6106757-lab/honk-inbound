@@ -711,11 +711,30 @@ impl TcpOutbound for Socks5Handler {
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<ProxyStream> {
+        self.dial_runtime_ctx(
+            runtime,
+            target,
+            target_domain,
+            connect_timeout,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
+    }
+
+    async fn dial_runtime_ctx(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<ProxyStream> {
         let detour = runtime.detour();
         let server = crate::proxy::detour::connect_server(
             runtime.node.as_ref(),
             detour.as_deref(),
             connect_timeout,
+            ctx,
         )
         .await?;
         self.dial_with_stream(runtime.node.as_ref(), target, target_domain, server)
@@ -732,10 +751,31 @@ impl TcpOutbound for Socks5Handler {
         connect_timeout: std::time::Duration,
         detour: &Arc<crate::proxy::detour::DetourPath>,
     ) -> anyhow::Result<ProxyStream> {
+        self.dial_runtime_detoured_ctx(
+            runtime,
+            target,
+            target_domain,
+            connect_timeout,
+            detour,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
+    }
+
+    async fn dial_runtime_detoured_ctx(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+        detour: &Arc<crate::proxy::detour::DetourPath>,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<ProxyStream> {
         let server = crate::proxy::detour::connect_server(
             runtime.node.as_ref(),
             Some(detour),
             connect_timeout,
+            ctx,
         )
         .await?;
         self.dial_with_stream(runtime.node.as_ref(), target, target_domain, server)

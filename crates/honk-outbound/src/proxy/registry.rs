@@ -328,8 +328,15 @@ impl ProxyRegistry {
             let tcp = Arc::clone(&entry.tcp);
             let detour = Arc::clone(&detour);
             Ok(async move {
-                tcp.dial_runtime_detoured_ctx(runtime, target, target_domain, connect_timeout, &detour, &ctx)
-                    .await
+                tcp.dial_runtime_detoured_ctx(
+                    runtime,
+                    target,
+                    target_domain,
+                    connect_timeout,
+                    &detour,
+                    &ctx,
+                )
+                .await
             })
         })
         .await

@@ -364,6 +364,7 @@ impl AnyTlsHandler {
         target: SocketAddr,
         target_domain: Option<&str>,
         connect_timeout: Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<Arc<AnyTlsUotTransport>> {
         let pool = runtime.anytls_pool()?;
         let node = Arc::clone(&runtime.node);
@@ -379,6 +380,7 @@ impl AnyTlsHandler {
         let dial_addr = format!("{}:{}", node.host(), node.port);
         let padding_state = pool.padding_state();
         let inbound_payload_budget = pool.inbound_payload_budget();
+        let ctx = *ctx;
         pool.open_with(
             move || {
                 let node = Arc::clone(&dial_node);
@@ -399,6 +401,7 @@ impl AnyTlsHandler {
                             padding_state,
                             inbound_payload_budget,
                             detour,
+                            &ctx,
                         ))
                         .await
                 }
@@ -421,6 +424,7 @@ impl AnyTlsHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
         detour: &Arc<crate::proxy::detour::DetourPath>,
+        ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<Arc<AnyTlsUotTransport>> {
         let pool = Arc::new(AnyTlsPool::new());
         let node = Arc::clone(&runtime.node);
@@ -433,6 +437,7 @@ impl AnyTlsHandler {
         let padding_state = pool.padding_state();
         let inbound_payload_budget = pool.inbound_payload_budget();
         let chained = Arc::clone(detour);
+        let ctx = *ctx;
         pool.open_with(
             move || {
                 let node = Arc::clone(&dial_node);
@@ -453,6 +458,7 @@ impl AnyTlsHandler {
                             padding_state,
                             inbound_payload_budget,
                             Some(chained),
+                            &ctx,
                         ))
                         .await
                 }
@@ -470,6 +476,7 @@ impl AnyTlsHandler {
         target: SocketAddr,
         target_domain: Option<&str>,
         connect_timeout: Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<PreparedUdpTransport<AnyTlsUotTransport>> {
         let pool = runtime.anytls_pool()?;
         let node = Arc::clone(&runtime.node);
@@ -478,6 +485,7 @@ impl AnyTlsHandler {
         let dial_addr = format!("{}:{}", node.host(), node.port);
         let padding_state = pool.padding_state();
         let inbound_payload_budget = pool.inbound_payload_budget();
+        let ctx = *ctx;
         runtime
             .scope_tasks(Self::dial_udp_transport_speculative_for_pool_with(
                 node.as_ref(),
@@ -500,6 +508,7 @@ impl AnyTlsHandler {
                             padding_state,
                             inbound_payload_budget,
                             detour,
+                            &ctx,
                         ))
                         .await
                 },
@@ -531,12 +540,19 @@ impl AnyTlsHandler {
                 target,
                 target_domain,
                 connect_timeout,
+                &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
             )
             .await?;
             return Ok(erase_prepared(prepared, source));
         }
-        let transport =
-            Self::dial_udp_transport_typed(runtime, target, target_domain, connect_timeout).await?;
+        let transport = Self::dial_udp_transport_typed(
+            runtime,
+            target,
+            target_domain,
+            connect_timeout,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await?;
         Ok(PreparedUdpTransport::ready(source(transport)))
     }
 }
@@ -587,8 +603,27 @@ impl PacketOutbound for AnyTlsHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        self.dial_udp_transport_runtime_ctx(
+            runtime,
+            target,
+            target_domain,
+            connect_timeout,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
+    }
+
+    async fn dial_udp_transport_runtime_ctx(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         let transport =
-            Self::dial_udp_transport_typed(runtime, target, target_domain, connect_timeout).await?;
+            Self::dial_udp_transport_typed(runtime, target, target_domain, connect_timeout, ctx)
+                .await?;
         Ok(transport)
     }
 
@@ -600,12 +635,33 @@ impl PacketOutbound for AnyTlsHandler {
         connect_timeout: Duration,
         detour: &Arc<crate::proxy::detour::DetourPath>,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        self.dial_udp_transport_runtime_detoured_ctx(
+            runtime,
+            target,
+            target_domain,
+            connect_timeout,
+            detour,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
+    }
+
+    async fn dial_udp_transport_runtime_detoured_ctx(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        detour: &Arc<crate::proxy::detour::DetourPath>,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         let transport = Self::dial_udp_transport_typed_detoured(
             runtime,
             target,
             target_domain,
             connect_timeout,
             detour,
+            ctx,
         )
         .await?;
         Ok(transport)
@@ -623,6 +679,7 @@ impl PacketOutbound for AnyTlsHandler {
             target,
             target_domain,
             connect_timeout,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
         )
         .await?;
         Ok(erase_prepared(prepared, |transport| {

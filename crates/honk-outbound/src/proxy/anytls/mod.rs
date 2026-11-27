@@ -1352,6 +1352,7 @@ async fn dial_session(
     padding_state: Arc<PaddingState>,
     inbound_payload_budget: Arc<InboundPayloadBudget>,
     detour: Option<Arc<crate::proxy::detour::DetourPath>>,
+    ctx: &crate::proxy::detour::DetourDialCtx,
 ) -> anyhow::Result<Arc<AnyTlsSession>> {
     let timeout = connect_timeout.saturating_mul(3);
     tokio::time::timeout(timeout, async {
@@ -1364,6 +1365,7 @@ async fn dial_session(
             tls_connector,
             &padding,
             detour.as_deref(),
+            ctx,
         )
         .await?;
         AnyTlsSession::establish(
@@ -1398,13 +1400,14 @@ async fn connect_transport(
     tls_connector: Option<Arc<TlsConnector>>,
     padding: &PaddingScheme,
     detour: Option<&crate::proxy::detour::DetourPath>,
+    ctx: &crate::proxy::detour::DetourDialCtx,
 ) -> anyhow::Result<(BoxedReader, BoxedWriter, Vec<u8>)> {
     let password = node.anytls().unwrap().password.as_deref().unwrap_or("");
     let auth = authentication_payload(password, padding);
     // Through the detour when the node names one: AnyTLS keeps its own
     // session pool, but the connection under a session is still just the path
     // to the node's server, and that is what a detour replaces.
-    let tcp = crate::proxy::detour::connect_server(node, detour, connect_timeout).await?;
+    let tcp = crate::proxy::detour::connect_server(node, detour, connect_timeout, ctx).await?;
     let tcp = crate::transport_quality::tcp::ObservedTcp::new_carrier(tcp);
     debug!("AnyTLS: TCP connected to {}", addr);
 
@@ -1469,6 +1472,7 @@ impl AnyTlsHandler {
                     .map(|runtime| runtime.anytls_tls_connector())
                     .transpose()?;
                 let detour = runtime.as_ref().and_then(|runtime| runtime.detour());
+                let ctx = crate::proxy::detour::DetourDialCtx::root(Duration::from_secs(10));
                 let dial = dial_session(
                     &node,
                     &label,
@@ -1477,6 +1481,7 @@ impl AnyTlsHandler {
                     padding_state,
                     inbound_payload_budget,
                     detour,
+                    &ctx,
                 );
                 match runtime {
                     Some(runtime) => runtime.transport_quality().scope(dial).await,
@@ -1696,6 +1701,7 @@ impl WarmableOutbound for AnyTlsHandler {
                     padding_state,
                     inbound_payload_budget,
                     detour,
+                    &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
                 ))
                 .await
         })
@@ -1726,6 +1732,24 @@ impl TcpOutbound for AnyTlsHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
+        self.dial_runtime_ctx(
+            runtime,
+            target,
+            target_domain,
+            connect_timeout,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
+    }
+
+    async fn dial_runtime_ctx(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<ProxyStream> {
         let pool = runtime.anytls_pool()?;
         let node = Arc::clone(&runtime.node);
         if !runtime.is_ephemeral() {
@@ -1737,6 +1761,7 @@ impl TcpOutbound for AnyTlsHandler {
         let padding_state = pool.padding_state();
         let inbound_payload_budget = pool.inbound_payload_budget();
         let domain = target_domain.map(str::to_string);
+        let ctx = *ctx;
         let stream = pool
             .open_with(
                 move || {
@@ -1758,6 +1783,7 @@ impl TcpOutbound for AnyTlsHandler {
                                 padding_state,
                                 inbound_payload_budget,
                                 detour,
+                                &ctx,
                             ))
                             .await
                     }
@@ -1793,6 +1819,26 @@ impl TcpOutbound for AnyTlsHandler {
         connect_timeout: Duration,
         detour: &Arc<crate::proxy::detour::DetourPath>,
     ) -> anyhow::Result<ProxyStream> {
+        self.dial_runtime_detoured_ctx(
+            runtime,
+            target,
+            target_domain,
+            connect_timeout,
+            detour,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
+    }
+
+    async fn dial_runtime_detoured_ctx(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        detour: &Arc<crate::proxy::detour::DetourPath>,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<ProxyStream> {
         let pool = Arc::new(AnyTlsPool::new());
         let node = Arc::clone(&runtime.node);
         let dial_node = Arc::clone(&node);
@@ -1802,6 +1848,7 @@ impl TcpOutbound for AnyTlsHandler {
         let inbound_payload_budget = pool.inbound_payload_budget();
         let chained = Arc::clone(detour);
         let domain = target_domain.map(str::to_string);
+        let ctx = *ctx;
         let stream = pool
             .open_with(
                 move || {
@@ -1823,6 +1870,7 @@ impl TcpOutbound for AnyTlsHandler {
                                 padding_state,
                                 inbound_payload_budget,
                                 Some(chained),
+                                &ctx,
                             ))
                             .await
                     }

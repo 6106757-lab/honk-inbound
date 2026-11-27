@@ -323,7 +323,13 @@ async fn udp_stream_partial_write_marks_admission_without_replay() {
     let client = handler.build_client(&node, None, None).await.unwrap();
     let target = "192.0.2.1:53".parse().unwrap();
     let transport = handler
-        .udp_transport_via_client(client, target, None, Duration::from_secs(5))
+        .udp_transport_via_client_ctx(
+            client,
+            target,
+            None,
+            Duration::from_secs(5),
+            &crate::proxy::detour::DetourDialCtx::root(Duration::from_secs(5)),
+        )
         .await
         .unwrap();
     let (conn, _auth) = tokio::time::timeout(Duration::from_secs(5), peer)
@@ -428,7 +434,13 @@ async fn udp_request_observation_follows_each_source_view() {
                     } else {
                         let client = handler.build_client(&node, None, None).await.unwrap();
                         handler
-                            .udp_transport_via_client(client, target, None, Duration::from_secs(5))
+                            .udp_transport_via_client_ctx(
+                                client,
+                                target,
+                                None,
+                                Duration::from_secs(5),
+                                &crate::proxy::detour::DetourDialCtx::root(Duration::from_secs(5)),
+                            )
                             .await
                             .unwrap()
                     }
@@ -504,7 +516,13 @@ async fn udp_source_send_to_tracks_physical_admission() {
         let target = "192.0.2.1:53".parse().unwrap();
         let other = "192.0.2.2:5353".parse().unwrap();
         let transport = handler
-            .udp_transport_via_client(client, target, None, Duration::from_secs(5))
+            .udp_transport_via_client_ctx(
+                client,
+                target,
+                None,
+                Duration::from_secs(5),
+                &crate::proxy::detour::DetourDialCtx::root(Duration::from_secs(5)),
+            )
             .await
             .unwrap();
         let admitted = AtomicBool::new(false);

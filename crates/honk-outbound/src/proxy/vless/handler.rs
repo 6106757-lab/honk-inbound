@@ -231,29 +231,39 @@ impl VLessHandler {
         target: SocketAddr,
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         match path {
             VlessUdpPath::H2 => {
-                Self::open_h2_udp(runtime, target, target_domain, connect_timeout).await
+                Self::open_h2_udp(runtime, target, target_domain, connect_timeout, ctx).await
             }
             VlessUdpPath::CoolShared => {
-                Self::open_cool_udp(runtime, false, target, target_domain, connect_timeout).await
+                Self::open_cool_udp(runtime, false, target, target_domain, connect_timeout, ctx)
+                    .await
             }
             VlessUdpPath::CoolSeparate => {
-                Self::open_cool_udp(runtime, true, target, target_domain, connect_timeout).await
+                Self::open_cool_udp(runtime, true, target, target_domain, connect_timeout, ctx)
+                    .await
             }
             VlessUdpPath::UotV2 => {
                 let (transport, preparation) = self
-                    .prepare_uot_transport(&runtime, target, target_domain, connect_timeout)
+                    .prepare_uot_transport(&runtime, target, target_domain, connect_timeout, ctx)
                     .await?;
                 preparation.commit()?;
                 Ok(transport)
             }
             VlessUdpPath::Native | VlessUdpPath::Xudp => {
-                self.prepare_protocol_udp(runtime, path, target, target_domain, connect_timeout)
-                    .await?
-                    .commit()
-                    .await
+                self.prepare_protocol_udp(
+                    runtime,
+                    path,
+                    target,
+                    target_domain,
+                    connect_timeout,
+                    ctx,
+                )
+                .await?
+                .commit()
+                .await
             }
         }
     }
@@ -279,8 +289,10 @@ impl VLessHandler {
     async fn dial_h2_session(
         runtime: Arc<crate::runtime::NodeRuntime>,
         connect_timeout: std::time::Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<Arc<super::mux::VlessMuxSession>> {
-        let (session, preparation) = Self::prepare_h2_session(runtime, connect_timeout).await?;
+        let (session, preparation) =
+            Self::prepare_h2_session(runtime, connect_timeout, ctx).await?;
         preparation.commit()?;
         Ok(session)
     }
@@ -288,6 +300,7 @@ impl VLessHandler {
     async fn prepare_h2_session(
         runtime: Arc<crate::runtime::NodeRuntime>,
         connect_timeout: std::time::Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<(
         Arc<super::mux::VlessMuxSession>,
         crate::proxy::transport::TransportPreparation,
@@ -301,7 +314,7 @@ impl VLessHandler {
                     anyhow::bail!("VLESS H2 path has no H2 multiplex settings");
                 };
                 let (stream, preparation) = Self::new()
-                    .prepare_retained_base(&runtime, target, Some(domain), connect_timeout)
+                    .prepare_retained_base(&runtime, target, Some(domain), connect_timeout, ctx)
                     .await?;
                 Ok((
                     super::mux::connect(stream.stream, *padding).await?,
@@ -316,13 +329,15 @@ impl VLessHandler {
         target: SocketAddr,
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<ProxyStream> {
         let pool = runtime.vless_h2_pool()?;
         let dial_runtime = Arc::clone(&runtime);
         let domain = target_domain.map(str::to_string);
+        let ctx = *ctx;
         let stream = pool
             .open_with(
-                move || Self::dial_h2_session(dial_runtime, connect_timeout),
+                move || Self::dial_h2_session(dial_runtime, connect_timeout, &ctx),
                 move |session, permit| {
                     let domain = domain.clone();
                     async move { session.open_stream(permit, target, domain.as_deref()).await }
@@ -341,13 +356,15 @@ impl VLessHandler {
         target: SocketAddr,
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         let pool = runtime.vless_h2_pool()?;
         let dial_runtime = Arc::clone(&runtime);
         let domain = target_domain.map(str::to_string);
+        let ctx = *ctx;
         let transport = pool
             .open_with(
-                move || Self::dial_h2_session(dial_runtime, connect_timeout),
+                move || Self::dial_h2_session(dial_runtime, connect_timeout, &ctx),
                 move |session, permit| {
                     let domain = domain.clone();
                     async move { session.open_packet(permit, target, domain.as_deref()).await }
@@ -361,9 +378,10 @@ impl VLessHandler {
         runtime: Arc<crate::runtime::NodeRuntime>,
         active_limit: usize,
         connect_timeout: std::time::Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<Arc<super::cool::VlessCoolSession>> {
         let (session, preparation) =
-            Self::prepare_cool_session(runtime, active_limit, connect_timeout).await?;
+            Self::prepare_cool_session(runtime, active_limit, connect_timeout, ctx).await?;
         preparation.commit()?;
         Ok(session)
     }
@@ -372,6 +390,7 @@ impl VLessHandler {
         runtime: Arc<crate::runtime::NodeRuntime>,
         active_limit: usize,
         timeout: std::time::Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<(
         Arc<super::cool::VlessCoolSession>,
         crate::proxy::transport::TransportPreparation,
@@ -379,7 +398,7 @@ impl VLessHandler {
         runtime
             .scope_tasks(Box::pin(async {
                 let (stream, preparation) = Self::new()
-                    .prepare_retained_mux_carrier(&runtime, timeout)
+                    .prepare_retained_mux_carrier(&runtime, timeout, ctx)
                     .await?;
                 Ok((super::cool::connect(stream, active_limit), preparation))
             }))
@@ -391,14 +410,16 @@ impl VLessHandler {
         target: SocketAddr,
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<ProxyStream> {
         let pool = runtime.vless_shared_cool_pool()?;
         let active_limit = Self::cool_limit(&runtime.node, false)?;
         let dial_runtime = Arc::clone(&runtime);
         let domain = target_domain.map(str::to_string);
+        let ctx = *ctx;
         let stream = pool
             .open_with(
-                move || Self::dial_cool_session(dial_runtime, active_limit, connect_timeout),
+                move || Self::dial_cool_session(dial_runtime, active_limit, connect_timeout, &ctx),
                 move |session, permit| {
                     let domain = domain.clone();
                     async move { session.open_stream(permit, target, domain.as_deref()).await }
@@ -418,6 +439,7 @@ impl VLessHandler {
         target: SocketAddr,
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         let pool = if separate {
             runtime.vless_separate_cool_pool()?
@@ -427,9 +449,10 @@ impl VLessHandler {
         let active_limit = Self::cool_limit(&runtime.node, separate)?;
         let dial_runtime = Arc::clone(&runtime);
         let domain = target_domain.map(str::to_string);
+        let ctx = *ctx;
         let transport = pool
             .open_with(
-                move || Self::dial_cool_session(dial_runtime, active_limit, connect_timeout),
+                move || Self::dial_cool_session(dial_runtime, active_limit, connect_timeout, &ctx),
                 move |session, permit| {
                     let domain = domain.clone();
                     async move { session.open_packet(permit, target, domain.as_deref()).await }
@@ -548,13 +571,38 @@ impl TcpOutbound for VLessHandler {
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<ProxyStream> {
+        self.dial_runtime_ctx(
+            runtime,
+            target,
+            target_domain,
+            connect_timeout,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
+    }
+
+    async fn dial_runtime_ctx(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<ProxyStream> {
         // A node that names a detour rides it on every dial, the same way a
         // group's detour reaches a member. The transport refuses a detour it
         // was not handed, so reading it here is what keeps the node's traffic
         // on the front the operator configured instead of failing the dial.
         if let Some(detour) = runtime.detour() {
             return self
-                .dial_runtime_detoured(runtime, target, target_domain, connect_timeout, &detour)
+                .dial_runtime_detoured_ctx(
+                    runtime,
+                    target,
+                    target_domain,
+                    connect_timeout,
+                    &detour,
+                    ctx,
+                )
                 .await;
         }
         match runtime.node.vless().unwrap().tcp_path() {
@@ -565,6 +613,7 @@ impl TcpOutbound for VLessHandler {
                         target,
                         target_domain,
                         connect_timeout,
+                        ctx,
                     );
                     let (stream, preparation) =
                         crate::runtime::flow_observation::request_write(std::pin::pin!(operation))
@@ -572,14 +621,21 @@ impl TcpOutbound for VLessHandler {
                     preparation.commit()?;
                     return Ok(stream);
                 }
-                self.dial_base(&runtime.node, target, target_domain, None, connect_timeout)
-                    .await
+                self.dial_base(
+                    &runtime.node,
+                    target,
+                    target_domain,
+                    None,
+                    connect_timeout,
+                    ctx,
+                )
+                .await
             }
             VlessTcpPath::H2 => {
-                Self::open_h2_tcp(runtime, target, target_domain, connect_timeout).await
+                Self::open_h2_tcp(runtime, target, target_domain, connect_timeout, ctx).await
             }
             VlessTcpPath::Cool => {
-                Self::open_cool_tcp(runtime, target, target_domain, connect_timeout).await
+                Self::open_cool_tcp(runtime, target, target_domain, connect_timeout, ctx).await
             }
         }
     }
@@ -600,6 +656,26 @@ impl TcpOutbound for VLessHandler {
         connect_timeout: std::time::Duration,
         detour: &Arc<crate::proxy::detour::DetourPath>,
     ) -> anyhow::Result<ProxyStream> {
+        self.dial_runtime_detoured_ctx(
+            runtime,
+            target,
+            target_domain,
+            connect_timeout,
+            detour,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
+    }
+
+    async fn dial_runtime_detoured_ctx(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+        detour: &Arc<crate::proxy::detour::DetourPath>,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<ProxyStream> {
         let path = runtime.node.vless().unwrap().tcp_path();
         anyhow::ensure!(
             path == VlessTcpPath::Direct,
@@ -613,6 +689,7 @@ impl TcpOutbound for VLessHandler {
                 target_domain,
                 connect_timeout,
                 Some(detour),
+                ctx,
             );
             let (stream, preparation) =
                 crate::runtime::flow_observation::request_write(std::pin::pin!(operation)).await?;
@@ -625,6 +702,7 @@ impl TcpOutbound for VLessHandler {
             target_domain,
             connect_timeout,
             detour,
+            ctx,
         )
         .await
     }
@@ -676,7 +754,13 @@ impl WarmableOutbound for VLessHandler {
                     let dial_runtime = Arc::clone(&runtime);
                     Self::warm_mux_pool(
                         pool,
-                        move || Self::dial_h2_session(dial_runtime, connect_timeout),
+                        move || {
+                            Self::dial_h2_session(
+                                dial_runtime,
+                                connect_timeout,
+                                &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+                            )
+                        },
                         "VLESS H2 pool retired during warm-up",
                     )
                     .await
@@ -692,7 +776,12 @@ impl WarmableOutbound for VLessHandler {
                     Self::warm_mux_pool(
                         pool,
                         move || {
-                            Self::dial_cool_session(dial_runtime, active_limit, connect_timeout)
+                            Self::dial_cool_session(
+                                dial_runtime,
+                                active_limit,
+                                connect_timeout,
+                                &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+                            )
                         },
                         if separate {
                             "VLESS separate Cool pool retired during warm-up"
