@@ -531,6 +531,14 @@ impl DetourPath {
         timeout: Duration,
         ctx: &DetourDialCtx,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        if ctx.hop >= MAX_DETOUR_HOPS {
+            anyhow::bail!(crate::proxy::DetourHopFailure {
+                hop: ctx.hop,
+                node: None,
+                node_name: self.target_description(),
+                error: anyhow::anyhow!("detour depth exceeds {MAX_DETOUR_HOPS}"),
+            });
+        }
         let budget = ctx.budget(timeout);
         let timed_out = || {
             std::io::Error::new(
@@ -541,12 +549,14 @@ impl DetourPath {
         if budget.is_zero() {
             return Err(self.wrap_leg_error(timed_out().into(), ctx.hop, node_id));
         }
-        let dial = self.proxies.dial_udp_transport_runtime(
+        let child = ctx.child();
+        let dial = self.proxies.dial_udp_transport_runtime_ctx(
             Arc::clone(&self.generation),
             node_id,
             target,
             target_domain,
             budget,
+            &child,
         );
         match tokio::time::timeout(budget, dial).await {
             Ok(result) => result.map_err(|error| self.wrap_leg_error(error, ctx.hop, node_id)),
@@ -1419,6 +1429,142 @@ mod tests {
         assert!(
             timed_out,
             "the second hop failed on the shared deadline: {error}"
+        );
+    }
+
+    /// A Trojan node dialing the fake server at `server`: its UDP control
+    /// connection is a TCP stream, so its own detour nests through the TCP leg.
+    fn trojan_node(name: &str, server: SocketAddr) -> Node {
+        Node {
+            name: name.to_string(),
+            host: server.ip().to_string(),
+            address: server.ip().to_string(),
+            port: server.port(),
+            outbound: honk_config::node::OutboundConfig::Trojan(Default::default()),
+            ..Default::default()
+        }
+    }
+
+    /// A UDP leg at the depth cap refuses before dialling: the cap is a leg
+    /// property, not a TCP-only one.
+    #[tokio::test]
+    async fn detour_udp_depth_cap_rejects_at_four_hops() {
+        let mut front = socks5_node("front", closed_port().await);
+        front.id = front.derive_id();
+        let generation = Arc::new(OutboundRuntimeRegistry::build(&[front.clone()]).unwrap());
+        let path = DetourPath::new(
+            Arc::new(ProxyRegistry::default_resolver().unwrap()),
+            Arc::clone(&generation),
+            front.id,
+        );
+        let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
+        let error = path
+            .connect_udp_via(
+                front.id,
+                target,
+                None,
+                Duration::from_secs(5),
+                &DetourDialCtx {
+                    hop: MAX_DETOUR_HOPS,
+                    deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+                },
+            )
+            .await
+            .unwrap_err();
+        let hop = crate::proxy::failed_hop(&error).expect("a cap failure is hop-tagged");
+        assert_eq!(hop.hop, MAX_DETOUR_HOPS);
+        assert!(
+            error.to_string().contains("detour depth exceeds 4"),
+            "{error}"
+        );
+    }
+
+    /// A nested UDP leg shares the caller's deadline: the front's own detour
+    /// leg reports hop 1 on the shared deadline instead of restarting the
+    /// hop count and the deadline.
+    #[tokio::test]
+    async fn detour_udp_nested_leg_shares_the_caller_deadline() {
+        let mut f2 = socks5_node("f2", spawn_silent_tcp().await);
+        f2.id = f2.derive_id();
+        let mut f1 = trojan_node("f1", closed_port().await);
+        f1.detour = Some("f2".into());
+        f1.id = f1.derive_id();
+        let generation =
+            Arc::new(OutboundRuntimeRegistry::build(&[f1.clone(), f2.clone()]).unwrap());
+        let proxies = Arc::new(ProxyRegistry::default_resolver().unwrap());
+        let path_to_f2 = Arc::new(DetourPath::new(
+            Arc::clone(&proxies),
+            Arc::clone(&generation),
+            f2.id,
+        ));
+        assert!(generation.bind_detour(f1.id, Arc::clone(&path_to_f2)));
+        let path_to_f1 = DetourPath::new(proxies, Arc::clone(&generation), f1.id);
+
+        let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
+        let started = std::time::Instant::now();
+        let error = path_to_f1
+            .connect_udp_via(
+                f1.id,
+                target,
+                None,
+                Duration::from_secs(5),
+                &DetourDialCtx::root_at(tokio::time::Instant::now() + Duration::from_millis(300)),
+            )
+            .await
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "a silent nested UDP leg waited {elapsed:?}"
+        );
+        let hop = crate::proxy::failed_hop(&error).expect("a nested UDP failure is hop-tagged");
+        assert_eq!(hop.hop, 1);
+        let timed_out = error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
+        });
+        assert!(
+            timed_out,
+            "the nested leg failed on the shared deadline: {error}"
+        );
+    }
+
+    /// An expired deadline fails fast with a hop-tagged timeout and never
+    /// dials. A behaviour pin, not an ablation target: `timeout(0, dial)`
+    /// would give the same observable outcome, so this pins the outcome,
+    /// not the fast path that produces it.
+    #[tokio::test]
+    async fn detour_udp_zero_budget_fails_fast_without_dialing() {
+        let mut front = socks5_node("front", closed_port().await);
+        front.id = front.derive_id();
+        let generation = Arc::new(OutboundRuntimeRegistry::build(&[front.clone()]).unwrap());
+        let path = DetourPath::new(
+            Arc::new(ProxyRegistry::default_resolver().unwrap()),
+            Arc::clone(&generation),
+            front.id,
+        );
+        let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
+        let error = path
+            .connect_udp_via(
+                front.id,
+                target,
+                None,
+                Duration::from_secs(5),
+                &DetourDialCtx::root_at(tokio::time::Instant::now() - Duration::from_secs(1)),
+            )
+            .await
+            .unwrap_err();
+        let hop = crate::proxy::failed_hop(&error).expect("an expired deadline is hop-tagged");
+        assert_eq!(hop.hop, 0);
+        let timed_out = error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
+        });
+        assert!(
+            timed_out,
+            "an expired deadline fails with a timeout: {error}"
         );
     }
 
