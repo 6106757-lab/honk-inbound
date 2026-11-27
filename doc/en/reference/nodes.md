@@ -235,7 +235,7 @@ For VMess JSON with `net: "ws"`, an omitted or empty `host` uses the endpoint ho
 | AnyTLS | Reject payloads above 16 KiB, matching anytls-go 0.0.13's relay buffer. Non-connect UoT v2 carries each datagram's destination and the server's real source address. One stream serves all destinations of a client source; unsolicited replies retain their real source. |
 | Trojan | One associate stream serves every destination of a client source and returns each reply's real source. A cooperating server can provide EIM/EIF behavior. Destinations share the stream's head-of-line blocking and fail together. |
 
-SOCKS5 UDP ASSOCIATE keeps one control TCP connection and one relay socket per client source, shared by every destination of that source, and returns the real remote peer named in each reply header. Whether a peer the client never contacted can reach it depends on the server: Dante's default `udp.connectdst: yes` connects its outbound socket only while a single destination has been used.
+SOCKS5 UDP ASSOCIATE keeps one control TCP connection and one relay socket per client source, shared by every destination of that source, and returns the real remote peer named in each reply header. Whether a peer the client never contacted can reach it depends on the server: Dante's default `udp.connectdst: yes` connects its outbound socket only while a single destination has been used. A node that names a `dialer-proxy` has its UDP dial refused before any packet is sent, never silently dialled directly.
 
 **UDP full-cone.** These UDP-capable proxy protocols share one association across all destinations of a client source and return each reply's real remote peer:
 
@@ -283,7 +283,9 @@ all receive-session state changes, so an invalid packet cannot reset replay hist
 
 Shadowsocks UDP, legacy AEAD and 2022 alike, keeps one server-facing socket per
 client source for all of its destinations. 2022 keeps one session ID, one
-increasing packet counter and one set of replay windows across them.
+increasing packet counter and one set of replay windows across them. A node that
+names a `dialer-proxy` has its UDP dial refused before any packet is sent, never
+silently dialled directly.
 
 Replies return the real remote address the server reports, so a host that was never
 contacted can still reach the client when the server forwards it; a reply naming
