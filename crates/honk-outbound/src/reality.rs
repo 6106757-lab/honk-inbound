@@ -51,6 +51,15 @@ pub struct RealityConfig {
 #[error("REALITY server presented a real certificate (potential MITM or redirection)")]
 pub(crate) struct RealityMaskCertificate;
 
+/// Mirror of upstream's chain-side check: a mask certificate stays
+/// recognisable through wrappers. `Error::is` cannot see through `#[source]`
+/// wrappers such as `TargetFailure`; this walks the cause chain instead.
+pub(crate) fn reality_mask_certificate(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<RealityMaskCertificate>())
+}
+
 /// REALITY parameters from a node, or `None` when the node is not REALITY.
 ///
 /// Like pinSHA256, these keys are security assertions: an unparseable
@@ -554,6 +563,7 @@ mod tests {
             "bad sid must fail closed"
         );
     }
+
 }
 
 #[cfg(test)]
