@@ -22,10 +22,11 @@ pub(super) type UdpPrepare<T> = Arc<
 /// Fixed callbacks let the scheduler keep policy, health, and metric effects
 /// at the integration boundary. Completed transport errors trigger
 /// `on_dial_error`; rejected, aborted and never-started candidates are neutral.
+pub(super) type OnUdpDialError = Arc<dyn Fn(&Node, &anyhow::Error) + Send + Sync>;
 pub(super) struct UdpStaggerCallbacks {
     pub(super) allows_target: Arc<dyn Fn(&Node) -> bool + Send + Sync>,
     pub(super) is_eligible: Arc<dyn Fn(&Node) -> bool + Send + Sync>,
-    pub(super) on_dial_error: Arc<dyn Fn(&Node, &anyhow::Error) + Send + Sync>,
+    pub(super) on_dial_error: OnUdpDialError,
     pub(super) on_attempt: Arc<dyn Fn() + Send + Sync>,
     pub(super) on_winner: Arc<dyn Fn() + Send + Sync>,
     pub(super) on_cancellation: Arc<dyn Fn() + Send + Sync>,
