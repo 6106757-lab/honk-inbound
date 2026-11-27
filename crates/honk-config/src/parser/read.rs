@@ -131,11 +131,117 @@ impl<'d, 'a> Text<'d, 'a> {
             .map(|position| position - self.span.start)
     }
 
+    /// Delimiter positions that also skip a delimiter inside a regex `{n,m}`
+    /// quantifier, `(...)` group or `[...]` character class, so a comma in a
+    /// `regex:` argument does not split the argument. A backslash escapes
+    /// the next character. Quoted spans are skipped whole, as in
+    /// [`Self::delimiter_positions`], and an escape does not cross one.
+    pub(super) fn delimiter_positions_pattern<'s>(
+        self,
+        delimiter: &'s str,
+    ) -> impl Iterator<Item = usize> + 's
+    where
+        'd: 's,
+    {
+        assert!(!delimiter.is_empty(), "delimiter must not be empty");
+        let raw = self.raw();
+        let mut quotes = self.quotes().peekable();
+        let mut offset = 0;
+        let mut escaped = false;
+        let mut in_class = false;
+        let mut class_first = false;
+        let mut brace_depth: usize = 0;
+        let mut paren_depth: usize = 0;
+        std::iter::from_fn(move || {
+            loop {
+                if offset + delimiter.len() > raw.len() {
+                    return None;
+                }
+                let position = self.span.start + offset;
+                while quotes.peek().is_some_and(|quote| quote.end <= position) {
+                    quotes.next();
+                }
+                if let Some(quote) = quotes.peek().filter(|quote| quote.start <= position) {
+                    offset = quote.end - self.span.start;
+                    quotes.next();
+                    escaped = false;
+                    continue;
+                }
+                if raw[offset..].starts_with(delimiter)
+                    && !escaped
+                    && !in_class
+                    && brace_depth == 0
+                    && paren_depth == 0
+                {
+                    offset += delimiter.len();
+                    return Some(position);
+                }
+                let ch = raw[offset..].chars().next()?;
+                offset += ch.len_utf8();
+                if escaped {
+                    escaped = false;
+                    class_first = false;
+                    continue;
+                }
+                match ch {
+                    '\\' => escaped = true,
+                    '[' if !in_class => {
+                        in_class = true;
+                        class_first = true;
+                    }
+                    ']' if in_class => {
+                        // A `]` right after `[` or `[^` is a literal member.
+                        if !class_first {
+                            in_class = false;
+                        }
+                        class_first = false;
+                    }
+                    '{' if !in_class => brace_depth += 1,
+                    '}' if !in_class => brace_depth = brace_depth.saturating_sub(1),
+                    '(' if !in_class => paren_depth += 1,
+                    ')' if !in_class => paren_depth = paren_depth.saturating_sub(1),
+                    // A `^` right after `[` does not end the "first" window, so a
+                    // `]` after `[^` stays a literal member like after `[`.
+                    '^' if in_class && class_first => {}
+                    _ => class_first = false,
+                }
+            }
+        })
+    }
+
     pub fn split<'s>(self, delimiter: &'s str) -> impl Iterator<Item = Self> + 's
     where
         'd: 's,
     {
         let mut delimiters = self.delimiter_positions(delimiter);
+        let mut start = self.span.start;
+        let mut done = false;
+        std::iter::from_fn(move || {
+            if done {
+                return None;
+            }
+            if let Some(end) = delimiters.next() {
+                let part = self.sub(start - self.span.start, end - self.span.start);
+                start = end + delimiter.len();
+                Some(part)
+            } else {
+                done = true;
+                Some(self.sub(start - self.span.start, self.span.end - self.span.start))
+            }
+        })
+    }
+
+    /// Like [`Self::split`], but a delimiter inside a regex quantifier,
+    /// group or character class does not split. For argument lists that
+    /// carry `regex:` values.
+    pub(super) fn split_pattern_args<'s>(
+        self,
+        delimiter: &'s str,
+    ) -> impl Iterator<Item = Self> + 's
+    where
+        'd: 's,
+    {
+        let mut delimiters = self.delimiter_positions_pattern(delimiter);
         let mut start = self.span.start;
         let mut done = false;
         std::iter::from_fn(move || {

@@ -182,6 +182,34 @@ impl DnsConfig {
                 error.diagnostic.entry_index = Some(index + 1);
                 return Err(error);
             }
+            // A subtag regex compiles at router construction; check it here
+            // so an invalid one fails validation instead of startup/reload.
+            for condition in rule.conditions.iter() {
+                let DnsCond::Subtag { tags, .. } = condition else {
+                    continue;
+                };
+                for tag in tags {
+                    let DnsTagMatcher::Regex(value) = tag else {
+                        continue;
+                    };
+                    if regex::Regex::new(value).is_err() {
+                        let mut error = DetailedConfigError::new(
+                            ErrorCategory::Validation,
+                            "subtag-dns-regex",
+                            source.clone(),
+                            SettingPath::new("dns")
+                                .field("routing")
+                                .field("request")
+                                .field("rules")
+                                .index(index + 1)
+                                .field("conditions"),
+                            "a subtag() regex: value is not a valid regular expression",
+                        );
+                        error.diagnostic.entry_index = Some(index + 1);
+                        return Err(error);
+                    }
+                }
+            }
         }
         Ok(())
     }

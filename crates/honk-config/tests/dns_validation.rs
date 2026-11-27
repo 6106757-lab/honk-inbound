@@ -332,3 +332,32 @@ fn subtag_rules_need_a_direct_upstream_and_only_qname() {
         assert_eq!(error.diagnostic.setting.to_string(), setting);
     }
 }
+
+#[test]
+fn subtag_regexes_are_compiled_by_validation() {
+    let config = |rule: &str| {
+        honk_config::parser::parse_dae_config(&format!(
+            "dns {{\n upstream {{\n  providerdoh: 'https://203.0.113.1/dns-query' -> direct\n }}\n routing {{\n  request {{\n   {rule}\n   fallback: providerdoh\n  }}\n }}\n}}\n"
+        ))
+        .unwrap()
+    };
+    // An invalid regex fails validation now, not at startup/reload.
+    let error = config("subtag(regex:^a{1) -> providerdoh")
+        .validate_detailed()
+        .expect_err("invalid subtag regex must fail validation");
+    assert_eq!(error.diagnostic.code, "subtag-dns-regex");
+    assert_eq!(
+        error.diagnostic.setting.to_string(),
+        "dns.routing.request.rules[1].conditions"
+    );
+    // Controls: a valid regex and non-regex tags validate fine.
+    config("subtag(regex:^a{1,2}$) -> providerdoh")
+        .validate()
+        .unwrap();
+    config("subtag(keyword:foo) -> providerdoh")
+        .validate()
+        .unwrap();
+    config("subtag(MyAirport) -> providerdoh")
+        .validate()
+        .unwrap();
+}

@@ -488,7 +488,7 @@ fn parse_text_filter(text: Text<'_, '_>, function: &str) -> Option<(Regex, Vec<S
     let args = text.sub(function.len() + 1, raw.len() - 1);
     let mut patterns = Vec::new();
     let mut exact = Vec::new();
-    for argument in args.split(",") {
+    for argument in args.split_pattern_args(",") {
         let argument = argument.trim();
         let raw = argument.raw();
         let pattern = if raw.strip_prefix("keyword:").is_some() {
