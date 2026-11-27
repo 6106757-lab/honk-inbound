@@ -564,6 +564,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reality_mask_certificate_walks_the_cause_chain() {
+        let bare: anyhow::Error = RealityMaskCertificate.into();
+        assert!(reality_mask_certificate(&bare));
+        assert!(bare.is::<RealityMaskCertificate>());
+        // anyhow's `is` sees through its own context wrapper, so the helper
+        // and `is` agree here; the helper's edge is the `#[source]` wrapper
+        // below, which `is` cannot see through.
+        let wrapped = bare.context("handshake failed");
+        assert!(reality_mask_certificate(&wrapped));
+        assert!(wrapped.is::<RealityMaskCertificate>());
+        let target_wrapped =
+            anyhow::Error::new(crate::proxy::TargetFailure(RealityMaskCertificate.into()));
+        assert!(reality_mask_certificate(&target_wrapped));
+        assert!(!target_wrapped.is::<RealityMaskCertificate>());
+        let other = anyhow::anyhow!("REALITY certificate authentication failed");
+        assert!(!reality_mask_certificate(&other));
+        let tls = anyhow::anyhow!("REALITY handshake with example.com failed: tls alert");
+        assert!(!reality_mask_certificate(&tls));
+    }
 }
 
 #[cfg(test)]

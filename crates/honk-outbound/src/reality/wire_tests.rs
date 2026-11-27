@@ -37,7 +37,7 @@ struct Captured {
     hello: Vec<u8>,
 }
 
-fn node(addr: SocketAddr, key: &PKey<Private>, supplied: bool) -> Node {
+fn node(addr: SocketAddr, key: &PKey<Private>, supplied: bool, fingerprint: Option<&str>) -> Node {
     let mut public = [0; 32];
     key.raw_public_key(&mut public).unwrap();
     Node {
@@ -51,6 +51,7 @@ fn node(addr: SocketAddr, key: &PKey<Private>, supplied: bool) -> Node {
         outbound: OutboundConfig::Trojan(TrojanConfig {
             tls: TlsOptions {
                 enabled: true,
+                fingerprint: fingerprint.map(str::to_owned),
                 sni: Some("localhost".into()),
                 reality_public_key: Some(
                     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(public),
@@ -236,12 +237,16 @@ async fn exchange(node: &Node, tcp: Option<TcpStream>) -> anyhow::Result<Vec<u8>
     Ok(received)
 }
 
-async fn exercise(replies: &[Reply], supplied: bool) -> Vec<Captured> {
+async fn exercise_with_fingerprint(
+    replies: &[Reply],
+    supplied: bool,
+    fingerprint: Option<&str>,
+) -> (anyhow::Result<Vec<u8>>, Vec<Captured>) {
     timeout(Duration::from_secs(10), async {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let key = PKey::generate(Id::X25519).unwrap();
-        let node = node(addr, &key, supplied);
+        let node = node(addr, &key, supplied, fingerprint);
         let (registry, _) =
             crate::runtime::OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
                 &[],
@@ -268,22 +273,27 @@ async fn exercise(replies: &[Reply], supplied: bool) -> Vec<Captured> {
             captured
         };
         let (result, captured) = tokio::join!(registry.scope_dials(client), server);
-        if matches!(replies.last(), Some(Reply::Authenticated)) {
-            assert_eq!(result.unwrap(), SERVER_DATA);
-        } else {
-            assert!(
-                result.is_err(),
-                "unauthenticated REALITY connection succeeded"
-            );
-        }
         assert!(
             listener.accept().now_or_never().is_none(),
             "unexpected extra dial"
         );
-        captured
+        (result, captured)
     })
     .await
     .unwrap()
+}
+
+async fn exercise(replies: &[Reply], supplied: bool) -> Vec<Captured> {
+    let (result, captured) = exercise_with_fingerprint(replies, supplied, None).await;
+    if matches!(replies.last(), Some(Reply::Authenticated)) {
+        assert_eq!(result.unwrap(), SERVER_DATA);
+    } else {
+        assert!(
+            result.is_err(),
+            "unauthenticated REALITY connection succeeded"
+        );
+    }
+    captured
 }
 
 fn assert_fresh_classical_retry(captured: &[Captured]) {
@@ -322,12 +332,48 @@ async fn mask_retries_fresh_classical_and_only_authenticated_stream_carries_data
 }
 
 #[tokio::test]
+async fn mask_certificate_with_pinned_ios_fingerprint_does_not_redial() {
+    let (result, captured) = exercise_with_fingerprint(&[Reply::Mask], false, Some("ios")).await;
+    let error = result.expect_err("a pinned fingerprint must not redial a mask certificate");
+    assert!(error.is::<super::RealityMaskCertificate>());
+    assert_eq!(captured.len(), 1);
+    assert_eq!(
+        key_shares(&captured[0].hello)
+            .iter()
+            .map(|(group, _)| *group)
+            .collect::<Vec<_>>(),
+        [29]
+    );
+    // The gate closes only the retry, not the first dial: an ios node still
+    // authenticates in one X25519-only hello.
+    let (result, captured) =
+        exercise_with_fingerprint(&[Reply::Authenticated], false, Some("ios")).await;
+    assert_eq!(result.unwrap(), SERVER_DATA);
+    assert_eq!(captured.len(), 1);
+}
+
+#[tokio::test]
+async fn mask_certificate_with_pinned_chrome_fingerprint_does_not_redial() {
+    let (result, captured) = exercise_with_fingerprint(&[Reply::Mask], false, Some("chrome")).await;
+    let error = result.expect_err("a pinned fingerprint must not redial a mask certificate");
+    assert!(error.is::<super::RealityMaskCertificate>());
+    assert_eq!(captured.len(), 1);
+    assert_eq!(
+        key_shares(&captured[0].hello)
+            .iter()
+            .map(|(group, _)| *group)
+            .collect::<Vec<_>>(),
+        [0x11ec, 29]
+    );
+}
+
+#[tokio::test]
 async fn supplied_fallback_waits_for_capacity_without_spending_sibling_credit() {
     timeout(Duration::from_secs(10), async {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let sibling_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let key = PKey::generate(Id::X25519).unwrap();
-        let node = node(listener.local_addr().unwrap(), &key, true);
+        let node = node(listener.local_addr().unwrap(), &key, true, None);
         let (registry, _) =
             crate::runtime::OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
                 &[],
@@ -402,7 +448,7 @@ async fn cancelling_classical_handshake_drops_the_replacement_socket() {
     timeout(Duration::from_secs(10), async {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let key = PKey::generate(Id::X25519).unwrap();
-        let node = node(listener.local_addr().unwrap(), &key, false);
+        let node = node(listener.local_addr().unwrap(), &key, false, None);
         let client = tokio::spawn(async move {
             maybe_tls_wrap_concrete(
                 &node,
@@ -431,7 +477,7 @@ async fn setup_deadline_includes_the_replacement_handshake() {
     timeout(Duration::from_secs(10), async {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let key = PKey::generate(Id::X25519).unwrap();
-        let node = node(listener.local_addr().unwrap(), &key, false);
+        let node = node(listener.local_addr().unwrap(), &key, false, None);
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let client = tokio::spawn(async move {
             started_tx.send(tokio::time::Instant::now()).unwrap();
@@ -471,7 +517,7 @@ async fn setup_deadline_includes_the_replacement_handshake() {
 async fn setup_deadline_includes_initial_dial_admission() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let key = PKey::generate(Id::X25519).unwrap();
-    let node = node(listener.local_addr().unwrap(), &key, false);
+    let node = node(listener.local_addr().unwrap(), &key, false, None);
     let (registry, _) = crate::runtime::OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
         &[],
         1,
