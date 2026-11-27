@@ -148,6 +148,8 @@ proxies:
 
 UDP 拨号前会先筛一遍前置：按（末端协议的 UDP 需求 × 前置的 UDP 能力 × 目标端口）逐个检查组内候选前置，筛掉不能用的、换下一个；全部筛掉时立即报错 `detour could not carry UDP to …`，不等满拨号超时。
 
+XHTTP 也走组 detour：走组 detour 的每次拨号为该连接单独建载体会话走前置，不与节点共享池里的会话混用（走节点自身 detour 的仍共享池）；Trojan / VMess 的 UDP 控制连接同样走这条载体。
+
 Shadowsocks 作末端时，TCP 握手在已连通的前置流上跑，不再要求真实 socket；UDP 没有流可骑，走组 detour 的 UDP 仍在拨号前拒绝。Shadowsocks 作前置（carrier）不受影响，仍按原来的直接拨号走。
 
 节点级 detour 同理：带 `dialer-proxy` 的 Shadowsocks / SOCKS5 节点，UDP 拨号在发包前拒绝（`node …: shadowsocks/socks5 UDP cannot carry detour …`），不会静默直连；TCP 仍走前置。其他协议的节点级 detour 由绑定检查兜底，绑定缺失时同样拒绝。
