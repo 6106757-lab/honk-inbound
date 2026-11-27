@@ -27,6 +27,7 @@ mod lifecycle;
 mod support;
 use support::*;
 mod capacity;
+mod detour;
 mod download;
 mod errors;
 mod flow_control;

@@ -161,7 +161,7 @@ impl TrojanHandler {
                     runtime,
                     tcp,
                     timeout,
-                    detour.as_deref(),
+                    detour.as_ref(),
                     ctx,
                 )
                 .await

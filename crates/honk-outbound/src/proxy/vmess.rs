@@ -511,7 +511,7 @@ impl VmessHandler {
                     runtime,
                     None,
                     connect_timeout,
-                    detour.as_deref(),
+                    detour.as_ref(),
                     ctx,
                 )
                 .await?
@@ -673,7 +673,7 @@ impl TcpOutbound for VmessHandler {
             &runtime,
             None,
             connect_timeout,
-            detour.as_deref(),
+            detour.as_ref(),
             ctx,
         )
         .await?;

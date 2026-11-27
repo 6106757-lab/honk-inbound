@@ -92,7 +92,13 @@ async fn get_reaches_only_the_download_peer_and_supplied_socket_stays_upload() {
             let runtime = owner.runtime();
             let supplied = TcpStream::connect(upload_peer.address).await.unwrap();
             let (mut stream, preparation) = transport
-                .prepare(&runtime, Some(supplied), DEADLINE)
+                .prepare(
+                    &runtime,
+                    Some(supplied),
+                    DEADLINE,
+                    None,
+                    crate::proxy::detour::DetourDialCtx::root(DEADLINE),
+                )
                 .await
                 .unwrap();
             let mut get = download_peer.next().await;
@@ -150,7 +156,16 @@ async fn dead_download_carrier_fails_commit_without_publishing_either_peer() {
         let mut download_peer = Peer::new(32).await;
         let (owner, transport) = split(&upload_peer, &download_peer, XhttpMode::StreamUp);
         let runtime = owner.runtime();
-        let (mut stream, preparation) = transport.prepare(&runtime, None, DEADLINE).await.unwrap();
+        let (mut stream, preparation) = transport
+            .prepare(
+                &runtime,
+                None,
+                DEADLINE,
+                None,
+                crate::proxy::detour::DetourDialCtx::root(DEADLINE),
+            )
+            .await
+            .unwrap();
         download_peer.next().await;
         drop(download_peer);
         assert!(stream.read(&mut [0; 1]).await.is_err());
@@ -171,7 +186,16 @@ async fn dead_upload_carrier_fails_commit_without_publishing_either_peer() {
         let mut download_peer = Peer::new(32).await;
         let (owner, transport) = split(&upload_peer, &download_peer, XhttpMode::StreamUp);
         let runtime = owner.runtime();
-        let (mut stream, preparation) = transport.prepare(&runtime, None, DEADLINE).await.unwrap();
+        let (mut stream, preparation) = transport
+            .prepare(
+                &runtime,
+                None,
+                DEADLINE,
+                None,
+                crate::proxy::detour::DetourDialCtx::root(DEADLINE),
+            )
+            .await
+            .unwrap();
         let _get = download_peer.next().await;
         upload_peer.next().await;
         drop(upload_peer);

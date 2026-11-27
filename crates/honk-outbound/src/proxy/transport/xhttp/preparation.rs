@@ -6,6 +6,7 @@ use tokio::{net::TcpStream, sync::Notify};
 
 use super::runtime::{Peer, Phase};
 use super::{MAX_CARRIERS, XhttpRuntime, XhttpSession};
+use crate::proxy::detour::{DetourDialCtx, DetourPath};
 use crate::runtime::NodeRuntime;
 use crate::session::{
     DetachedSessionReservation, ManagedSession, SessionPermit, SessionState, SpeculativeCheckout,
@@ -82,6 +83,8 @@ impl PreparationState {
         runtime: &Arc<NodeRuntime>,
         tcp: Arc<Mutex<Option<TcpStream>>>,
         timeout: Duration,
+        detour: Option<Arc<DetourPath>>,
+        ctx: DetourDialCtx,
     ) -> anyhow::Result<(Arc<XhttpSession>, SessionPermit<XhttpSession>)> {
         loop {
             let changed = self.changed.notified();
@@ -110,7 +113,7 @@ impl PreparationState {
             };
             drop(closed);
             if committed {
-                return self.peer.reserve(runtime, tcp, timeout).await;
+                return self.peer.reserve(runtime, tcp, timeout, detour, ctx).await;
             }
             // Poll all private capacity notifications before checking their reservations.
             // These sessions remain invisible to shared pool checkout until winner commit.
@@ -142,7 +145,7 @@ impl PreparationState {
                 }
                 SpeculativeCheckout::Detached(mut reservation) => {
                     let session = tokio::select! {
-                        result = XhttpRuntime::dial(runtime.clone(), self.peer.node.clone(), tcp.clone(), timeout) => result?,
+                        result = XhttpRuntime::dial(runtime.clone(), self.peer.node.clone(), tcp.clone(), timeout, detour.clone(), ctx) => result?,
                         _ = reservation.cancelled() => anyhow::bail!("XHTTP pool retired during preparation"),
                         error = self.cancellation_error() => return Err(error),
                     };
