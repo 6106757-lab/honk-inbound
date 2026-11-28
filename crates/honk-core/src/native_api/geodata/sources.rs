@@ -559,7 +559,7 @@ impl Sources {
             changed: tokio::sync::Notify::new(),
         };
         let now = SystemTime::now();
-        sources.seed(settings, file, now)?;
+        sources.seed(settings, file)?;
         sources.reschedule(now);
         Ok(sources)
     }
@@ -578,12 +578,7 @@ impl Sources {
     /// file does not name is kept when a patch stored it and deleted when an
     /// earlier file wrote it, so its default applies again. The file's
     /// `auto_update` and `cron` form one schedule, each defaulting on its own.
-    fn seed(
-        &self,
-        settings: &NativeApiConfig,
-        file: &GeodataDefaults,
-        now: SystemTime,
-    ) -> Result<(), Error> {
+    fn seed(&self, settings: &NativeApiConfig, file: &GeodataDefaults) -> Result<(), Error> {
         let urls = [&settings.geosite_download_url, &settings.geoip_download_url];
         let mut stored = self.stored.lock();
         let mut next = stored.clone();
@@ -634,10 +629,10 @@ impl Sources {
             next.verify_checksum = None;
             next.verify_checksum_from_config = false;
         }
-        let auto = effective(&next).auto_update;
-        if file.cron.is_some() || auto.enabled {
-            validate_schedule(&auto.schedule, now, &chrono::Local)?;
-        }
+        // A retained schedule that cannot fire only warns, like the update
+        // loop: the file is operator configuration, and a geodata plan must
+        // not kill the proxy at startup. reschedule() right after open()
+        // owns the warning and the retry backoff, so seed() stays silent.
         if next != *stored {
             self.write(&next)?;
             *stored = next;
@@ -693,8 +688,28 @@ impl Sources {
             }
         };
         let auto = effective(&next).auto_update;
-        if explicit_cron || auto.enabled {
+        if explicit_cron {
             validate_schedule(&auto.schedule, SystemTime::now(), &chrono::Local)?;
+        } else if auto.enabled {
+            // A retained schedule only warns, routed through the same flag
+            // reschedule() uses, so one episode warns once however the
+            // patch reaches here. reschedule() runs right after when the
+            // schedule changed and finds the flag already set.
+            let now = SystemTime::now();
+            let mut status = self.status.lock();
+            let (_, unavailable) = due(
+                &auto.schedule,
+                status.last_checked_at,
+                status.failures,
+                now,
+                &chrono::Local,
+            );
+            if unavailable && !status.schedule_unavailable {
+                tracing::warn!(
+                    "geodata cron has no future local occurrence; change or disable the schedule; failed downloads retain their retry backoff"
+                );
+            }
+            status.schedule_unavailable = unavailable;
         }
         self.write(&next)?;
         let schedule_changed = next.auto_update != stored.auto_update;
