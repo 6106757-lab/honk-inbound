@@ -416,6 +416,21 @@ routing {
     }
 
     #[test]
+    fn test_parse_routing_domain_regex_commas() {
+        let input = r#"
+routing {
+    domain(regex:^a{1,2}$) -> direct
+    fallback: direct
+}
+"#;
+        let config = parse_dae_config(input).unwrap();
+        let rules = &config.routing.rules;
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].condition.domain_regex, vec!["^a{1,2}$"]);
+        assert!(rules[0].condition.domain_suffix.is_empty());
+    }
+
+    #[test]
     fn test_parse_nodes() {
         let input = r#"
 node {
@@ -1754,6 +1769,88 @@ group {
         .unwrap();
     assert_eq!(paid_group.nodes.len(), 3);
 }
+
+#[test]
+fn test_group_subscription_filter_regex_commas() {
+    let input = r#"
+subscription {
+    aa: 'https://example.com/aa'
+    a: 'https://example.com/a'
+    free: 'https://example.com/free'
+    'a,b': 'https://example.com/ab'
+}
+node {
+    aa-node: 'socks5://10.0.0.1:1080'
+    a-node: 'socks5://10.0.0.2:1080'
+    free-node: 'socks5://10.0.0.3:1080'
+    ab-node: 'socks5://10.0.0.5:1080'
+    static: 'socks5://10.0.0.4:1080'
+}
+group {
+    quantifier {
+        filter: subtag(regex:^a{1,2}$)
+    }
+    paren {
+        filter: subtag(regex:(a,b))
+    }
+    quantifier-or-exact {
+        filter: subtag(regex:^a{1,2}$, free)
+    }
+}
+"#;
+    let mut config = parse_dae_config(input).unwrap();
+    let id = |name: &str| {
+        config
+            .subscriptions
+            .iter()
+            .find(|subscription| subscription.name == name)
+            .unwrap()
+            .id
+    };
+    let (aa, a, free) = (id("aa"), id("a"), id("free"));
+    let ab = id("a,b");
+    for node in &mut config.nodes {
+        node.subscription_id = match node.name.as_str() {
+            "aa-node" => Some(aa),
+            "a-node" => Some(a),
+            "free-node" => Some(free),
+            "ab-node" => Some(ab),
+            _ => None,
+        };
+    }
+    crate::parser::resolve_group_filters(&mut config.groups, &config.nodes, &config.subscriptions);
+    let names = |tag: &str| {
+        let group = config
+            .groups
+            .iter()
+            .find(|group| group.name == tag)
+            .unwrap();
+        let mut names: Vec<_> = group
+            .nodes
+            .iter()
+            .map(|id| {
+                config
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == *id)
+                    .unwrap()
+                    .name
+                    .as_str()
+            })
+            .collect();
+        names.sort_unstable();
+        names
+    };
+    assert_eq!(names("quantifier"), vec!["a-node", "aa-node"]);
+    // `(a,b)` is a regex group matching the literal "a,b": the comma must
+    // not split the argument, or the filter fails to compile and is ignored.
+    assert_eq!(names("paren"), vec!["ab-node"]);
+    assert_eq!(
+        names("quantifier-or-exact"),
+        vec!["a-node", "aa-node", "free-node"]
+    );
+}
+
 #[test]
 fn test_group_filter_multi_tags_comma_and_pipe() {
     let input = r#"
@@ -1998,6 +2095,57 @@ dns {
     );
     // subtag() is request-only: the response rule is omitted.
     assert!(config.dns.routing.response.rules.is_empty());
+}
+
+#[test]
+fn test_parse_dns_request_routing_subtag_regex_commas() {
+    let input = r#"
+dns {
+    routing {
+        request {
+            subtag(regex:^a{1,2}$) -> providerdoh
+            subtag(regex:^a{1,2}$, keyword:foo) -> providerdoh
+            subtag(regex:[a,b]+) -> providerdoh
+            subtag(regex:^a\,b$) -> providerdoh
+            subtag(regex:"^a{1,2}$") -> providerdoh
+        }
+    }
+}
+"#;
+    let config = parse_dae_config(input).unwrap();
+    let rules = &config.dns.routing.request.rules;
+    let subtag = |tags| crate::dns::DnsCond::Subtag { not: false, tags };
+    use crate::dns::DnsTagMatcher::{Exact, Keyword, Regex};
+    assert_eq!(rules.len(), 5);
+    assert_eq!(
+        rules[0].conditions[0],
+        subtag(vec![Regex("^a{1,2}$".into())])
+    );
+    assert_eq!(
+        rules[1].conditions[0],
+        subtag(vec![Regex("^a{1,2}$".into()), Keyword("foo".into())])
+    );
+    assert_eq!(rules[2].conditions[0], subtag(vec![Regex("[a,b]+".into())]));
+    assert_eq!(
+        rules[3].conditions[0],
+        subtag(vec![Regex(r"^a\,b$".into())])
+    );
+    // A quoted regex was already kept whole; it stays whole.
+    assert_eq!(
+        rules[4].conditions[0],
+        subtag(vec![Regex("^a{1,2}$".into())])
+    );
+    // No ghost exact tag leaks from a split comma.
+    assert!(
+        rules
+            .iter()
+            .all(|rule| !rule.conditions.iter().any(|condition| matches!(
+                condition,
+                crate::dns::DnsCond::Subtag { tags, .. }
+                    if tags.iter().any(|tag| matches!(tag, Exact(value) if value == "2}$"))
+            ))),
+        "a comma inside a regex must not produce an Exact(\"2}}$\") tag"
+    );
 }
 
 #[test]

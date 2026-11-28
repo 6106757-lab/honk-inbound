@@ -729,7 +729,7 @@ fn parse_dns_conditions(
             );
         }
         let args: Vec<_> = arguments
-            .split(",")
+            .split_pattern_args(",")
             .map(Text::unquote)
             .filter(|arg| !arg.raw().is_empty())
             .collect();
@@ -866,7 +866,7 @@ fn parse_dns_qname_args(args: &[Text<'_, '_>]) -> Vec<crate::dns::DnsDomainMatch
 fn parse_dns_subtag_args(arguments: Text<'_, '_>) -> Vec<crate::dns::DnsTagMatcher> {
     use crate::dns::DnsTagMatcher;
     let mut tags = Vec::new();
-    for a in arguments.split(",") {
+    for a in arguments.split_pattern_args(",") {
         let a = a.trim();
         let raw = a.raw();
         let (prefix, matcher): (&str, fn(String) -> DnsTagMatcher) = if raw.starts_with("keyword:")

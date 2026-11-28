@@ -102,6 +102,37 @@ impl<'p, 'd, 'a> Expression<'p, 'd, 'a> {
         })
     }
 
+    /// Like [`Self::split`], but a delimiter inside a regex quantifier,
+    /// group or character class does not split. For argument lists that
+    /// carry `regex:` values.
+    pub(super) fn split_pattern_args<'s>(
+        self,
+        delimiter: &'s str,
+    ) -> impl Iterator<Item = Self> + 's
+    where
+        'p: 's,
+        'd: 's,
+    {
+        let mut delimiters = self
+            .parts()
+            .flat_map(move |part| part.delimiter_positions_pattern(delimiter));
+        let mut start = self.span.start;
+        let mut done = false;
+        std::iter::from_fn(move || {
+            if done {
+                return None;
+            }
+            if let Some(end) = delimiters.next() {
+                let part = self.sub(start, end).trim();
+                start = end + delimiter.len();
+                Some(part)
+            } else {
+                done = true;
+                Some(self.sub(start, self.span.end).trim())
+            }
+        })
+    }
+
     pub(super) fn parentheses(self) -> impl Iterator<Item = (usize, u8)> + 'p
     where
         'd: 'p,
@@ -485,7 +516,7 @@ fn parse_call<'p, 'd, 'a>(
     }
     Ok(Some(
         call.sub(call.span.start + 1, position)
-            .split(",")
+            .split_pattern_args(",")
             .map(Expression::unquote)
             .filter(|value| !value.is_empty())
             .collect(),
