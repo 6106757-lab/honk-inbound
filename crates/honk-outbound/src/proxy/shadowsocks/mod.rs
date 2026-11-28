@@ -587,6 +587,16 @@ impl ShadowsocksHandler {
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<SsUdpTransport> {
+        // A node that names a detour must ride it: UDP dialled directly
+        // would leave the real interface while the TCP path rides the front.
+        if let Some(name) = node.detour_name()
+            && name != "direct"
+        {
+            anyhow::bail!(
+                "node {}: shadowsocks UDP cannot carry detour {name:?}",
+                node.name
+            );
+        }
         let config = node.shadowsocks().unwrap();
         let method = config.encryption.as_deref().unwrap_or("aes-128-gcm");
         let password = config.password.as_deref().unwrap_or("");

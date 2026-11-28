@@ -435,6 +435,17 @@ impl Socks5Handler {
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<Socks5UdpTransport> {
+        // A node that names a detour must ride it: a UDP association opened
+        // directly would leave the real interface while the TCP path rides
+        // the front.
+        if let Some(name) = node.detour_name()
+            && name != "direct"
+        {
+            anyhow::bail!(
+                "node {}: socks5 UDP cannot carry detour {name:?}",
+                node.name
+            );
+        }
         if target_domain.is_some_and(|domain| domain.len() > usize::from(u8::MAX)) {
             anyhow::bail!("SOCKS5 UDP domain exceeds 255 bytes");
         }
