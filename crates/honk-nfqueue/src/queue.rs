@@ -99,7 +99,11 @@ impl QueueSocket {
                 Some(libc::EINVAL) => QueueError::Unavailable,
                 _ => QueueError::Io(error),
             })?;
-        self.send_config_command(NFQNL_CFG_CMD_PF_BIND, libc::AF_INET6 as u16, 0)?;
+        self.send_config_command(NFQNL_CFG_CMD_PF_BIND, libc::AF_INET6 as u16, 0)
+            .map_err(|error| match error.raw_os_error() {
+                Some(libc::EINVAL) => QueueError::Unavailable,
+                _ => QueueError::Io(error),
+            })?;
         self.send_config_command(NFQNL_CFG_CMD_BIND, 0, QUEUE_NUM)
             .map_err(|error| {
                 // The kernel returns EPERM before its EBUSY branch when another
@@ -591,6 +595,47 @@ mod tests {
             acknowledgement[start + 16..start + 20].copy_from_slice(&(-libc::EINVAL).to_ne_bytes());
             netlink::seal_message(&mut acknowledgement, start);
             netlink::send(peer.as_raw_fd(), &acknowledgement).expect("config NACK");
+        });
+
+        assert!(matches!(socket.configure(), Err(QueueError::Unavailable)));
+        responder.join().expect("config responder");
+    }
+
+    #[test]
+    fn configure_reports_missing_ipv6_queue_subsystem() {
+        let (socket, peer, _fatal) = QueueSocket::for_test();
+        let responder = std::thread::spawn(move || {
+            for expected_family in [libc::AF_INET as u16, libc::AF_INET6 as u16] {
+                let request =
+                    netlink::recv_datagram(peer.as_raw_fd(), 256).expect("config request");
+                let message = netlink::messages(request)
+                    .next()
+                    .expect("one config message")
+                    .expect("valid config message");
+                let attributes = netlink::attributes(message.body.slice(netlink::NFGENMSG_LEN..))
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("valid config attributes");
+                assert_eq!(attributes.len(), 1);
+                assert_eq!(attributes[0].kind, NFQA_CFG_CMD);
+                assert_eq!(attributes[0].payload[0], NFQNL_CFG_CMD_PF_BIND);
+                let family = u16::from_be_bytes(attributes[0].payload[2..4].try_into().unwrap());
+                assert_eq!(family, expected_family);
+                let mut acknowledgement = Vec::with_capacity(20);
+                let start = netlink::put_message_header(
+                    &mut acknowledgement,
+                    netlink::NLMSG_ERROR,
+                    0,
+                    message.sequence,
+                    0,
+                    0,
+                );
+                if expected_family == libc::AF_INET6 as u16 {
+                    acknowledgement[start + 16..start + 20]
+                        .copy_from_slice(&(-libc::EINVAL).to_ne_bytes());
+                }
+                netlink::seal_message(&mut acknowledgement, start);
+                netlink::send(peer.as_raw_fd(), &acknowledgement).expect("config reply");
+            }
         });
 
         assert!(matches!(socket.configure(), Err(QueueError::Unavailable)));
