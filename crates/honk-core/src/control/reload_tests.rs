@@ -2844,6 +2844,41 @@ async fn changed_hosts_file_rebuilds_reload_snapshot() {
 }
 
 #[tokio::test]
+async fn bad_alias_chain_reload_is_rejected_and_keeps_the_old_snapshot() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("hosts.rules");
+    std::fs::write(&path, "full:reload.invalid 192.0.2.1\n").unwrap();
+    let cp = test_cp().await;
+    let mut config = Config::default();
+    config.dns.hosts = vec![path.to_string_lossy().into_owned()];
+
+    assert!(
+        cp.apply_runtime_config(config.clone(), Default::default(), &DrainTracker::new())
+            .await
+            .accepted()
+    );
+    let first_forwarder = cp.dns_controller.forwarder();
+    let first = first_forwarder.hosts_snapshot();
+    let first_hosts = first.hosts().unwrap();
+    let first_fingerprint = first.fingerprint();
+
+    std::fs::write(&path, "full:a.test b.test\nfull:b.test a.test\n").unwrap();
+    assert_eq!(
+        cp.apply_runtime_config(config, Default::default(), &DrainTracker::new())
+            .await,
+        ReloadOutcome::Rejected
+    );
+    let second = cp.dns_controller.forwarder().hosts_snapshot();
+
+    assert!(Arc::ptr_eq(
+        &first_forwarder,
+        &cp.dns_controller.forwarder()
+    ));
+    assert_eq!(first_fingerprint, second.fingerprint());
+    assert!(Arc::ptr_eq(&first_hosts, &second.hosts().unwrap()));
+}
+
+#[tokio::test]
 async fn client_subnet_reload_injects_upstream_query() {
     let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let cp = test_cp().await;
