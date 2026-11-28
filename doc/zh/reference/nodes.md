@@ -634,7 +634,7 @@ VLESS 按以下规则选择 TLS：
 
 重复的 `security` 与已识别的 `tls` 声明必须一致，包括别名之间的 TLS 开关。后值不能覆盖前面的冲突声明。VLESS 与编码 VMess 只接受 `tls=0|1`；其他协议方案保留对未识别 `tls` 文本的处理。Trojan 与 AnyTLS 拒绝显式明文声明，而不是静默保留强制 TLS。
 
-REALITY 仅使用 TLS 1.3，首次尝试依次通告 hybrid `X25519MLKEM768` 与预设 classic `X25519` share。仅当握手完成后收到非 ed25519 叶证书，才向同一对端新建一次仅使用 X25519 的连接；新连接仍须通过配置的 REALITY key/HMAC 认证，之后才能发送代理数据。
+REALITY 仅使用 TLS 1.3。未设 `fp` 时首次尝试依次通告 hybrid `X25519MLKEM768` 与预设 classic `X25519` share；设了 `fp` 的节点首拨按该指纹的 key share（Chromium 系 hybrid，其余仅 X25519）。仅当握手完成后收到非 ed25519 叶证书、且节点未设 `fp` 时，才向同一对端新建一次仅使用 X25519 的连接；设了 `fp` 的节点不重拨，直接返回掩码证书错误。新连接仍须通过配置的 REALITY key/HMAC 认证，之后才能发送代理数据。
 
 两次尝试共享 `3 × connect_timeout` 的 setup deadline，不增加配置项。该触发结果未经认证，并非服务端版本检测。ed25519 HMAC 错误、TLS/IO 错误及 HRR 仍是最终失败。每条连接只 seal 一次 ClientHello，不复用 key/nonce。参见[兼容与认证边界](../design/outbound.md)。
 

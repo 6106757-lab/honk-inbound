@@ -51,6 +51,15 @@ pub struct RealityConfig {
 #[error("REALITY server presented a real certificate (potential MITM or redirection)")]
 pub(crate) struct RealityMaskCertificate;
 
+/// Mirror of upstream's chain-side check: a mask certificate stays
+/// recognisable through wrappers. `Error::is` cannot see through `#[source]`
+/// wrappers such as `TargetFailure`; this walks the cause chain instead.
+pub(crate) fn reality_mask_certificate(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<RealityMaskCertificate>())
+}
+
 /// REALITY parameters from a node, or `None` when the node is not REALITY.
 ///
 /// Like pinSHA256, these keys are security assertions: an unparseable
@@ -553,6 +562,27 @@ mod tests {
             parse_reality_config(&bad).is_err(),
             "bad sid must fail closed"
         );
+    }
+
+    #[test]
+    fn reality_mask_certificate_walks_the_cause_chain() {
+        let bare: anyhow::Error = RealityMaskCertificate.into();
+        assert!(reality_mask_certificate(&bare));
+        assert!(bare.is::<RealityMaskCertificate>());
+        // anyhow's `is` sees through its own context wrapper, so the helper
+        // and `is` agree here; the helper's edge is the `#[source]` wrapper
+        // below, which `is` cannot see through.
+        let wrapped = bare.context("handshake failed");
+        assert!(reality_mask_certificate(&wrapped));
+        assert!(wrapped.is::<RealityMaskCertificate>());
+        let target_wrapped =
+            anyhow::Error::new(crate::proxy::TargetFailure(RealityMaskCertificate.into()));
+        assert!(reality_mask_certificate(&target_wrapped));
+        assert!(!target_wrapped.is::<RealityMaskCertificate>());
+        let other = anyhow::anyhow!("REALITY certificate authentication failed");
+        assert!(!reality_mask_certificate(&other));
+        let tls = anyhow::anyhow!("REALITY handshake with example.com failed: tls alert");
+        assert!(!reality_mask_certificate(&tls));
     }
 }
 

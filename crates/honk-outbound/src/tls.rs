@@ -589,6 +589,17 @@ pub fn reality_hybrid_first(node: &Node) -> bool {
         .is_none_or(|fingerprint| fingerprint.is_chromium())
 }
 
+/// Whether a REALITY mask-certificate retry may switch key shares: only
+/// when the node stores no recognised per-node fingerprint. A pinned
+/// fingerprint is authoritative for the hello the node sends; flipping its
+/// key shares mid-dial would send a hello the user never asked for.
+pub fn reality_key_share_fallback(node: &Node) -> bool {
+    node.tls()
+        .and_then(|tls| tls.fingerprint.as_deref())
+        .and_then(TlsFingerprint::parse)
+        .is_none()
+}
+
 /// Process-wide cache for DNS-discovered ECHConfigLists (RFC 9460 HTTPS RR).
 struct EchCacheEntry {
     config: Option<Vec<u8>>,

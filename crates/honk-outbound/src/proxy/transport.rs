@@ -257,7 +257,10 @@ pub(crate) async fn maybe_tls_wrap_concrete(
             .await
             {
                 Ok(stream) => stream,
-                Err(error) if error.is::<crate::reality::RealityMaskCertificate>() => {
+                Err(error)
+                    if crate::reality::reality_mask_certificate(&error)
+                        && crate::tls::reality_key_share_fallback(node) =>
+                {
                     // The failed handshake has dropped its SSL/TCP before admission
                     // transfers. Supplied sockets cannot spend another dial's credit.
                     let replacement = async {
@@ -301,6 +304,12 @@ pub(crate) async fn maybe_tls_wrap_concrete(
                             tcp,
                             &reality,
                             fingerprint,
+                            // The retry flips the first attempt's key shares.
+                            // The gate above only opens this arm when no
+                            // fingerprint pins the hello, so the flip here is
+                            // hybrid-first to classical; keep the expression
+                            // instead of a literal `false` so it stays correct
+                            // if the first attempt's default ever changes.
                             !hybrid_first,
                             alpn,
                         )
