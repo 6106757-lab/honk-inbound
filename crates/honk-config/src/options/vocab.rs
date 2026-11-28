@@ -141,30 +141,41 @@ pub fn verification_text(value: &str) -> Result<bool, &'static str> {
     Err("invalid certificate verification boolean")
 }
 
+/// Split a hopping spec into its comma segments, trimming each and skipping
+/// empty ones (the mport consumer's historical grammar).
+fn hopping_parts(spec: &str) -> impl Iterator<Item = &str> + '_ {
+    spec.split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+}
+
+/// Parse one segment into an inclusive `(low, high)` port range, rejecting
+/// zero ports and reversed ranges. Shared by both hopping decoders so their
+/// grammars cannot drift apart.
+fn parse_hopping_part(part: &str) -> Option<(u16, u16)> {
+    let (low, high) = match part.split_once('-') {
+        Some((low, high)) => (
+            low.trim().parse::<u16>().ok()?,
+            high.trim().parse::<u16>().ok()?,
+        ),
+        None => {
+            let port = part.parse::<u16>().ok()?;
+            (port, port)
+        }
+    };
+    if low == 0 || high < low {
+        return None;
+    }
+    Some((low, high))
+}
+
 /// Decode nonzero ports and inclusive ranges into sorted, merged disjoint ranges,
 /// rejecting repeated or overlapping ports. Empty comma segments retain the mport
 /// consumer's historical grammar.
 pub fn port_hopping_ranges(spec: &str) -> Option<Vec<(u16, u16)>> {
     let mut ranges = Vec::new();
-    for part in spec
-        .split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-    {
-        let (low, high) = match part.split_once('-') {
-            Some((low, high)) => (
-                low.trim().parse::<u16>().ok()?,
-                high.trim().parse::<u16>().ok()?,
-            ),
-            None => {
-                let port = part.parse::<u16>().ok()?;
-                (port, port)
-            }
-        };
-        if low == 0 || high < low {
-            return None;
-        }
-        ranges.push((low, high));
+    for part in hopping_parts(spec) {
+        ranges.push(parse_hopping_part(part)?);
     }
     if ranges.is_empty() {
         return None;
@@ -191,24 +202,8 @@ pub fn port_hopping_ranges(spec: &str) -> Option<Vec<(u16, u16)>> {
 pub fn parse_port_hopping(spec: &str) -> Option<Vec<u16>> {
     let mut ports = Vec::new();
     let mut seen = [0u64; 1024];
-    for part in spec
-        .split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-    {
-        let (low, high) = match part.split_once('-') {
-            Some((low, high)) => (
-                low.trim().parse::<u16>().ok()?,
-                high.trim().parse::<u16>().ok()?,
-            ),
-            None => {
-                let port = part.parse::<u16>().ok()?;
-                (port, port)
-            }
-        };
-        if low == 0 || high < low {
-            return None;
-        }
+    for part in hopping_parts(spec) {
+        let (low, high) = parse_hopping_part(part)?;
         for port in low..=high {
             let word = &mut seen[usize::from(port) / 64];
             let bit = 1u64 << (port % 64);
@@ -224,7 +219,7 @@ pub fn parse_port_hopping(spec: &str) -> Option<Vec<u16>> {
 
 #[cfg(test)]
 mod tests {
-    use super::port_hopping_ranges;
+    use super::{parse_port_hopping, port_hopping_ranges};
 
     #[test]
     fn port_hopping_ranges_canonicalizes_single_ports_ranges_and_adjacent_merges() {
@@ -280,6 +275,78 @@ mod tests {
             "65536",
         ] {
             assert_eq!(port_hopping_ranges(invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn port_hopping_grammars_agree_on_validity() {
+        for spec in [
+            "443",
+            " 443 , ",
+            "8080, 9000-9001",
+            "20000-20003",
+            "6000, 4000 - 5000",
+            "5000-5005,5006-5010",
+            "5006-5010,5000-5005",
+            "102,100,101",
+            "65535",
+            "65534,65535",
+            "1-65535",
+            "443,",
+            "",
+            "   ",
+            ",",
+            " , ",
+            "0",
+            "0-10",
+            "9000-8000",
+            "443,443",
+            "65535,65535",
+            "65530-65535,65535",
+            "100-200,150-250",
+            "100-200,200-250",
+            "35000-39000,35000",
+            "bad",
+            "abc-def",
+            "443,-500",
+            "0,6000",
+            "65536-65537",
+            "1-2-3",
+            "65536",
+        ] {
+            assert_eq!(
+                parse_port_hopping(spec).is_some(),
+                port_hopping_ranges(spec).is_some(),
+                "{spec}"
+            );
+        }
+    }
+
+    #[test]
+    fn port_hopping_ranges_match_the_expanded_ports() {
+        for (spec, expected) in [
+            ("443", vec![(443, 443)]),
+            ("8080, 9000-9001", vec![(8080, 8080), (9000, 9001)]),
+            ("6000, 4000 - 5000", vec![(4000, 5000), (6000, 6000)]),
+            ("5000-5005,5006-5010", vec![(5000, 5010)]),
+            ("102,100,101", vec![(100, 102)]),
+            ("65534,65535", vec![(65534, 65535)]),
+            ("1-65535", vec![(1, 65535)]),
+        ] {
+            let mut ports = parse_port_hopping(spec).expect("valid spec");
+            ports.sort_unstable();
+            let mut ranges: Vec<(u16, u16)> = Vec::new();
+            for port in ports {
+                if let Some(prev) = ranges.last_mut()
+                    && prev.1.checked_add(1) == Some(port)
+                {
+                    prev.1 = port;
+                    continue;
+                }
+                ranges.push((port, port));
+            }
+            assert_eq!(port_hopping_ranges(spec), Some(expected), "{spec}");
+            assert_eq!(port_hopping_ranges(spec), Some(ranges), "{spec}");
         }
     }
 }
