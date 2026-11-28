@@ -524,7 +524,7 @@ fn nested_final_only_leaf_is_health_registered_and_keeps_probe_ownership() {
     let mut config = nested_final_config();
     let primary = config.nodes[0].id;
     let backup = config.nodes[1].id;
-    let alive = AliveDialerSet::new();
+    let alive = Arc::new(AliveDialerSet::new());
     sync_health_check_nodes(&alive, &config);
     assert_eq!(
         alive
@@ -538,12 +538,16 @@ fn nested_final_only_leaf_is_health_registered_and_keeps_probe_ownership() {
     for group in &mut config.groups {
         group.policy = GroupPolicy::URLTest;
     }
-    alive.sync_urltest_groups(&urltest_group_registrations(&config));
+    alive.sync_idle_groups(&idle_group_registrations(&config));
     assert!(alive.is_probe_suspended(backup));
 
     config.groups[0].policy = GroupPolicy::Selector;
     config.groups[2].groups.push("root".into());
-    alive.sync_urltest_groups(&urltest_group_registrations(&config));
+    alive.sync_idle_groups(&idle_group_registrations(&config));
+    assert!(alive.is_probe_suspended(backup));
+    // A node `final` keeps probing while its groups are idle.
+    GroupManager::with_alive_set(&config.groups, &config.nodes, Some(Arc::clone(&alive)))
+        .publish_selected_probe_nodes();
     assert!(!alive.is_probe_suspended(backup));
 
     config.groups[2].final_outbound = None;
@@ -3485,11 +3489,14 @@ fn udp_warm_candidates_do_not_mutate_group_selection_state() {
         ..Default::default()
     };
     let alive = Arc::new(crate::outbound::AliveDialerSet::new());
-    alive.register_urltest_group(
-        "cold-urltest",
-        std::slice::from_ref(&cold.id),
-        Some(Duration::from_secs(60)),
-    );
+    alive.sync_idle_groups(&[honk_outbound::alive::IdleGroupRegistration {
+        name: "cold-urltest".into(),
+        members: vec![cold.id],
+        idle_timeout: Some(Duration::from_secs(60)),
+        kind: honk_outbound::alive::IdleGroupKind::Automatic,
+        tcp_recovery_members: vec![cold.id],
+        udp_recovery_members: vec![cold.id],
+    }]);
     let manager =
         GroupManager::with_alive_set(&config.groups, &config.nodes, Some(Arc::clone(&alive)));
     // Advance LB once and set the fallback pin before observing warm-up.
@@ -3517,7 +3524,7 @@ fn udp_warm_candidates_do_not_mutate_group_selection_state() {
             alive.report_unavailable_forced(fallback_a.id, domain, ipver);
         }
     }
-    assert!(alive.is_urltest_group_idle("cold-urltest"));
+    assert!(alive.is_group_idle("cold-urltest"));
     let runtime = honk_outbound::runtime::OutboundRuntimeRegistry::build(&config.nodes).unwrap();
 
     assert_eq!(
@@ -3525,7 +3532,7 @@ fn udp_warm_candidates_do_not_mutate_group_selection_state() {
         vec![lb_a.id, lb_b.id, lb_c.id, cold.id, fallback_b.id],
         "per-group top-three plus cold URLTest and the live fallback leaf,              UUID-deduplicated across V4/V6"
     );
-    assert!(alive.is_urltest_group_idle("cold-urltest"));
+    assert!(alive.is_group_idle("cold-urltest"));
     assert_eq!(
         manager
             .get_fallback_selection_for_network("fallback", crate::group::SelectionNetwork::Udp,),

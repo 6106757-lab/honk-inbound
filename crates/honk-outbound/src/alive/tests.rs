@@ -1,5 +1,6 @@
 use super::*;
 use honk_config::config::{BLOCK_NODE_ID, DIRECT_NODE_ID};
+use std::sync::atomic::Ordering;
 
 fn id(n: u128) -> Uuid {
     Uuid::from_u128(n)
@@ -183,23 +184,55 @@ fn available_traffic_fast_path_preserves_clean_state_and_resets_dirty_state() {
     assert!(reset.is_clean_alive());
 }
 
+fn idle_reg(
+    name: &str,
+    members: Vec<Uuid>,
+    idle_timeout: Option<Duration>,
+    kind: IdleGroupKind,
+) -> IdleGroupRegistration {
+    let recovery = if kind == IdleGroupKind::Automatic {
+        members.clone()
+    } else {
+        Vec::new()
+    };
+    IdleGroupRegistration {
+        name: name.to_owned(),
+        members,
+        idle_timeout,
+        kind,
+        tcp_recovery_members: recovery.clone(),
+        udp_recovery_members: recovery,
+    }
+}
+
 #[test]
 fn group_activity_ignores_untracked_groups_and_reuses_registered_key() {
     let set = AliveDialerSet::new();
-    set.mark_group_active("untracked");
-    assert!(set.group_last_active.read().is_empty());
+    let _ = set.mark_group_active_slot("untracked");
+    assert!(set.idle_groups.read().groups.is_empty());
 
-    set.sync_urltest_groups(&[(
-        "tracked".to_owned(),
+    set.sync_idle_groups(&[idle_reg(
+        "tracked",
         Vec::new(),
         Some(Duration::from_secs(60)),
+        IdleGroupKind::Automatic,
     )]);
-    set.mark_group_active("tracked");
-    let first = set.group_last_active.read()["tracked"];
-    set.mark_group_active("tracked");
-    let active = set.group_last_active.read();
-    assert_eq!(active.len(), 1);
-    assert!(active["tracked"] >= first);
+    let _ = set.mark_group_active_slot("tracked");
+    let first = set.idle_groups.read().groups["tracked"]
+        .activity
+        .last_active_ns
+        .load(Ordering::Acquire);
+    assert!(first > 0);
+    let _ = set.mark_group_active_slot("tracked");
+    let idle = set.idle_groups.read();
+    assert_eq!(idle.groups.len(), 1);
+    assert!(
+        idle.groups["tracked"]
+            .activity
+            .last_active_ns
+            .load(Ordering::Acquire)
+            >= first
+    );
 }
 
 /// Traffic failures during the grace period must not mark a fresh node
@@ -361,7 +394,12 @@ async fn test_emergency_probe_keeps_udp_cooldown() {
         "HEAD".into(),
     )
     .await;
-    set.register_urltest_group("idle", &[node_id], Some(Duration::from_secs(3600)));
+    set.sync_idle_groups(&[idle_reg(
+        "idle",
+        vec![node_id],
+        Some(Duration::from_secs(3600)),
+        IdleGroupKind::Automatic,
+    )]);
     for ipver in [IpVersion::V4, IpVersion::V6] {
         set.states.write().get_mut(&node_id).unwrap()[alive_index(ProbeDomain::Tcp, ipver)]
             .cooldown_until = Instant::now() + Duration::from_secs(300);
@@ -380,9 +418,9 @@ async fn test_emergency_probe_keeps_udp_cooldown() {
     );
 
     set.trigger_probe(node_id);
-    assert!(set.trigger_pending.lock().contains(&node_id));
+    assert!(set.trigger_pending.lock().contains_key(&node_id));
     tokio::time::timeout(Duration::from_secs(10), async {
-        while set.trigger_pending.lock().contains(&node_id) {
+        while set.trigger_pending.lock().contains_key(&node_id) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -411,68 +449,66 @@ async fn test_emergency_probe_keeps_udp_cooldown() {
 }
 
 #[test]
-fn test_suspension_check_releases_node_groups_before_reading_timeouts() {
-    // Reload takes urltest_group_timeout first and node_urltest_groups last.
-    // A suspension check reads them in the opposite order, so it must release
-    // the node groups before consulting the timeouts or the two orders form a
-    // cycle. With the timeouts held here the check cannot finish; the node
-    // groups must still be free for reload's next acquisition.
+fn test_idle_suspension_and_sync_remain_deadlock_free_under_contention() {
     let set = std::sync::Arc::new(AliveDialerSet::new());
     set.register_node(id(1), "n1".into(), "127.0.0.1:1".into());
-    set.register_urltest_group("g", &[id(1)], Some(Duration::from_millis(50)));
+    set.sync_idle_groups(&[idle_reg(
+        "g",
+        vec![id(1)],
+        Some(Duration::from_millis(50)),
+        IdleGroupKind::Automatic,
+    )]);
 
-    let timeouts = set.urltest_group_timeout.write();
-    let (entered, started) = std::sync::mpsc::channel();
-    let prober = {
-        let set = std::sync::Arc::clone(&set);
-        std::thread::spawn(move || {
-            let _ = entered.send(());
-            set.is_probe_suspended(id(1))
-        })
-    };
-    started.recv().unwrap();
-    std::thread::sleep(Duration::from_millis(10));
-
-    // The check cannot finish while the timeouts are held, so a map that is
-    // never free within the deadline is one held across the idle lookup.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let mut node_groups_free = false;
-    while std::time::Instant::now() < deadline {
-        if set.node_urltest_groups.try_write().is_some() {
-            node_groups_free = true;
-            break;
+    let sync_set = std::sync::Arc::clone(&set);
+    let syncer = std::thread::spawn(move || {
+        for _ in 0..200 {
+            sync_set.sync_idle_groups(&[idle_reg(
+                "g",
+                vec![id(1)],
+                Some(Duration::from_secs(60)),
+                IdleGroupKind::Automatic,
+            )]);
         }
-        std::thread::sleep(Duration::from_millis(5));
+    });
+    let active_set = std::sync::Arc::clone(&set);
+    let activator = std::thread::spawn(move || {
+        for _ in 0..200 {
+            let _ = active_set.mark_group_active_slot("g");
+        }
+    });
+    for _ in 0..200 {
+        let _ = set.is_probe_suspended(id(1));
     }
-    drop(timeouts);
-    prober.join().unwrap();
-
-    assert!(
-        node_groups_free,
-        "the suspension check held node_urltest_groups while waiting for urltest_group_timeout"
-    );
+    syncer.join().unwrap();
+    activator.join().unwrap();
+    assert!(!set.is_probe_suspended(id(1)));
 }
 
 #[tokio::test]
 async fn test_urltest_idle_suspension() {
     let set = AliveDialerSet::new();
     set.register_node(id(1), "n1".into(), "127.0.0.1:1".into());
-    set.register_urltest_group("g", &[id(1)], Some(Duration::from_millis(50)));
+    set.sync_idle_groups(&[idle_reg(
+        "g",
+        vec![id(1)],
+        Some(Duration::from_millis(50)),
+        IdleGroupKind::Automatic,
+    )]);
 
     // Lazy start: a never-active group is idle → probing suspended.
-    assert!(set.is_urltest_group_idle("g"));
+    assert!(set.is_group_idle("g"));
     assert!(set.is_probe_suspended(id(1)));
 
-    set.mark_group_active("g");
-    assert!(!set.is_urltest_group_idle("g"));
+    let _ = set.mark_group_active_slot("g");
+    assert!(!set.is_group_idle("g"));
     assert!(!set.is_probe_suspended(id(1)));
 
     tokio::time::sleep(Duration::from_millis(60)).await;
-    assert!(set.is_urltest_group_idle("g"));
+    assert!(set.is_group_idle("g"));
     assert!(set.is_probe_suspended(id(1)));
 
     // Unregistered groups are never idle; ungrouped nodes never suspended.
-    assert!(!set.is_urltest_group_idle("nope"));
+    assert!(!set.is_group_idle("nope"));
     assert!(!set.is_probe_suspended(id(99)));
 }
 
@@ -482,14 +518,19 @@ async fn test_health_cycle_skips_idle_urltest_nodes() {
     // 127.0.0.1:1 refuses connections → a probe records a failure.
     set.register_node(id(1), "n1".into(), "127.0.0.1:1".into());
     set.register_node(id(2), "n2".into(), "127.0.0.1:1".into());
-    set.register_urltest_group("g", &[id(1)], Some(Duration::from_secs(3600)));
+    set.sync_idle_groups(&[idle_reg(
+        "g",
+        vec![id(1)],
+        Some(Duration::from_secs(3600)),
+        IdleGroupKind::Automatic,
+    )]);
 
     // n1's group was never active → suspended → cycle never probes it.
     set.run_health_check_cycle(Duration::from_millis(200)).await;
     assert!(
         set.get_probe_history(id(1), ProbeDomain::Tcp, IpVersion::V4)
             .is_empty(),
-        "idle URLTest node must not be probed"
+        "idle node must not be probed"
     );
     assert!(
         !set.get_probe_history(id(2), ProbeDomain::Tcp, IpVersion::V4)
@@ -497,12 +538,12 @@ async fn test_health_cycle_skips_idle_urltest_nodes() {
         "ungrouped node must be probed"
     );
 
-    set.mark_group_active("g");
+    let _ = set.mark_group_active_slot("g");
     set.run_health_check_cycle(Duration::from_millis(200)).await;
     assert!(
         !set.get_probe_history(id(1), ProbeDomain::Tcp, IpVersion::V4)
             .is_empty(),
-        "active URLTest node must be probed"
+        "active node must be probed"
     );
 }
 
@@ -546,35 +587,53 @@ fn test_push_ebpf_uses_outbound_resolver() {
 }
 
 #[test]
-fn test_sync_urltest_groups_full_refresh() {
+fn test_sync_idle_groups_full_refresh() {
     let set = AliveDialerSet::new();
     for (i, n) in ["n1", "n2", "n3"].into_iter().enumerate() {
         set.register_node(id(i as u128 + 1), n.into(), "127.0.0.1:1".into());
     }
-    // Re-registering the same group twice duplicates the node→groups
-    // index; the full refresh must rebuild it cleanly.
-    set.register_urltest_group("g1", &[id(1)], Some(Duration::from_secs(10)));
-    set.register_urltest_group("g1", &[id(1)], Some(Duration::from_secs(10)));
-    set.register_urltest_group("g2", &[id(2)], Some(Duration::from_secs(20)));
-    set.mark_group_active("g1");
+    // Re-registering the same group is idempotent, and full refresh
+    // rebuilds the node→groups index cleanly.
+    set.sync_idle_groups(&[idle_reg(
+        "g1",
+        vec![id(1)],
+        Some(Duration::from_secs(10)),
+        IdleGroupKind::Automatic,
+    )]);
+    set.sync_idle_groups(&[
+        idle_reg(
+            "g1",
+            vec![id(1)],
+            Some(Duration::from_secs(10)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "g2",
+            vec![id(2)],
+            Some(Duration::from_secs(20)),
+            IdleGroupKind::Automatic,
+        ),
+    ]);
+    let _ = set.mark_group_active_slot("g1");
 
     // Reload: g1 survives with new members/timeout, g2 removed, g3 new.
-    set.sync_urltest_groups(&[
-        (
-            "g1".into(),
+    set.sync_idle_groups(&[
+        idle_reg(
+            "g1",
             vec![id(2), id(3)],
             Some(Duration::from_secs(30)),
+            IdleGroupKind::Automatic,
         ),
-        ("g3".into(), vec![id(1)], None),
+        idle_reg("g3", vec![id(1)], None, IdleGroupKind::Automatic),
     ]);
 
     // g1 keeps its activity timestamp (not idle despite the new 30s
     // timeout because it was just active).
-    assert!(!set.is_urltest_group_idle("g1"));
+    assert!(!set.is_group_idle("g1"));
     // g2 is gone → treated as unregistered (never idle).
-    assert!(!set.is_urltest_group_idle("g2"));
+    assert!(!set.is_group_idle("g2"));
     // g3 registered with the default timeout, never active → idle.
-    assert!(set.is_urltest_group_idle("g3"));
+    assert!(set.is_group_idle("g3"));
 
     // Node → groups index rebuilt: n1 now belongs only to g3, n2/n3 to g1.
     assert!(set.is_probe_suspended(id(1))); // g3 idle
@@ -582,8 +641,8 @@ fn test_sync_urltest_groups_full_refresh() {
     assert!(!set.is_probe_suspended(id(3))); // g1 active
 
     // Wake-up membership follows the new table.
-    set.sync_urltest_groups(&[("g3".into(), vec![id(1)], None)]);
-    assert!(!set.is_urltest_group_idle("g1")); // removed → never idle
+    set.sync_idle_groups(&[idle_reg("g3", vec![id(1)], None, IdleGroupKind::Automatic)]);
+    assert!(!set.is_group_idle("g1")); // removed → never idle
     assert!(!set.is_probe_suspended(id(2))); // no groups → not suspended
 }
 struct MockHttpProber {
@@ -979,7 +1038,7 @@ async fn removed_node_discards_collections_and_late_probe_results() {
         assert!(!set.node_registered_at.read().contains_key(&node));
         assert!(!set.last_emergency_tcp.lock().contains_key(&node));
         assert!(!set.last_emergency_udp.lock().contains_key(&node));
-        assert!(!set.trigger_pending.lock().contains(&node));
+        assert!(!set.trigger_pending.lock().contains_key(&node));
 
         if re_register {
             // Identical metadata is a different registration, not the old owner.
@@ -2706,4 +2765,1266 @@ async fn health_shutdown_deadline_joins_blocking_resolver_before_returning_error
         };
         assert!(matches!(set.acquire_health_probe(), Err(error) if error == expected));
     }
+}
+#[test]
+fn test_idle_timeout_zero_suppresses_per_selection_probe_storm() {
+    let set = AliveDialerSet::new();
+    let zero_node = id(101);
+    let timed_node = id(102);
+    set.register_node(zero_node, "zero".into(), "127.0.0.1:1".into());
+    set.register_node(timed_node, "timed".into(), "127.0.0.1:1".into());
+    set.sync_idle_groups(&[
+        idle_reg(
+            "zero",
+            vec![zero_node],
+            Some(Duration::ZERO),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "timed",
+            vec![timed_node],
+            Some(Duration::from_secs(60)),
+            IdleGroupKind::Automatic,
+        ),
+    ]);
+    let mut trigger_rx = set.take_trigger_rx().expect("trigger receiver");
+
+    for _ in 0..10 {
+        let _ = set.mark_group_active_slot("zero");
+    }
+    assert!(set.is_group_idle("zero"));
+    assert!(set.is_probe_suspended(zero_node));
+    assert!(trigger_rx.try_recv().is_err());
+
+    let _ = set.mark_group_active_slot("timed");
+    assert!(!set.is_group_idle("timed"));
+    assert_eq!(trigger_rx.try_recv(), Ok(timed_node));
+    set.finish_trigger_probe(timed_node);
+    for _ in 0..10 {
+        let _ = set.mark_group_active_slot("timed");
+    }
+    assert!(trigger_rx.try_recv().is_err());
+}
+
+#[test]
+fn test_replace_selected_nodes_returns_newly_added_idle_nodes_and_remove_cleans_up() {
+    let set = Arc::new(AliveDialerSet::new());
+    let (idle_a, idle_b, active_n, ungrouped) = (id(111), id(112), id(113), id(114));
+    for (node, name) in [
+        (idle_a, "idle_a"),
+        (idle_b, "idle_b"),
+        (active_n, "active_n"),
+        (ungrouped, "ungrouped"),
+    ] {
+        set.register_node(node, name.into(), "127.0.0.1:1".into());
+    }
+    set.sync_idle_groups(&[
+        idle_reg(
+            "g_idle",
+            vec![idle_a, idle_b],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "g_active",
+            vec![active_n],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+    ]);
+    let _ = set.mark_group_active_slot("g_active");
+
+    // `set_selected_nodes` is gone: its return was replace + the idle filter.
+    let added = set.replace_selected_nodes(HashSet::from([idle_a, active_n, ungrouped]));
+    let woken: Vec<Uuid> = added
+        .into_iter()
+        .filter(|id| set.is_groups_idle_for_node(*id))
+        .collect();
+    assert_eq!(woken, vec![idle_a]);
+    assert!(!set.is_probe_suspended(idle_a));
+    assert!(set.is_probe_suspended(idle_b));
+
+    let added = set.replace_selected_nodes(HashSet::from([idle_a, idle_b]));
+    let woken: Vec<Uuid> = added
+        .into_iter()
+        .filter(|id| set.is_groups_idle_for_node(*id))
+        .collect();
+    assert_eq!(woken, vec![idle_b]);
+    assert!(!set.is_probe_suspended(idle_a));
+    assert!(!set.is_probe_suspended(idle_b));
+
+    let added = set.replace_selected_nodes(HashSet::from([idle_b]));
+    let woken: Vec<Uuid> = added
+        .into_iter()
+        .filter(|id| set.is_groups_idle_for_node(*id))
+        .collect();
+    assert!(woken.is_empty());
+    assert!(set.is_probe_suspended(idle_a));
+    assert!(!set.is_probe_suspended(idle_b));
+
+    // Removing a selected node must drop its selected_nodes and idle_groups state.
+    set.remove_node(idle_b);
+    set.register_node(idle_b, "idle_b".into(), "127.0.0.1:1".into());
+    // Full refresh: list every surviving group (`remove_node` already pruned
+    // idle_b from g_idle's members).
+    set.sync_idle_groups(&[
+        idle_reg(
+            "g_idle",
+            vec![idle_a],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "g_active",
+            vec![active_n],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "g_re",
+            vec![idle_b],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+    ]);
+    assert!(set.is_probe_suspended(idle_b));
+
+    // Concurrent updates must stay consistent without lost writes or panics.
+    let threads: Vec<_> = (0..4)
+        .map(|worker| {
+            let set = Arc::clone(&set);
+            std::thread::spawn(move || {
+                for step in 0..100 {
+                    let target = if (worker + step) % 2 == 0 {
+                        idle_a
+                    } else {
+                        idle_b
+                    };
+                    let _ = set.replace_selected_nodes(HashSet::from([target]));
+                }
+            })
+        })
+        .collect();
+    for handle in threads {
+        handle.join().unwrap();
+    }
+    let selected_count =
+        usize::from(!set.is_probe_suspended(idle_a)) + usize::from(!set.is_probe_suspended(idle_b));
+    assert_eq!(selected_count, 1);
+}
+
+struct RecordingHttpProber {
+    calls: Arc<Mutex<Vec<(Uuid, String)>>>,
+}
+
+impl HttpProber for RecordingHttpProber {
+    fn probe_http(
+        &self,
+        node_id: Uuid,
+        _addr: std::net::SocketAddr,
+        url: &str,
+        _timeout: Duration,
+        _cancel: ProbeCancellation,
+    ) -> Pin<Box<dyn Future<Output = HttpProbeOutcome> + Send + 'static>> {
+        self.calls.lock().push((node_id, url.to_owned()));
+        Box::pin(async { HttpProbeResult::WarmSuccess(Duration::from_millis(5)).into() })
+    }
+}
+
+struct RecordingUdpProber {
+    calls: Arc<Mutex<Vec<Uuid>>>,
+}
+
+impl UdpProber for RecordingUdpProber {
+    fn probe_udp(
+        &self,
+        node_id: Uuid,
+        _timeout: Duration,
+        _cancel: ProbeCancellation,
+    ) -> Pin<Box<dyn Future<Output = UdpProbeOutcome> + Send + 'static>> {
+        self.calls.lock().push(node_id);
+        Box::pin(async {
+            UdpProbeOutcome {
+                dns: Some(Ok(Duration::from_millis(5))),
+                data_path: None,
+                observations: [None, None],
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn test_idle_recovery_targets_only_unreachable_automatic_groups() {
+    let set = Arc::new(AliveDialerSet::new());
+    let tcp_calls = Arc::new(Mutex::new(Vec::new()));
+    let udp_calls = Arc::new(Mutex::new(Vec::new()));
+    set.set_http_probe(
+        Arc::new(RecordingHttpProber {
+            calls: Arc::clone(&tcp_calls),
+        }),
+        "http://127.0.0.1/".into(),
+        "HEAD".into(),
+    )
+    .await;
+    set.set_udp_probe(Arc::new(RecordingUdpProber {
+        calls: Arc::clone(&udp_calls),
+    }));
+
+    let (v4_only, dns_blocked, dead_sib, alive_sib, sel_dead, all_dead) =
+        (id(201), id(202), id(203), id(204), id(205), id(206));
+    for (node, name) in [
+        (v4_only, "v4_only"),
+        (dns_blocked, "dns_blocked"),
+        (dead_sib, "dead_sib"),
+        (alive_sib, "alive_sib"),
+        (sel_dead, "sel_dead"),
+        (all_dead, "all_dead"),
+    ] {
+        set.register_node(node, name.into(), "127.0.0.1:1".into());
+    }
+    set.sync_idle_groups(&[
+        idle_reg(
+            "g_v4",
+            vec![v4_only],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "g_dns",
+            vec![dns_blocked],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "g_partial",
+            vec![dead_sib, alive_sib],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "g_sel",
+            vec![sel_dead],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Selector,
+        ),
+        idle_reg(
+            "g_dead",
+            vec![all_dead],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+    ]);
+
+    let kill_ready = |node: Uuid, domain: ProbeDomain, ipver: IpVersion| {
+        set.report_unavailable_forced(node, domain, ipver);
+        let mut states = set.states.write();
+        let entry = &mut states.get_mut(&node).unwrap()[alive_index(domain, ipver)];
+        entry.consecutive_successes = RECOVERY_SUCCESSES_NEEDED - 1;
+        entry.cooldown_until = Instant::now();
+    };
+
+    // IPv4-only: V6 dead, V4 alive.
+    kill_ready(v4_only, ProbeDomain::Tcp, IpVersion::V6);
+    // DNS-UDP blocked: DnsUdp dead, DataUdp alive.
+    kill_ready(dns_blocked, ProbeDomain::DnsUdp, IpVersion::V4);
+    kill_ready(dns_blocked, ProbeDomain::DnsUdp, IpVersion::V6);
+    // Partial-dead group and unselected Selector: both families dead on TCP and DataUdp.
+    for node in [dead_sib, sel_dead, all_dead] {
+        for domain in [ProbeDomain::Tcp, ProbeDomain::DataUdp] {
+            for ipver in [IpVersion::V4, IpVersion::V6] {
+                kill_ready(node, domain, ipver);
+            }
+        }
+    }
+
+    set.run_recovery_check_cycle_concurrent(Duration::from_secs(1), 4)
+        .await;
+
+    let probed_tcp: Vec<Uuid> = tcp_calls.lock().iter().map(|(id, _)| *id).collect();
+    let probed_udp: Vec<Uuid> = udp_calls.lock().clone();
+    assert_eq!(probed_tcp, vec![all_dead]);
+    assert_eq!(probed_udp, vec![all_dead]);
+    assert!(set.is_alive_for(all_dead, ProbeDomain::Tcp, IpVersion::V4));
+    assert!(set.is_alive_for(all_dead, ProbeDomain::DataUdp, IpVersion::V4));
+}
+
+#[tokio::test]
+async fn test_custom_check_url_idle_recovery_and_pinned_exemption() {
+    let set = Arc::new(AliveDialerSet::new());
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    set.set_http_probe(
+        Arc::new(RecordingHttpProber {
+            calls: Arc::clone(&calls),
+        }),
+        "http://127.0.0.1/global".into(),
+        "HEAD".into(),
+    )
+    .await;
+
+    let (dead_a, dead_b, part_dead, part_alive, pin_node, pin_other) =
+        (id(211), id(212), id(213), id(214), id(215), id(216));
+    for (node, name) in [
+        (dead_a, "dead_a"),
+        (dead_b, "dead_b"),
+        (part_dead, "part_dead"),
+        (part_alive, "part_alive"),
+        (pin_node, "pin_node"),
+        (pin_other, "pin_other"),
+    ] {
+        set.register_node(node, name.into(), "127.0.0.1:1".into());
+    }
+    set.sync_idle_groups(&[
+        idle_reg(
+            "g_dead",
+            vec![dead_a, dead_b],
+            Some(Duration::ZERO),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "g_partial",
+            vec![part_dead, part_alive],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "g_pinned",
+            vec![pin_node, pin_other],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "g_shared_unpinned",
+            vec![pin_node],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+    ]);
+    let (url_dead, url_partial, url_pinned, url_other) = (
+        "http://127.0.0.1/dead",
+        "http://127.0.0.1/partial",
+        "http://127.0.0.1/pinned",
+        "http://127.0.0.1/other",
+    );
+    set.sync_group_check_urls(&[
+        ("g_dead".into(), url_dead.into()),
+        ("g_partial".into(), url_partial.into()),
+        ("g_pinned".into(), url_pinned.into()),
+        ("g_shared_unpinned".into(), url_other.into()),
+    ]);
+    let member = |tag: &str, leaf: Uuid| UrlProbeMember {
+        tag: tag.to_owned(),
+        leaf,
+        native: None,
+    };
+    set.set_url_member_resolver(Some(Arc::new(move |group| match group {
+        "g_dead" => vec![member("dead_a", dead_a), member("dead_b", dead_b)],
+        "g_partial" => vec![
+            member("part_dead", part_dead),
+            member("part_alive", part_alive),
+        ],
+        "g_pinned" => vec![member("pin_node", pin_node), member("pin_other", pin_other)],
+        "g_shared_unpinned" => vec![member("pin_node", pin_node)],
+        _ => Vec::new(),
+    })));
+    set.replace_pinned_url_members(HashMap::from([(
+        "g_pinned".into(),
+        HashSet::from(["pin_node".into()]),
+    )]));
+
+    // Periodic cycle probes only the pinned member in its own custom-URL group.
+    set.run_health_check_cycle_concurrent(Duration::from_secs(1), 4)
+        .await;
+    assert_eq!(
+        calls.lock().as_slice(),
+        &[(pin_node, url_pinned.to_owned())]
+    );
+    calls.lock().clear();
+
+    let kill_url_ready = |tag: &str, url: &str| {
+        for _ in 0..probe_failure_threshold(ProbeDomain::Tcp) {
+            set.record_url_probe_failure(tag, url);
+        }
+        let mut states = set.url_states.write();
+        let entry = states.get_mut(&(tag.to_owned(), url.to_owned())).unwrap();
+        entry.consecutive_successes = RECOVERY_SUCCESSES_NEEDED - 1;
+        entry.cooldown_until = Instant::now();
+    };
+    kill_url_ready("dead_a", url_dead);
+    kill_url_ready("dead_b", url_dead);
+    kill_url_ready("part_dead", url_partial);
+    kill_url_ready("pin_node", url_pinned);
+
+    // Recovery revives the all-dead (idle_timeout=0) group and the dead pinned
+    // member, while skipping the partial-dead idle group and unrelated group.
+    set.run_recovery_check_cycle_concurrent(Duration::from_secs(1), 4)
+        .await;
+    let mut probed: Vec<_> = calls.lock().clone();
+    probed.sort();
+    let mut expected = vec![
+        (dead_a, url_dead.to_owned()),
+        (dead_b, url_dead.to_owned()),
+        (pin_node, url_pinned.to_owned()),
+    ];
+    expected.sort();
+    assert_eq!(probed, expected);
+    assert!(set.is_alive_for_url("dead_a", url_dead));
+    assert!(set.is_alive_for_url("dead_b", url_dead));
+    assert!(set.is_alive_for_url("pin_node", url_pinned));
+    assert!(!set.is_alive_for_url("part_dead", url_partial));
+}
+
+#[test]
+fn test_notify_network_change_skips_healthy_idle_nodes_and_resets_url_backoff() {
+    let set = AliveDialerSet::new();
+    let mut idle_members = Vec::new();
+    for index in 0..300u128 {
+        let node = id(1000 + index);
+        set.register_node(node, format!("idle-{index}"), "127.0.0.1:1".into());
+        idle_members.push(node);
+    }
+    let active_node = id(2001);
+    let selected_node = id(2002);
+    let all_dead_node = id(2003);
+    for (node, name) in [
+        (active_node, "active"),
+        (selected_node, "selected"),
+        (all_dead_node, "all_dead"),
+    ] {
+        set.register_node(node, name.into(), "127.0.0.1:1".into());
+    }
+    set.sync_idle_groups(&[
+        idle_reg(
+            "g_idle",
+            idle_members.clone(),
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "g_active",
+            vec![active_node],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "g_sel",
+            vec![selected_node],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Selector,
+        ),
+        idle_reg(
+            "g_dead",
+            vec![all_dead_node],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+    ]);
+    let _ = set.mark_group_active_slot("g_active");
+    let _ = set.replace_selected_nodes(HashSet::from([selected_node]));
+    for ipver in [IpVersion::V4, IpVersion::V6] {
+        set.report_unavailable_forced(all_dead_node, ProbeDomain::Tcp, ipver);
+    }
+    // Give both a suspended node and a custom check_url state a future backoff.
+    let future = Instant::now() + Duration::from_secs(300);
+    set.states.write().get_mut(&idle_members[0]).unwrap()
+        [alive_index(ProbeDomain::Tcp, IpVersion::V4)]
+    .cooldown_until = future;
+    set.record_url_probe_failure("tag", "http://127.0.0.1/custom");
+    set.url_states
+        .write()
+        .get_mut(&("tag".into(), "http://127.0.0.1/custom".into()))
+        .unwrap()
+        .cooldown_until = future;
+    assert!(!set.should_probe(idle_members[0], ProbeDomain::Tcp, IpVersion::V4));
+    assert!(!set.should_probe_url("tag", "http://127.0.0.1/custom"));
+
+    let mut trigger_rx = set.take_trigger_rx().expect("trigger receiver");
+    // Drain the earlier mark_group_active_slot wake for active_node.
+    while trigger_rx.try_recv().is_ok() {}
+    set.finish_trigger_probe(active_node);
+
+    set.notify_network_change();
+
+    assert!(set.should_probe(idle_members[0], ProbeDomain::Tcp, IpVersion::V4));
+    assert!(set.should_probe_url("tag", "http://127.0.0.1/custom"));
+    let mut queued = HashSet::new();
+    while let Ok(node) = trigger_rx.try_recv() {
+        queued.insert(node);
+    }
+    assert_eq!(
+        queued,
+        HashSet::from([active_node, selected_node, all_dead_node])
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_mark_group_active_wakes_custom_url_async_and_respects_zero_timeout_and_builtins() {
+    use honk_config::config::{BLOCK_NODE_ID, DIRECT_NODE_ID};
+    use std::sync::atomic::AtomicBool;
+
+    let set = Arc::new(AliveDialerSet::new());
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    set.set_http_probe(
+        Arc::new(RecordingHttpProber {
+            calls: Arc::clone(&calls),
+        }),
+        "http://127.0.0.1/global".into(),
+        "HEAD".into(),
+    )
+    .await;
+
+    let (direct_member, sub_leaf) = (id(221), id(222));
+
+    // Direct trigger-queue check: mark_group_active_slot must queue only non-builtin
+    // members and never enqueue DIRECT_NODE_ID or BLOCK_NODE_ID.
+    {
+        let queue_set = AliveDialerSet::new();
+        queue_set.sync_idle_groups(&[IdleGroupRegistration {
+            name: "custom_auto".into(),
+            members: vec![direct_member, DIRECT_NODE_ID, BLOCK_NODE_ID],
+            idle_timeout: Some(Duration::from_secs(3600)),
+            kind: IdleGroupKind::Automatic,
+            tcp_recovery_members: vec![direct_member],
+            udp_recovery_members: vec![direct_member],
+        }]);
+        let mut trigger_rx = queue_set.take_trigger_rx().expect("trigger receiver");
+        let _ = queue_set.mark_group_active_slot("custom_auto");
+        let mut queued = Vec::new();
+        while let Ok(node) = trigger_rx.try_recv() {
+            queued.push(node);
+        }
+        assert_eq!(
+            queued,
+            vec![direct_member],
+            "mark_group_active_slot must queue only direct proxy members, never builtins"
+        );
+    }
+
+    set.register_node(direct_member, "direct_m".into(), "127.0.0.1:1".into());
+    set.register_node(sub_leaf, "sub_leaf".into(), "127.0.0.1:1".into());
+    set.register_node(DIRECT_NODE_ID, "direct".into(), String::new());
+    set.register_node(BLOCK_NODE_ID, "block".into(), String::new());
+
+    let url = "http://127.0.0.1/custom-wake";
+    set.sync_idle_groups(&[IdleGroupRegistration {
+        name: "custom_auto".into(),
+        members: vec![direct_member, DIRECT_NODE_ID, BLOCK_NODE_ID],
+        idle_timeout: Some(Duration::from_secs(3600)),
+        kind: IdleGroupKind::Automatic,
+        tcp_recovery_members: vec![direct_member, sub_leaf],
+        udp_recovery_members: vec![direct_member, sub_leaf],
+    }]);
+    set.sync_group_check_urls(&[("custom_auto".into(), url.into())]);
+
+    let forbid_sync_resolver = Arc::new(AtomicBool::new(false));
+    let resolver_flag = Arc::clone(&forbid_sync_resolver);
+    set.set_url_member_resolver(Some(Arc::new(move |group| {
+        assert!(
+            !resolver_flag.load(Ordering::Acquire),
+            "mark_group_active_slot must never call url_member_resolver synchronously"
+        );
+        if group == "custom_auto" {
+            vec![
+                UrlProbeMember {
+                    tag: "direct_m".into(),
+                    leaf: direct_member,
+                    native: None,
+                },
+                UrlProbeMember {
+                    tag: "sub".into(),
+                    leaf: sub_leaf,
+                    native: None,
+                },
+            ]
+        } else {
+            Vec::new()
+        }
+    })));
+
+    // Give subgroup custom-URL state a future cooldown before wake.
+    set.record_url_probe_failure("sub", url);
+    set.url_states
+        .write()
+        .get_mut(&("sub".into(), url.into()))
+        .unwrap()
+        .cooldown_until = Instant::now() + Duration::from_secs(300);
+    assert!(!set.should_probe_url("sub", url));
+
+    let loop_task = set.spawn_health_check_loop_concurrent(
+        Duration::from_secs(3600),
+        Duration::from_secs(1),
+        2,
+    );
+    // Advance past initial stagger jitter while idle so periodic ticker is 3600s away.
+    tokio::time::advance(Duration::from_secs(6)).await;
+    tokio::task::yield_now().await;
+    assert!(calls.lock().is_empty());
+
+    // Activating the group resets custom-URL cooldown and queues async wake without
+    // invoking url_member_resolver synchronously or waking builtins.
+    forbid_sync_resolver.store(true, Ordering::Release);
+    let _ = set.mark_group_active_slot("custom_auto");
+    forbid_sync_resolver.store(false, Ordering::Release);
+    assert!(set.should_probe_url("sub", url));
+
+    let mut woke = false;
+    for _ in 0..20 {
+        {
+            let recorded = calls.lock();
+            if recorded
+                .iter()
+                .any(|(id, u)| *id == direct_member && u == "http://127.0.0.1/global")
+                && recorded
+                    .iter()
+                    .any(|(id, u)| *id == direct_member && u == url)
+                && recorded.iter().any(|(id, u)| *id == sub_leaf && u == url)
+            {
+                woke = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        woke,
+        "async custom-URL wake must probe both direct and subgroup members before periodic tick"
+    );
+
+    set.shutdown_health_checks().await.unwrap();
+    loop_task.await.unwrap();
+
+    // After draining all emergency workers: each member must be probed against
+    // the custom check_url exactly once (no duplicate probe bypassing hysteresis).
+    {
+        let recorded = calls.lock();
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|(id, u)| *id == direct_member && u == url)
+                .count(),
+            1,
+            "direct member must be probed exactly once against custom check_url on wake"
+        );
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|(id, u)| *id == sub_leaf && u == url)
+                .count(),
+            1,
+            "subgroup member must be probed exactly once against custom check_url on wake"
+        );
+    }
+
+    // Hot-reloading an active group to idle_timeout=0 clears its activity timestamp,
+    // so reloading back to a positive timeout stays idle rather than resurrecting it.
+    assert!(!set.is_group_idle("custom_auto"));
+    set.sync_idle_groups(&[idle_reg(
+        "custom_auto",
+        vec![direct_member],
+        Some(Duration::ZERO),
+        IdleGroupKind::Automatic,
+    )]);
+    assert!(set.is_group_idle("custom_auto"));
+    set.sync_idle_groups(&[idle_reg(
+        "custom_auto",
+        vec![direct_member],
+        Some(Duration::from_secs(1800)),
+        IdleGroupKind::Automatic,
+    )]);
+    assert!(set.is_group_idle("custom_auto"));
+}
+
+#[tokio::test]
+async fn test_idle_recovery_matches_datapath_reachability() {
+    use honk_config::config::{BLOCK_NODE_ID, DIRECT_NODE_ID};
+
+    let set = Arc::new(AliveDialerSet::new());
+    let tcp_calls = Arc::new(Mutex::new(Vec::new()));
+    let udp_calls = Arc::new(Mutex::new(Vec::new()));
+    set.set_http_probe(
+        Arc::new(RecordingHttpProber {
+            calls: Arc::clone(&tcp_calls),
+        }),
+        "http://127.0.0.1/".into(),
+        "HEAD".into(),
+    )
+    .await;
+    set.set_udp_probe(Arc::new(RecordingUdpProber {
+        calls: Arc::clone(&udp_calls),
+    }));
+
+    let (tcp_only, udp_dead, v4_dead_v6_alive, v4_alive_v6_dead, zero_proxy, dead_direct, sub_leaf) = (
+        id(231),
+        id(232),
+        id(233),
+        id(234),
+        id(235),
+        id(236),
+        id(237),
+    );
+    for (node, name) in [
+        (tcp_only, "tcp_only"),
+        (udp_dead, "udp_dead"),
+        (v4_dead_v6_alive, "v4_dead_v6_alive"),
+        (v4_alive_v6_dead, "v4_alive_v6_dead"),
+        (zero_proxy, "zero_proxy"),
+        (dead_direct, "dead_direct"),
+        (sub_leaf, "sub_leaf"),
+    ] {
+        set.register_node(node, name.into(), "127.0.0.1:1".into());
+    }
+    set.register_node(DIRECT_NODE_ID, "direct".into(), String::new());
+    set.register_node(BLOCK_NODE_ID, "block".into(), String::new());
+
+    set.sync_idle_groups(&[
+        // Mixed TCP-only + UDP-capable group: UDP recovery must ignore TCP-only node.
+        IdleGroupRegistration {
+            name: "g_mixed".into(),
+            members: vec![tcp_only, udp_dead],
+            idle_timeout: Some(Duration::from_secs(3600)),
+            kind: IdleGroupKind::Automatic,
+            tcp_recovery_members: vec![tcp_only, udp_dead],
+            udp_recovery_members: vec![udp_dead],
+        },
+        // IPv4-dead / IPv6-alive: TC closes (domain, V4), so V4 must recover.
+        idle_reg(
+            "g_v4_dead",
+            vec![v4_dead_v6_alive],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        // IPv4-alive / IPv6-dead: TC allows V6→V4 fallback, so stays silent.
+        idle_reg(
+            "g_v6_dead",
+            vec![v4_alive_v6_dead],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        // idle_timeout=0 with final: direct/block: builtins excluded from recovery liveness.
+        IdleGroupRegistration {
+            name: "g_zero_final".into(),
+            members: vec![zero_proxy, DIRECT_NODE_ID, BLOCK_NODE_ID],
+            idle_timeout: Some(Duration::ZERO),
+            kind: IdleGroupKind::Automatic,
+            tcp_recovery_members: vec![zero_proxy, DIRECT_NODE_ID],
+            udp_recovery_members: vec![zero_proxy, BLOCK_NODE_ID],
+        },
+        // Dead direct member + alive subgroup leaf: stays silent until subgroup also dies.
+        IdleGroupRegistration {
+            name: "g_parent".into(),
+            members: vec![dead_direct],
+            idle_timeout: Some(Duration::from_secs(3600)),
+            kind: IdleGroupKind::Automatic,
+            tcp_recovery_members: vec![dead_direct, sub_leaf],
+            udp_recovery_members: vec![dead_direct, sub_leaf],
+        },
+        idle_reg(
+            "g_sub",
+            vec![sub_leaf],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+    ]);
+
+    let kill_ready = |node: Uuid, domain: ProbeDomain, ipver: IpVersion| {
+        set.report_unavailable_forced(node, domain, ipver);
+        let mut states = set.states.write();
+        let entry = &mut states.get_mut(&node).unwrap()[alive_index(domain, ipver)];
+        entry.consecutive_successes = RECOVERY_SUCCESSES_NEEDED - 1;
+        entry.cooldown_until = Instant::now();
+    };
+
+    kill_ready(udp_dead, ProbeDomain::DataUdp, IpVersion::V4);
+    kill_ready(v4_dead_v6_alive, ProbeDomain::Tcp, IpVersion::V4);
+    kill_ready(v4_dead_v6_alive, ProbeDomain::DataUdp, IpVersion::V4);
+    kill_ready(v4_alive_v6_dead, ProbeDomain::Tcp, IpVersion::V6);
+    kill_ready(v4_alive_v6_dead, ProbeDomain::DataUdp, IpVersion::V6);
+    kill_ready(zero_proxy, ProbeDomain::Tcp, IpVersion::V4);
+    kill_ready(zero_proxy, ProbeDomain::DataUdp, IpVersion::V4);
+    kill_ready(dead_direct, ProbeDomain::Tcp, IpVersion::V4);
+    kill_ready(dead_direct, ProbeDomain::DataUdp, IpVersion::V4);
+
+    set.run_recovery_check_cycle_concurrent(Duration::from_secs(1), 4)
+        .await;
+
+    let probed_tcp: HashSet<Uuid> = tcp_calls.lock().iter().map(|(id, _)| *id).collect();
+    let probed_udp: HashSet<Uuid> = udp_calls.lock().iter().copied().collect();
+    assert_eq!(probed_tcp, HashSet::from([v4_dead_v6_alive, zero_proxy]));
+    assert_eq!(
+        probed_udp,
+        HashSet::from([udp_dead, v4_dead_v6_alive, zero_proxy])
+    );
+    assert!(set.is_alive_for(udp_dead, ProbeDomain::DataUdp, IpVersion::V4));
+    assert!(set.is_alive_for(v4_dead_v6_alive, ProbeDomain::Tcp, IpVersion::V4));
+    assert!(set.is_alive_for(zero_proxy, ProbeDomain::Tcp, IpVersion::V4));
+    assert!(!set.is_alive_for(dead_direct, ProbeDomain::Tcp, IpVersion::V4));
+
+    // Once the subgroup leaf also dies on V4, both parent's direct member and subgroup recover.
+    tcp_calls.lock().clear();
+    udp_calls.lock().clear();
+    kill_ready(sub_leaf, ProbeDomain::Tcp, IpVersion::V4);
+    kill_ready(sub_leaf, ProbeDomain::DataUdp, IpVersion::V4);
+    set.run_recovery_check_cycle_concurrent(Duration::from_secs(1), 4)
+        .await;
+    let probed_tcp: HashSet<Uuid> = tcp_calls.lock().iter().map(|(id, _)| *id).collect();
+    let probed_udp: HashSet<Uuid> = udp_calls.lock().iter().copied().collect();
+    assert_eq!(probed_tcp, HashSet::from([dead_direct, sub_leaf]));
+    assert_eq!(probed_udp, HashSet::from([dead_direct, sub_leaf]));
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_emergency_trigger_and_network_change_recover_all_dead_custom_check_url_group() {
+    let set = Arc::new(AliveDialerSet::new());
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    set.set_http_probe(
+        Arc::new(RecordingHttpProber {
+            calls: Arc::clone(&calls),
+        }),
+        "http://127.0.0.1/global".into(),
+        "HEAD".into(),
+    )
+    .await;
+
+    let (dead_a, dead_b, part_dead, part_alive) = (id(241), id(242), id(243), id(244));
+    for (node, name) in [
+        (dead_a, "dead_a"),
+        (dead_b, "dead_b"),
+        (part_dead, "part_dead"),
+        (part_alive, "part_alive"),
+    ] {
+        set.register_node(node, name.into(), "127.0.0.1:1".into());
+    }
+    let url_dead = "http://127.0.0.1/zero-all-dead";
+    let url_partial = "http://127.0.0.1/partial-idle";
+    set.sync_idle_groups(&[
+        idle_reg(
+            "g_zero_dead",
+            vec![dead_a, dead_b],
+            Some(Duration::ZERO),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "g_partial",
+            vec![part_dead, part_alive],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+    ]);
+    set.sync_group_check_urls(&[
+        ("g_zero_dead".into(), url_dead.into()),
+        ("g_partial".into(), url_partial.into()),
+    ]);
+    let member = |tag: &str, leaf: Uuid| UrlProbeMember {
+        tag: tag.to_owned(),
+        leaf,
+        native: None,
+    };
+    set.set_url_member_resolver(Some(Arc::new(move |group| match group {
+        "g_zero_dead" => vec![member("dead_a", dead_a), member("dead_b", dead_b)],
+        "g_partial" => vec![
+            member("part_dead", part_dead),
+            member("part_alive", part_alive),
+        ],
+        _ => Vec::new(),
+    })));
+
+    let loop_task = set.spawn_health_check_loop_concurrent(
+        Duration::from_secs(3600),
+        Duration::from_secs(1),
+        2,
+    );
+    tokio::time::advance(Duration::from_secs(6)).await;
+    tokio::task::yield_now().await;
+    assert!(calls.lock().is_empty());
+
+    let kill_url = |tag: &str, url: &str| {
+        for _ in 0..probe_failure_threshold(ProbeDomain::Tcp) {
+            set.record_url_probe_failure(tag, url);
+        }
+        let mut states = set.url_states.write();
+        let entry = states.get_mut(&(tag.to_owned(), url.to_owned())).unwrap();
+        entry.consecutive_successes = RECOVERY_SUCCESSES_NEEDED - 1;
+        entry.cooldown_until = Instant::now() + Duration::from_secs(300);
+    };
+
+    // Part A: emergency trigger_probe (probe_unavailable_group path) recovers an all-dead
+    // unpinned idle_timeout=0 custom-URL group, while skipping a partially-dead idle group.
+    kill_url("dead_a", url_dead);
+    kill_url("dead_b", url_dead);
+    kill_url("part_dead", url_partial);
+
+    set.trigger_probe(dead_a);
+    set.trigger_probe(part_dead);
+    let mut recovered = false;
+    for _ in 0..20 {
+        if set.is_alive_for_url("dead_a", url_dead) {
+            recovered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        recovered,
+        "emergency trigger must probe all-dead unpinned idle_timeout=0 custom-URL group"
+    );
+    assert!(
+        !calls.lock().iter().any(|(_, url)| url == url_partial),
+        "emergency trigger must not probe partially-dead unpinned idle custom-URL group"
+    );
+
+    // Part B: notify_network_change immediately wakes an all-dead custom-URL group even
+    // when global TCP state is alive, without waking partially-dead idle custom-URL groups.
+    calls.lock().clear();
+    kill_url("dead_a", url_dead);
+    kill_url("dead_b", url_dead);
+    set.notify_network_change();
+    let mut both_recovered = false;
+    for _ in 0..20 {
+        if set.is_alive_for_url("dead_a", url_dead) && set.is_alive_for_url("dead_b", url_dead) {
+            both_recovered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        both_recovered,
+        "notify_network_change must immediately wake all-dead idle custom-URL groups"
+    );
+    assert!(
+        !calls.lock().iter().any(|(_, url)| url == url_partial),
+        "notify_network_change must keep partially-dead unpinned idle custom-URL groups silent"
+    );
+
+    // Part C: when both global TCP and custom check_url are dead, notify_network_change
+    // wakes global TCP and custom check_url once each (no duplicate custom-URL probes).
+    calls.lock().clear();
+    for node in [dead_a, dead_b] {
+        set.report_unavailable_forced(node, ProbeDomain::Tcp, IpVersion::V4);
+    }
+    kill_url("dead_a", url_dead);
+    kill_url("dead_b", url_dead);
+    set.notify_network_change();
+    let mut both_probed = false;
+    for _ in 0..20 {
+        {
+            let recorded = calls.lock();
+            if recorded
+                .iter()
+                .any(|(id, u)| *id == dead_a && u == "http://127.0.0.1/global")
+                && recorded
+                    .iter()
+                    .any(|(id, u)| *id == dead_b && u == "http://127.0.0.1/global")
+                && set.is_alive_for_url("dead_a", url_dead)
+                && set.is_alive_for_url("dead_b", url_dead)
+            {
+                both_probed = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        both_probed,
+        "notify_network_change must probe both global TCP and custom check_url when both are dead"
+    );
+
+    set.shutdown_health_checks().await.unwrap();
+    loop_task.await.unwrap();
+
+    let recorded = calls.lock();
+    assert_eq!(
+        recorded
+            .iter()
+            .filter(|(id, u)| *id == dead_a && u == url_dead)
+            .count(),
+        1,
+        "notify_network_change must probe dead_a against custom check_url exactly once"
+    );
+    assert_eq!(
+        recorded
+            .iter()
+            .filter(|(id, u)| *id == dead_b && u == url_dead)
+            .count(),
+        1,
+        "notify_network_change must probe dead_b against custom check_url exactly once"
+    );
+}
+
+#[tokio::test]
+async fn test_idle_activity_slot_fast_path_coarse_clock_and_generation_invalidation() {
+    let set = AliveDialerSet::new();
+    let n1 = id(251);
+    set.register_node(n1, "n1".into(), "127.0.0.1:1".into());
+
+    // 1. Sub-second exact clock: fast path refreshes active slot without waking,
+    //    then returns false once expired so slow path wakes the group.
+    set.sync_idle_groups(&[idle_reg(
+        "g",
+        vec![n1],
+        Some(Duration::from_millis(80)),
+        IdleGroupKind::Automatic,
+    )]);
+    let mut trigger_rx = set.take_trigger_rx().expect("trigger receiver");
+    let slot_exact = set.mark_group_active_slot("g").expect("registered slot");
+    assert_eq!(trigger_rx.try_recv(), Ok(n1));
+    set.finish_trigger_probe(n1);
+    assert!(!set.is_group_idle("g"));
+    assert!(set.try_touch_activity_slot(&slot_exact));
+    assert!(trigger_rx.try_recv().is_err());
+
+    // Sleep past refresh_quantum_ns (20ms) while still < timeout (80ms) to exercise CAS refresh.
+    let before = slot_exact.last_active_ns.load(Ordering::Acquire);
+    tokio::time::sleep(Duration::from_millis(35)).await;
+    assert!(set.try_touch_activity_slot(&slot_exact));
+    assert!(
+        slot_exact.last_active_ns.load(Ordering::Acquire) > before,
+        "CAS refresh past refresh_quantum_ns must advance last_active_ns"
+    );
+    assert!(!set.is_group_idle("g"));
+    assert!(trigger_rx.try_recv().is_err());
+
+    // Sleep past timeout (80ms): slot expires, fast path returns false, slow path wakes.
+    tokio::time::sleep(Duration::from_millis(95)).await;
+    assert!(set.is_group_idle("g"));
+    assert!(!set.try_touch_activity_slot(&slot_exact));
+    let _ = set.mark_group_active_slot("g");
+    assert!(!set.is_group_idle("g"));
+    assert_eq!(trigger_rx.try_recv(), Ok(n1));
+    set.finish_trigger_probe(n1);
+
+    // 2. Clock-domain translation across sync_idle_groups: exact (80ms) -> coarse (1800s)
+    //    preserves active state and invalidates old generation handle.
+    set.sync_idle_groups(&[idle_reg(
+        "g",
+        vec![n1],
+        Some(Duration::from_secs(1800)),
+        IdleGroupKind::Automatic,
+    )]);
+    assert!(!set.is_group_idle("g"));
+    assert!(
+        !set.try_touch_activity_slot(&slot_exact),
+        "old generation slot must be invalidated after sync_idle_groups"
+    );
+    let slot_coarse = set.mark_group_active_slot("g").expect("coarse slot");
+    assert!(set.try_touch_activity_slot(&slot_coarse));
+    assert!(trigger_rx.try_recv().is_err());
+
+    // 3. Coarse (1800s) -> exact (60ms) preserves fresh activity and then expires on exact clock.
+    set.sync_idle_groups(&[idle_reg(
+        "g",
+        vec![n1],
+        Some(Duration::from_millis(60)),
+        IdleGroupKind::Automatic,
+    )]);
+    assert!(!set.is_group_idle("g"));
+    assert!(!set.try_touch_activity_slot(&slot_coarse));
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    assert!(set.is_group_idle("g"));
+
+    // 4. Coarse clock (timeout == 1s) active -> idle transition on Linux CLOCK_MONOTONIC_COARSE.
+    set.sync_idle_groups(&[idle_reg(
+        "g",
+        vec![n1],
+        Some(Duration::from_secs(1)),
+        IdleGroupKind::Automatic,
+    )]);
+    let slot_1s = set.mark_group_active_slot("g").expect("1s coarse slot");
+    assert!(!set.is_group_idle("g"));
+    assert_eq!(trigger_rx.try_recv(), Ok(n1));
+    set.finish_trigger_probe(n1);
+    assert!(set.try_touch_activity_slot(&slot_1s));
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(set.is_group_idle("g"));
+    assert!(!set.try_touch_activity_slot(&slot_1s));
+
+    // 5. Hot-reloading to idle_timeout=0 invalidates previous slot and keeps group idle.
+    let _ = set.mark_group_active_slot("g");
+    assert!(!set.is_group_idle("g"));
+    set.sync_idle_groups(&[idle_reg(
+        "g",
+        vec![n1],
+        Some(Duration::ZERO),
+        IdleGroupKind::Automatic,
+    )]);
+    assert!(set.is_group_idle("g"));
+    assert!(!set.try_touch_activity_slot(&slot_1s));
+    let slot_zero = set.mark_group_active_slot("g").expect("zero slot");
+    assert!(set.try_touch_activity_slot(&slot_zero));
+    assert!(set.is_group_idle("g"));
+}
+
+#[test]
+fn wake_marks_only_members_whose_probes_were_suspended() {
+    let set = AliveDialerSet::new();
+    let a = id(1);
+    let b = id(2);
+    let c = id(3);
+    set.register_node(a, "a".into(), "127.0.0.1:1".into());
+    set.register_node(b, "b".into(), "127.0.0.1:2".into());
+    set.register_node(c, "c".into(), "127.0.0.1:3".into());
+    // a belongs to g only; b belongs to g and h; c is held fixed.
+    set.sync_idle_groups(&[
+        idle_reg(
+            "g",
+            vec![a, b],
+            // A 10ms timeout lets the test age the group past idle with a
+            // short sleep; the 3600s groups below use the coarse clock.
+            Some(Duration::from_millis(10)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "h",
+            vec![b],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "sel",
+            vec![c],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Selector,
+        ),
+    ]);
+    set.replace_selected_nodes(HashSet::from([c]));
+    // h is active, so b's probes were never suspended: stamp its slot
+    // active without going through a wake (which would mark b itself).
+    // The 3600s timeout uses the coarse clock (see use_coarse_clock_for).
+    {
+        let idle = set.idle_groups.read();
+        let slot = &idle.groups["h"].activity;
+        slot.last_active_ns
+            .store(set.activity_now_ns(true), Ordering::Relaxed);
+    }
+
+    // The first wake only activates the group: it was never active, so
+    // its members carry no aged data and nothing is marked.
+    let _ = set.mark_group_active_slot("g");
+    assert!(!set.is_stale(a));
+    // Age the group past its timeout, then wake it again: now the probes
+    // really were suspended, so the members are marked stale.
+    std::thread::sleep(Duration::from_millis(20));
+    let _ = set.mark_group_active_slot("g");
+
+    // a's only group woke: its probes were suspended, so it is stale.
+    assert!(set.is_stale(a));
+    // b's other group h is still active: b never stopped probing.
+    assert!(!set.is_stale(b));
+    // c is held fixed: it keeps periodic probing while idle.
+    assert!(!set.is_stale(c));
+}
+
+#[test]
+fn wake_staleness_clears_only_when_a_probe_refreshes_the_data() {
+    let set = AliveDialerSet::new();
+    let a = id(1);
+    let b = id(2);
+    let c = id(3);
+    for (node, name) in [(a, "a"), (b, "b"), (c, "c")] {
+        set.register_node(node, name.into(), format!("127.0.0.1:{node}"));
+        // Failures count only outside the grace period.
+        set.node_registered_at
+            .write()
+            .insert(node, Instant::now() - GRACE_PERIOD);
+    }
+    set.sync_idle_groups(&[
+        idle_reg(
+            "g",
+            vec![a],
+            // 10ms timeouts let the test age each group past idle with
+            // one short sleep; see the wake sequence below.
+            Some(Duration::from_millis(10)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "h",
+            vec![b],
+            Some(Duration::from_millis(10)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "i",
+            vec![c],
+            Some(Duration::from_millis(10)),
+            IdleGroupKind::Automatic,
+        ),
+    ]);
+
+    // A single probe failure does NOT clear: the node is still alive and
+    // the old latency is what selection trusts.
+    //
+    // Activate every group first (a never-active group is not marked),
+    // age them past the 10ms timeout, then wake g for real: now a's
+    // probes really were suspended, so a is marked stale.
+    let _ = set.mark_group_active_slot("g");
+    let _ = set.mark_group_active_slot("h");
+    let _ = set.mark_group_active_slot("i");
+    std::thread::sleep(Duration::from_millis(20));
+    let _ = set.mark_group_active_slot("g");
+    assert!(set.is_stale(a));
+    assert!(!set.mark_unavailable_state(a, ProbeDomain::Tcp, IpVersion::V4, false, false));
+    assert!(set.is_stale(a));
+    assert!(set.is_alive_for(a, ProbeDomain::Tcp, IpVersion::V4));
+    // Two more probe failures flip the node dead (threshold 3) — and the
+    // flip clears the marker, because selection no longer trusts the data.
+    assert!(!set.mark_unavailable_state(a, ProbeDomain::Tcp, IpVersion::V4, false, false));
+    assert!(set.is_stale(a));
+    assert!(set.mark_unavailable_state(a, ProbeDomain::Tcp, IpVersion::V4, false, false));
+    assert!(!set.is_stale(a));
+    assert!(!set.is_alive_for(a, ProbeDomain::Tcp, IpVersion::V4));
+
+    // Traffic failures never clear, even past their own threshold (10):
+    // traffic is not probe evidence.
+    let _ = set.mark_group_active_slot("h");
+    assert!(set.is_stale(b));
+    for _ in 0..10 {
+        set.mark_unavailable_state(b, ProbeDomain::Tcp, IpVersion::V4, false, true);
+    }
+    assert!(!set.is_alive_for(b, ProbeDomain::Tcp, IpVersion::V4));
+    assert!(set.is_stale(b));
+
+    // A probe success clears: the fresh latency is what selection trusts.
+    // (The return value is whether the node revived from dead; c was
+    // never dead, so it is false here — only the marker matters.)
+    let _ = set.mark_group_active_slot("i");
+    assert!(set.is_stale(c));
+    set.record_probe_latency_state(
+        c,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(10),
+        false,
+    );
+    assert!(!set.is_stale(c));
+}
+
+#[test]
+fn remove_node_cleans_pinned_url_members_and_stale_markers() {
+    let set = AliveDialerSet::new();
+    let a = id(1);
+    set.register_node(a, "a".into(), "127.0.0.1:1".into());
+    set.sync_idle_groups(&[idle_reg(
+        "g",
+        vec![a],
+        Some(Duration::from_secs(3600)),
+        IdleGroupKind::Automatic,
+    )]);
+    set.replace_pinned_url_members(HashMap::from([(
+        "g".to_string(),
+        HashSet::from(["a".to_string()]),
+    )]));
+    let url = "http://127.0.0.1/".to_string();
+    set.mark_url_stale(&[("a".to_string(), url.clone())]);
+    // Mark directly: this test covers `remove_node` cleanup, not the
+    // wake path (a never-active group's first wake marks nothing).
+    set.mark_stale(&[a]);
+
+    assert!(set.is_stale(a));
+    assert!(set.is_url_stale("a", &url));
+    assert!(!set.pinned_url_members_for("g").is_empty());
+
+    set.remove_node(a);
+
+    assert!(!set.is_stale(a));
+    assert!(!set.is_url_stale("a", &url));
+    assert!(set.pinned_url_members_for("g").is_empty());
+    assert!(set.pinned_url_members.read().is_empty());
 }

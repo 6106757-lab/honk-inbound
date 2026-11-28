@@ -29,9 +29,9 @@ pub(in crate::control) use subscription::config_with_subscription_nodes;
 
 pub(in crate::control) use connectivity::{
     build_outbound_id_map, group_check_url_registrations, group_connectivity_snapshot,
-    group_datapath_alive, install_interrupt_callback, install_selector_warm_callback,
-    open_group_connectivity, publish_group_connectivity, sync_health_check_nodes,
-    urltest_group_registrations,
+    group_datapath_alive, idle_group_registrations, install_interrupt_callback,
+    install_selector_warm_callback, open_group_connectivity, publish_group_connectivity,
+    publish_group_probe_state, sync_health_check_nodes,
 };
 
 pub(crate) fn resolve_outbound_nodes(

@@ -41,7 +41,7 @@ group {
 | `check_url` | `check_url` | `null` | Per-group TCP health-check target for non-Selector policies. A Selector ignores it with a warning. |
 | — (not in dae) | `check_interval` | `null` | Per-group interval field in seconds. The current runtime does not consult it and uses the global interval. |
 | `tolerance` | `tolerance` | `50` | Nonnegative URLTest switch threshold in milliseconds. Without an explicit value, dae URLTest groups inherit `global.check_tolerance`; the runtime applies an effective minimum of 1 ms. |
-| `idle_timeout` | `idle_timeout` | `null` | Nonnegative URLTest probe-suspension threshold after inactivity, in seconds. With `null`, the health layer uses 1800 seconds. |
+| `idle_timeout` | `idle_timeout` | `null` | Nonnegative probe-suspension threshold after inactivity, in seconds. With `null`, the health layer uses 1800 seconds. The first selection after a group wakes races the picked member against the next candidates instead of trusting pre-pause health, until a fresh probe lands. |
 | `interrupt_connections` | `interrupt_connections` | `false` | Close affected live userspace transports on selection changes, using captured group identities and network. This is transport retirement, not tracking removal; shared UDP carriers retain unaffected views. |
 | — (not in dae) | `id` | random UUID | Internal group identity generated when the field is absent. |
 

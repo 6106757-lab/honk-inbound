@@ -23,7 +23,7 @@ impl GroupManager {
     }
 
     pub fn group(&self, name: &str) -> Option<&Group> {
-        self.groups.get(name)
+        self.groups.get(name).map(|entry| &entry.group)
     }
 
     pub fn group_members(&self, name: &str) -> impl Iterator<Item = GroupMember<'_>> {
@@ -187,6 +187,31 @@ impl GroupManager {
 }
 
 impl GroupManager {
+    pub(super) fn pick_in_group_entry<'a>(
+        &'a self,
+        entry: &'a ManagedGroup,
+        domain: ProbeDomain,
+        ipver: IpVersion,
+        visited: &mut Vec<&'a str>,
+        depth: usize,
+        effects: SelectionEffects,
+    ) -> Option<&'a Node> {
+        self.pick_candidate_for_entry(
+            &entry.group,
+            Some(&entry.idle_activity),
+            &ScoreSelectionContext::aggregate(
+                SelectionNetwork::from_probe_domain(domain),
+                domain,
+                ipver,
+            ),
+            visited,
+            depth,
+            effects,
+            score::selection::ScoreSelectionRules::default(),
+        )
+        .map(|candidate| candidate.node)
+    }
+
     /// Resolve a group to the single leaf node its policy selects.
     /// `visited`/`depth` thread the cycle/depth guards through nesting.
     pub(super) fn pick_in_group<'a>(
@@ -253,7 +278,7 @@ impl GroupManager {
                     .groups
                     .iter()
                     .filter_map(move |tag| self.groups.get(tag))
-                    .map(GroupMember::Group),
+                    .map(|entry| GroupMember::Group(&entry.group)),
             )
     }
 
@@ -267,10 +292,11 @@ impl GroupManager {
         match name {
             Config::BUILTIN_DIRECT_NODE => Some(GroupMember::Node(&DIRECT)),
             Config::BUILTIN_BLOCK_NODE => Some(GroupMember::Node(&BLOCK)),
-            _ => self
-                .node_by_name(name)
-                .map(GroupMember::Node)
-                .or_else(|| self.groups.get(name).map(GroupMember::Group)),
+            _ => self.node_by_name(name).map(GroupMember::Node).or_else(|| {
+                self.groups
+                    .get(name)
+                    .map(|entry| GroupMember::Group(&entry.group))
+            }),
         }
     }
 
@@ -482,9 +508,10 @@ impl GroupManager {
         network: SelectionNetwork,
     ) -> (Vec<String>, Option<&Node>) {
         let mut chain = vec![group_name.to_string()];
-        let Some(mut group) = self.groups.get(group_name) else {
+        let Some(entry) = self.groups.get(group_name) else {
             return (chain, None);
         };
+        let mut group = &entry.group;
         for _ in 0..MAX_GROUP_DEPTH {
             let member = match (group.policy, self.selector_member(group, network)) {
                 (_, Some(member)) => Some(member),
@@ -856,7 +883,15 @@ mod native_probe_tests {
             ..Default::default()
         };
         let alive = Arc::new(AliveDialerSet::new());
-        alive.register_urltest_group(&group.name, &group.nodes, Some(Duration::from_secs(60)));
+        alive.sync_idle_groups(&[crate::alive::IdleGroupRegistration {
+            name: group.name.clone(),
+            members: group.nodes.clone(),
+            idle_timeout: Some(Duration::from_secs(60)),
+            kind: crate::alive::IdleGroupKind::Automatic,
+            // Config nodes are never builtins, so recovery is the member list.
+            tcp_recovery_members: group.nodes.clone(),
+            udp_recovery_members: group.nodes.clone(),
+        }]);
         let manager = GroupManager::with_alive_set(&[group], &nodes, Some(alive.clone()));
         let member = GroupMember::Group(manager.group("urltest").unwrap());
         assert!(
@@ -881,7 +916,7 @@ mod native_probe_tests {
                 .probe_leaf(member, ProbeDomain::DataUdp, IpVersion::V4)
                 .is_none()
         );
-        assert!(alive.is_urltest_group_idle("urltest"));
+        assert!(alive.is_group_idle("urltest"));
         assert_eq!(
             manager.get_urltest_selection_for_network("urltest", SelectionNetwork::Udp),
             None

@@ -248,11 +248,15 @@ fn native_reads_do_not_rotate_load_balance_wake_urltest_or_train_score() {
     })
     .collect();
     let alive = Arc::new(AliveDialerSet::new());
-    alive.register_urltest_group(
-        "urltest",
-        &config.groups[1].nodes,
-        Some(Duration::from_secs(60)),
-    );
+    alive.sync_idle_groups(&[honk_outbound::alive::IdleGroupRegistration {
+        name: "urltest".into(),
+        members: config.groups[1].nodes.clone(),
+        idle_timeout: Some(Duration::from_secs(60)),
+        kind: honk_outbound::alive::IdleGroupKind::Automatic,
+        // Config nodes are never builtins, so recovery is the member list.
+        tcp_recovery_members: config.groups[1].nodes.clone(),
+        udp_recovery_members: config.groups[1].nodes.clone(),
+    }]);
     let manager = GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive.clone()));
     let untouched = GroupManager::with_alive_set(
         &config.groups,
@@ -267,7 +271,7 @@ fn native_reads_do_not_rotate_load_balance_wake_urltest_or_train_score() {
             group_value(&manager, group, &identity, &alive, true);
         }
     }
-    assert!(alive.is_urltest_group_idle("urltest"));
+    assert!(alive.is_group_idle("urltest"));
     assert!(
         manager
             .peek_selection("urltest", SelectionNetwork::Tcp)

@@ -242,6 +242,15 @@ impl AliveDialerSet {
         }
 
         self.record_probe_history(node_id, idx, false, None);
+        // A probe failure clears staleness only when it flips the node dead
+        // for this (domain, ipver): a single failure below the threshold
+        // leaves the old alive/latency in place, so the data stays stale.
+        // Traffic failures never clear (they are not probe evidence); a
+        // traffic-threshold flip excludes the node anyway, and its revival
+        // clears through the success funnel.
+        if !is_traffic && !self.is_alive_for(node_id, domain, ipver) {
+            self.clear_stale(node_id);
+        }
         changed
     }
 
@@ -408,6 +417,10 @@ impl AliveDialerSet {
         }
 
         self.record_probe_history(node_id, idx, true, Some(latency));
+        // A probe success refreshes the data selection trusts (the moving
+        // average is fed when the node is alive; a still-dead node is
+        // excluded by the filter either way), so the wake staleness ends.
+        self.clear_stale(node_id);
         revived
     }
 

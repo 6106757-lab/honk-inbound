@@ -25,7 +25,9 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
+pub use urltest::{IdleActivitySlot, IdleGroupKind, IdleGroupRegistration};
 use uuid::Uuid;
 
 type ScoreFeedbackFactory =
@@ -299,10 +301,10 @@ type DeathCallback = dyn Fn(Uuid, &str) + Send + Sync;
 /// native group/member identities; display tags are not node lookup keys.
 pub type UrlMemberResolver = Arc<dyn Fn(&str) -> Vec<UrlProbeMember> + Send + Sync>;
 
-/// Default URLTest group idle timeout when the group config has none
-/// (sing-box default: 30 minutes). Periodic probing of a URLTest group's
+/// Default group idle timeout when the group config has none (sing-box
+/// default: 30 minutes). Periodic probing of an automatic group's direct
 /// members pauses while the group is idle and resumes on the next selection.
-pub const DEFAULT_URLTEST_IDLE_TIMEOUT: Duration = Duration::from_secs(1800);
+pub const DEFAULT_GROUP_IDLE_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// Resolves a NodeId to its eBPF outbound index for
 /// `OUTBOUND_CONNECTIVITY_MAP` writes (direct=0, block=1, group i → 2+i,
@@ -341,23 +343,51 @@ pub type ResolveHook = Arc<
         + Sync,
 >;
 
+/// Isolates hot lock words and atomics onto dedicated 64-byte cache lines so
+/// concurrent readers do not self-invalidate adjacent map metadata or atomics.
+#[repr(align(64))]
+struct CachePadded<T>(T);
+
+type PaddedRwLock<T> = CachePadded<RwLock<CachePadded<T>>>;
+type NodeCollections = HashMap<Uuid, [Arc<DialerCollection>; ALIVE_STATES_PER_NODE]>;
+
+impl<T> std::ops::Deref for CachePadded<T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for CachePadded<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
 pub struct AliveDialerSet {
     /// Uses parking_lot RwLock/Mutex for synchronous, uncontended access on the
     /// async runtime (parking_lot blocks OS threads without runtime awareness).
-    states: RwLock<HashMap<Uuid, [PerProtocolState; ALIVE_STATES_PER_NODE]>>,
+    states: PaddedRwLock<HashMap<Uuid, [PerProtocolState; ALIVE_STATES_PER_NODE]>>,
     /// Per-node-per-domain latency collections (Go `collection` struct).
-    collections: RwLock<HashMap<Uuid, [Arc<DialerCollection>; ALIVE_STATES_PER_NODE]>>,
+    collections: PaddedRwLock<NodeCollections>,
     registered: RwLock<HashMap<Uuid, Arc<RegisteredNode>>>,
+
     health_observations: RwLock<Option<observations::HealthHistory>>,
     ebpf_callback: RwLock<Option<Arc<EbpfAliveCallback>>>,
     death_callback: RwLock<Option<Arc<DeathCallback>>>,
     base_cooldown: Duration,
     max_cooldown: Duration,
     /// Bounded node-deduplicated emergency probe queue. A pending node owns
-    /// at most one entry, so traffic failure storms cannot grow memory.
+    /// at most one entry, so traffic failure storms cannot grow memory. The
+    /// value records whether custom `check_url` probing should also run after
+    /// the global TCP probe (coalesced via `|=` when a failure trigger arrives
+    /// alongside a node-only wake).
     trigger_tx: tokio::sync::mpsc::Sender<Uuid>,
     trigger_rx: Mutex<Option<tokio::sync::mpsc::Receiver<Uuid>>>,
-    trigger_pending: Mutex<HashSet<Uuid>>,
+    trigger_pending: Mutex<HashMap<Uuid, bool>>,
     health_control: Mutex<runner::HealthControl>,
     health_mode: tokio::sync::watch::Sender<runner::HealthMode>,
     health_changed: tokio::sync::Notify,
@@ -395,14 +425,36 @@ pub struct AliveDialerSet {
     outbound_resolver: RwLock<Option<OutboundIdResolver>>,
     /// DNS resolver for check targets (system lookup when unset).
     resolver: RwLock<Option<ResolveHook>>,
-    /// Last activity timestamp per URLTest group (lazy start: absent = idle).
-    group_last_active: RwLock<HashMap<String, Instant>>,
-    /// NodeId → URLTest groups it belongs to (for idle suspension).
-    node_urltest_groups: RwLock<HashMap<Uuid, Vec<String>>>,
-    /// URLTest group → member NodeIds (for wake-up probes).
-    urltest_group_members: RwLock<HashMap<String, Vec<Uuid>>>,
-    /// URLTest group → idle timeout (probing pauses past it).
-    urltest_group_timeout: RwLock<HashMap<String, Duration>>,
+    /// Monotonic origin for exact sub-second per-group activity timestamps.
+    started_at: Instant,
+    /// Monotonic coarse origin (Linux `CLOCK_MONOTONIC_COARSE`, ns) for `>= 1s`
+    /// per-group activity timestamps.
+    #[cfg(target_os = "linux")]
+    started_at_coarse_ns: u64,
+    /// Bumped on every idle-group table mutation to invalidate cached
+    /// [`IdleActivitySlot`] handles.
+    idle_generation: CachePadded<AtomicU64>,
+    /// Idle-group membership, timeouts, and per-group activity timestamps.
+    idle_groups: RwLock<urltest::IdleGroups>,
+    /// Nodes a group holds fixed (manual selection or non-builtin node `final`);
+    /// they keep periodic probing while their groups are idle.
+    selected_nodes: RwLock<HashSet<Uuid>>,
+    /// Members whose health data predates their group's idle wake: their
+    /// probes were suspended until the wake, and no fresh probe has landed
+    /// yet. Keyed by node id, valued by the wake instant (observability
+    /// only — no expiry is derived from it). Selection races such members
+    /// instead of trusting them alone (see `mark_group_active_slot`).
+    stale_members: RwLock<HashMap<Uuid, Instant>>,
+    /// Same staleness as `stale_members`, for custom-`check_url` groups:
+    /// (member tag, check URL) pairs whose URL probe data predates the wake.
+    stale_url_members: RwLock<HashMap<(String, String), Instant>>,
+    /// Automatic group name → pinned member tags that keep custom-`check_url`
+    /// probing while the group is idle.
+    pinned_url_members: RwLock<HashMap<String, HashSet<String>>>,
+    /// Custom-`check_url` groups queued for asynchronous member-probe wakeup
+    /// (resolved on the health loop, off caller locks such as `SharedGroupManager`).
+    pending_url_group_wakes: Mutex<HashSet<String>>,
+    url_group_wake_notify: tokio::sync::Notify,
     /// Group → custom check URL for per-group health check targets
     /// (sing-box urltest `url` option). Members are resolved dynamically
     /// each probe cycle through `url_member_resolver` — sub-group picks
@@ -422,6 +474,19 @@ pub struct AliveDialerSet {
     url_check_ips: RwLock<HashMap<String, Vec<SocketAddr>>>,
 }
 
+const _: () = {
+    assert!(
+        std::mem::align_of::<PaddedRwLock<HashMap<Uuid, [PerProtocolState; ALIVE_STATES_PER_NODE]>>>(
+        ) >= 64
+    );
+    assert!(
+        std::mem::size_of::<PaddedRwLock<HashMap<Uuid, [PerProtocolState; ALIVE_STATES_PER_NODE]>>>(
+        ) >= 128
+    );
+    assert!(std::mem::size_of::<PaddedRwLock<NodeCollections>>() >= 128);
+    assert!(std::mem::align_of::<CachePadded<AtomicU64>>() >= 64);
+};
+
 /// Default probe target for the `direct` node when no `bootstrap_resolver`
 /// is configured: a directly-reachable, anycasted resolver.
 pub const DEFAULT_DIRECT_CHECK_ADDR: &str = "223.5.5.5:53";
@@ -438,8 +503,8 @@ impl AliveDialerSet {
         let (tx, rx) = tokio::sync::mpsc::channel(TRIGGER_QUEUE_CAPACITY);
         let (health_mode, _) = tokio::sync::watch::channel(runner::HealthMode::Running);
         Self {
-            states: RwLock::new(HashMap::new()),
-            collections: RwLock::new(HashMap::new()),
+            states: CachePadded(RwLock::new(CachePadded(HashMap::new()))),
+            collections: CachePadded(RwLock::new(CachePadded(HashMap::new()))),
             registered: RwLock::new(HashMap::new()),
             health_observations: RwLock::new(None),
             ebpf_callback: RwLock::new(None),
@@ -449,7 +514,7 @@ impl AliveDialerSet {
             max_cooldown: Duration::from_secs(300),
             trigger_tx: tx,
             trigger_rx: Mutex::new(Some(rx)),
-            trigger_pending: Mutex::new(HashSet::new()),
+            trigger_pending: Mutex::new(HashMap::new()),
             health_control: Mutex::new(runner::HealthControl::default()),
             health_mode,
             health_changed: tokio::sync::Notify::new(),
@@ -468,10 +533,17 @@ impl AliveDialerSet {
             node_registered_at: RwLock::new(HashMap::new()),
             probe_history: RwLock::new(HashMap::new()),
             outbound_resolver: RwLock::new(None),
-            group_last_active: RwLock::new(HashMap::new()),
-            node_urltest_groups: RwLock::new(HashMap::new()),
-            urltest_group_members: RwLock::new(HashMap::new()),
-            urltest_group_timeout: RwLock::new(HashMap::new()),
+            started_at: Instant::now(),
+            #[cfg(target_os = "linux")]
+            started_at_coarse_ns: urltest::monotonic_coarse_ns(),
+            idle_generation: CachePadded(AtomicU64::new(0)),
+            idle_groups: RwLock::default(),
+            selected_nodes: RwLock::new(HashSet::new()),
+            stale_members: RwLock::new(HashMap::new()),
+            stale_url_members: RwLock::new(HashMap::new()),
+            pinned_url_members: RwLock::new(HashMap::new()),
+            pending_url_group_wakes: Mutex::new(HashSet::new()),
+            url_group_wake_notify: tokio::sync::Notify::new(),
             group_check_urls: RwLock::new(HashMap::new()),
             url_member_resolver: RwLock::new(None),
             url_states: RwLock::new(HashMap::new()),
@@ -704,20 +776,42 @@ impl AliveDialerSet {
 
     pub fn remove_node(&self, node_id: Uuid) {
         let mut registered = self.registered.write();
-        registered.remove(&node_id);
+        let removed = registered.remove(&node_id);
         self.states.write().remove(&node_id);
         self.collections.write().remove(&node_id);
         if let Some(observations) = self.health_observations.write().as_mut() {
             observations.remove_node(node_id);
         }
         self.node_registered_at.write().remove(&node_id);
-        self.node_urltest_groups.write().remove(&node_id);
-        self.probe_history
-            .write()
-            .retain(|(id, _), _| *id != node_id);
+        self.idle_groups.write().remove_node(node_id);
+        self.selected_nodes.write().remove(&node_id);
+        {
+            let mut history = self.probe_history.write();
+            for index in 0..ALIVE_STATES_PER_NODE {
+                history.remove(&(node_id, index));
+            }
+        }
         self.last_emergency_tcp.lock().remove(&node_id);
         self.last_emergency_udp.lock().remove(&node_id);
         self.trigger_pending.lock().remove(&node_id);
+        // A removed node must not keep a wake-staleness marker (a later
+        // re-registration starts with fresh probe data), and its pinned
+        // URL membership must go with it. Pins are keyed by member tag,
+        // which is the node name for direct members.
+        self.stale_members.write().remove(&node_id);
+        if let Some(node) = removed {
+            let tag = node.name.clone();
+            {
+                let mut pinned = self.pinned_url_members.write();
+                for members in pinned.values_mut() {
+                    members.remove(&tag);
+                }
+                pinned.retain(|_, members| !members.is_empty());
+            }
+            self.stale_url_members
+                .write()
+                .retain(|(member_tag, _), _| member_tag != &tag);
+        }
     }
 
     /// A link/address/route change invalidates probe backoff that may have
@@ -741,25 +835,83 @@ impl AliveDialerSet {
                 }
             }
         }
+        let mut dead_urls = HashSet::new();
+        {
+            let mut url_states = self.url_states.write();
+            for ((_, url), state) in url_states.iter_mut() {
+                state.cooldown_until = now;
+                if !state.alive {
+                    state.consecutive_successes = RECOVERY_SUCCESSES_NEEDED - 1;
+                    dead_urls.insert(url.clone());
+                }
+            }
+        }
         for node_id in node_ids {
-            self.trigger_probe(node_id);
+            if !self.is_probe_suspended(node_id)
+                || self.needs_idle_recovery(node_id, ProbeDomain::Tcp)
+            {
+                self.trigger_probe_node_only(node_id);
+            }
+        }
+        for (group, url) in self.group_check_urls() {
+            if !self.is_group_idle(&group)
+                || !self.pinned_url_members_for(&group).is_empty()
+                || dead_urls.contains(&url)
+            {
+                self.enqueue_url_group_wake(&group);
+            }
         }
     }
 
+    pub(super) fn enqueue_url_group_wake(&self, group: &str) {
+        let _control = self.health_control.lock();
+        if *self.health_mode.borrow() != runner::HealthMode::Running {
+            return;
+        }
+        if self.pending_url_group_wakes.lock().insert(group.to_owned()) {
+            self.url_group_wake_notify.notify_one();
+        }
+    }
+
+    pub(super) fn take_pending_url_group_wake(&self) -> Option<String> {
+        let mut pending = self.pending_url_group_wakes.lock();
+        let group = pending.iter().next()?.clone();
+        pending.remove(&group);
+        Some(group)
+    }
+
     pub fn trigger_probe(&self, node_id: Uuid) {
+        self.enqueue_trigger_probe(node_id, true);
+    }
+
+    pub(super) fn trigger_probe_node_only(&self, node_id: Uuid) {
+        self.enqueue_trigger_probe(node_id, false);
+    }
+
+    fn enqueue_trigger_probe(&self, node_id: Uuid, probe_custom_urls: bool) {
         let _control = self.health_control.lock();
         if *self.health_mode.borrow() != runner::HealthMode::Running {
             return;
         }
         let mut pending = self.trigger_pending.lock();
-        if !pending.insert(node_id) {
+        if let Some(existing) = pending.get_mut(&node_id) {
+            *existing |= probe_custom_urls;
             return;
         }
+        pending.insert(node_id, probe_custom_urls);
         if self.trigger_tx.try_send(node_id).is_err() {
             // Queue saturation drops this request (a later traffic failure or
             // periodic sweep retries it), and releases its dedup reservation.
             pending.remove(&node_id);
         }
+    }
+
+    pub(super) fn take_trigger_custom_urls(&self, node_id: Uuid) -> bool {
+        self.trigger_pending
+            .lock()
+            .get_mut(&node_id)
+            .map(|flag| std::mem::replace(flag, false))
+            .unwrap_or(false)
     }
 
     pub(crate) fn finish_trigger_probe(&self, node_id: Uuid) {
@@ -848,6 +1000,17 @@ mod trigger_tests {
         }
         set.trigger_probe(same);
         assert_eq!(receiver.try_recv(), Ok(same));
+        assert!(set.take_trigger_custom_urls(same));
+        assert!(!set.take_trigger_custom_urls(same));
+        set.finish_trigger_probe(same);
+
+        // A failure trigger coalesces custom-URL probing onto a queued node-only wake.
+        set.trigger_probe_node_only(same);
+        assert_eq!(receiver.try_recv(), Ok(same));
+        set.trigger_probe(same);
+        assert!(receiver.try_recv().is_err());
+        assert!(set.take_trigger_custom_urls(same));
+        set.finish_trigger_probe(same);
     }
 }
 

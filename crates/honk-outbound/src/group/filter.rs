@@ -35,6 +35,12 @@ impl GroupManager {
         alive.is_alive_for(node_id, domain, ipver)
     }
 
+    /// Whether the node carries UDP itself.
+    #[inline]
+    pub fn node_carries_udp(&self, node: &Node) -> bool {
+        crate::descriptor::node_carries_udp(node)
+    }
+
     /// Keep only capable, alive leaves; absent health tracking skips only health.
     ///
     /// When the group has a custom `check_url` (sing-box urltest `url`

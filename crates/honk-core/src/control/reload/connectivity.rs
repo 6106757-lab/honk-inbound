@@ -108,40 +108,80 @@ pub(in crate::control) fn sync_health_check_nodes(
     (added, removed)
 }
 
-/// URLTest group registrations for the alive set's idle-suspension table:
-/// `(group name, member NodeIds, idle timeout)` per URLTest group.
-/// Leaves shared with any non-URLTest group are probed unconditionally.
-/// Membership and explicit final edges both participate, since health state
-/// lives on real nodes. Used identically at startup and on config reload.
-pub(in crate::control) fn urltest_group_registrations(
+/// Direct idle-group registrations for the alive set, covering every policy.
+///
+/// Each entry lists only that group's direct node members and any direct-node
+/// `final` edge so activating an automatic group wakes its own members while
+/// chosen subgroups activate on traversal, and `Selector` groups stay isolated
+/// to their fixed selections. Automatic groups also carry their reachable
+/// non-builtin TCP and UDP recovery leaves for datapath-parity idle recovery.
+pub(in crate::control) fn idle_group_registrations(
     config: &Config,
-) -> Vec<(String, Vec<uuid::Uuid>, Option<Duration>)> {
+) -> Vec<honk_outbound::alive::IdleGroupRegistration> {
+    // The fork has no `GroupGraph`; reachable leaves come from the fork's own
+    // `collect_group_leaf_ids` (membership + explicit final edges, path-guarded).
     let by_name = groups_by_name(config);
+    let node_by_id: std::collections::HashMap<uuid::Uuid, &honk_config::node::Node> =
+        config.nodes.iter().map(|node| (node.id, node)).collect();
     let leaf_ids = |g: &Group| {
         let mut ids = std::collections::BTreeSet::new();
         collect_group_leaf_ids(g, config, &by_name, 0, &mut Vec::new(), &mut ids);
         ids
     };
-    let always_probed_node_ids: std::collections::BTreeSet<uuid::Uuid> = config
-        .groups
-        .iter()
-        .filter(|g| g.policy != GroupPolicy::URLTest)
-        .flat_map(&leaf_ids)
-        .collect();
     config
         .groups
         .iter()
-        .filter(|g| g.policy == GroupPolicy::URLTest)
         .map(|group| {
-            let members: Vec<uuid::Uuid> = leaf_ids(group)
-                .into_iter()
-                .filter(|id| !always_probed_node_ids.contains(id))
-                .collect();
-            (
-                group.name.clone(),
-                members,
-                group.idle_timeout.map(std::time::Duration::from_secs),
-            )
+            let mut members: std::collections::BTreeSet<uuid::Uuid> =
+                group.nodes.iter().copied().collect();
+            match group.final_outbound.as_deref() {
+                None => {}
+                Some(Config::BUILTIN_DIRECT_NODE) => {
+                    members.insert(honk_config::config::DIRECT_NODE_ID);
+                }
+                Some(Config::BUILTIN_BLOCK_NODE) => {
+                    members.insert(honk_config::config::BLOCK_NODE_ID);
+                }
+                Some(name) => {
+                    if let Some(node) = config.nodes.iter().find(|node| node.name == name) {
+                        members.insert(node.id);
+                    }
+                }
+            }
+            let (kind, tcp_recovery_members, udp_recovery_members) =
+                if group.policy == GroupPolicy::Selector {
+                    (
+                        honk_outbound::alive::IdleGroupKind::Selector,
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                } else {
+                    let tcp: Vec<uuid::Uuid> = leaf_ids(group)
+                        .into_iter()
+                        .filter(|id| {
+                            *id != honk_config::config::DIRECT_NODE_ID
+                                && *id != honk_config::config::BLOCK_NODE_ID
+                        })
+                        .collect();
+                    let udp: Vec<uuid::Uuid> = tcp
+                        .iter()
+                        .copied()
+                        .filter(|id| {
+                            node_by_id.get(id).is_some_and(|node| {
+                                honk_outbound::descriptor::node_carries_udp(node)
+                            })
+                        })
+                        .collect();
+                    (honk_outbound::alive::IdleGroupKind::Automatic, tcp, udp)
+                };
+            honk_outbound::alive::IdleGroupRegistration {
+                name: group.name.clone(),
+                members: members.into_iter().collect(),
+                idle_timeout: group.idle_timeout.map(std::time::Duration::from_secs),
+                kind,
+                tcp_recovery_members,
+                udp_recovery_members,
+            }
         })
         .collect()
 }
@@ -165,6 +205,20 @@ pub(in crate::control) fn group_check_url_registrations(config: &Config) -> Vec<
             )
         })
         .collect()
+}
+
+/// Publish idle-group membership, custom `check_url` targets, and fixed probe
+/// selections under the caller's publication guards. Call `wake()` on the
+/// returned token only after dropping those guards.
+pub(in crate::control) fn publish_group_probe_state(
+    alive_set: &AliveDialerSet,
+    group_manager: &GroupManager,
+    idle_groups: &[honk_outbound::alive::IdleGroupRegistration],
+    check_urls: &[(String, String)],
+) -> honk_outbound::group::SelectedProbeWake {
+    alive_set.sync_idle_groups(idle_groups);
+    alive_set.sync_group_check_urls(check_urls);
+    group_manager.stage_selected_probe_wake()
 }
 
 /// Automatic policy changes cancel captured group/network owners without rebuilding provenance.
@@ -335,7 +389,7 @@ impl ControlPlane {
     /// name (choices whose group or selected node vanished are dropped);
     /// choices kept in the state db survive because every change is persisted
     /// at set time, so no restore runs here. The alive set's
-    /// health-check registrations and URLTest group table are refreshed to
+    /// health-check registrations and group idle-probe table are refreshed to
     /// match the new group membership, and the node → eBPF outbound id map
     /// (`outbound_id_map`, already refreshed by the reload path) is built
     /// from the same config, keeping the two consistent.
@@ -370,20 +424,22 @@ impl ControlPlane {
                 db_cb.save_network_selector(group, network, member);
             })));
         }
-        {
-            let mut group_manager = self.group_manager.write();
-            new_gm.publish_score_membership();
-            *group_manager = Arc::new(new_gm);
-        }
-
-        // Refresh health-check registrations and the URLTest idle table to
-        // match the new group membership.
+        // Refresh health-check registrations and the group idle-probe table to
+        // match the new group membership. The idle probe state is published
+        // atomically under the manager guard; the deferred wake runs after it.
         let config = self.config.read().await;
         let (added, removed) = sync_health_check_nodes(&self.alive_set, &config);
-        self.alive_set
-            .sync_urltest_groups(&urltest_group_registrations(&config));
-        self.alive_set
-            .sync_group_check_urls(&group_check_url_registrations(&config));
+        let idle_groups = idle_group_registrations(&config);
+        let check_urls = group_check_url_registrations(&config);
+        let probe_wake = {
+            let mut group_manager = self.group_manager.write();
+            new_gm.publish_score_membership();
+            let probe_wake =
+                publish_group_probe_state(&self.alive_set, &new_gm, &idle_groups, &check_urls);
+            *group_manager = Arc::new(new_gm);
+            probe_wake
+        };
+        probe_wake.wake();
         info!(
             "Group manager rebuilt: {} group(s), health checks +{}/-{} node(s)",
             config.groups.len(),
