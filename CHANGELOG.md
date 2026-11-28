@@ -6,6 +6,67 @@ This changelog follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) 
 
 Entries live in [changes/](changes/) until release.
 
+## [0.2.2-rc.2] - 2026-11-28
+
+### Added
+
+- `use_host` rule files support domain aliases: an A/AAAA query for an alias resolves its target through the whole pipeline, and the reply includes the CNAME chain and target records.
+- DNS request rules accept `subtag(...)`, which resolves the server hosts of nodes from matching subscriptions through a chosen `-> direct` upstream (for example a provider's own DoH) instead of the bootstrap resolver. Each DNS generation precomputes host policy outcomes; native flow traces explicitly mark consumption of these decisions as incomplete evidence (`not_instrumented`).
+
+### Changed
+
+- Detour dial failures now name the failing hop: `detour hop 0 (socks-a): …` counts legs outward from the rider, so a dead front is visible in the error instead of hiding behind the rider's name. Failures are also attributed to that front in liveness tracking, not to the rider.
+- Every leg of a detour dial shares one deadline: each leg waits at most `min(connect_timeout, time left on the dial)`, so a silent second hop fails on the shared deadline instead of burning its own full timeout.
+- A detour that points back at itself (or cycles through other nodes) now fails fast at 4 hops with `detour depth exceeds 4` instead of descending until the dial timeout.
+- Automatic geodata updates run daily at 03:00 local time, plus the existing random delay of up to an hour, instead of every 24 hours. A schedule stored with `interval_hours` keeps its interval.
+- `assets.geodata` takes `auto_update`, `cron` and `checksum`, written into the stored geodata settings at startup like the download URLs and route.
+- The native API's geodata `auto_update` accepts a `cron` expression in place of `interval_hours` and reports it in `cron`.
+- Cron schedules skip nonexistent local times and use the first occurrence of a repeated time. Startup and API changes reject a schedule with no future occurrence in the local time zone; a later time-zone change is reported without dropping pending failure retries.
+- Health checks pause for every idle group policy after `idle_timeout` (default 1800 seconds) without traffic. Automatic groups resume probing their direct members on the next selection while keeping unselected Selector branches suspended; a Selector's current TCP and UDP picks, manually pinned automatic-group members (including custom `check_url`), and non-builtin `final` nodes keep being probed and wake immediately on change, and idle automatic groups still recover when all members fail TCP, data UDP, or a custom `check_url`.
+- The first selection after an idle group wakes no longer trusts pre-pause health: the picked member is raced against the group's next candidates instead of being dialed alone, until a fresh probe lands.
+- Remove the test-only health helpers (`mark_group_active`, `set_selected_nodes`, `register_idle_group`); tests now use the production paths (`mark_group_active_slot`, `replace_selected_nodes`, `sync_idle_groups`).
+
+### Fixed
+
+- Group detours now screen UDP front carriers before dialing: a front that cannot hand the rider a working UDP transport (or rejects the target port) is skipped for the next member, and the dial fails fast with "detour could not carry UDP to …" instead of burning the dial timeout; protocols that cannot ride a group detour on UDP fail before dialing instead of inside it.
+- A REALITY node with an explicit `fp` no longer switches key shares on a mask-certificate retry: the first attempt already sends the pinned fingerprint's hello, so a retry that swaps the hybrid share would send a hello the user never asked for. The mask-certificate error is returned instead. Nodes without `fp` keep the hybrid-first retry that falls back to classical X25519-only shares.
+- The mask-certificate check now walks the error cause chain instead of only matching the outermost error type, so a wrapped mask-certificate error still triggers the retry where one applies.
+- Shadowsocks can now ride a detour: its TCP handshake runs over the already-connected front stream instead of requiring a real socket, so a Shadowsocks node works as a group-detour member and through its own dialer-proxy. UDP through a group detour is still refused before dialing.
+- Probes that time out while still dialing now record an unavailable observation instead of leaving the node latency blank; timeouts after the connection is up still record nothing.
+- Load-time detour cycle rejection also follows a group's direct member nodes, so a cycle closed through a member (group → member → that member's detour → back to the group) is rejected at load instead of failing at dial time on the 4-hop cap; a group reached through a nested group or a fallback is expanded the same way as one named by a detour.
+- A group detour naming a MASQUE node refuses a MASQUE rider at dial time on TCP and UDP instead of nesting tunnels; the node-target path now carries the rider protocol like the group-target path, and non-MASQUE combinations are unchanged.
+- UDP detour legs now share the dial's deadline and hop count with the TCP legs: a nested UDP leg waits at most the time left on the dial and reports its own hop, instead of restarting the hop count and the deadline.
+- A detour cycle over UDP now fails fast at 4 legs with `detour depth exceeds 4`, the same cap the TCP legs already had.
+- The UDP detour pre-screen now skips Shadowsocks and SOCKS5 fronts that name their own detour, so a group falls through to the next member instead of failing the whole dial at the front's leaf refusal. A front naming `direct` is still eligible, like the leaf guards.
+- Startup no longer aborts on a retained geodata schedule with no future occurrence in the local zone; it only warns and the update loop keeps its retry backoff. The API still rejects a newly submitted explicit cron with no future occurrence.
+- Report a missing NFQUEUE subsystem as unavailable for the IPv6 bind as well as the IPv4 bind, so the startup warning names the missing `nfnetlink_queue` module instead of a raw `Invalid argument` error.
+- Validate `qname()` regexes at config validation (`qname-dns-regex`) instead of failing at router construction, for request, legacy and response DNS rules alike.
+- The splice relay now shares the copy relay's monotonic idle-drain deadline, so delayed polling no longer extends an idle drain; the DNS retry test that pinned successful retries not penalizing a Score candidate is restored.
+- Validate traffic-routing `domain()` regexes at config validation (`domain-routing-regex`) instead of failing at router construction, for positive and negated matchers alike.
+- Validate `subtag()` regexes at config validation (`subtag-dns-regex`) instead of failing at router construction, and stop splitting a `regex:` argument on a comma inside a `{n,m}` quantifier, `(...)` group or `[...]` character class, so unquoted comma regexes work in DNS `subtag()`/`qname()`, group filters and traffic-routing `domain()`.
+- Shadowsocks and SOCKS5 nodes that name a `dialer-proxy` no longer dial UDP directly: their UDP dial is refused before any packet is sent, instead of silently bypassing the front. TCP already rode the front (or refused); UDP now fails closed the same way.
+- Clash subscriptions coalesce equivalent Hysteria2 `ports`, `mport`, `port-hopping`, and `port_hopping` port-hopping aliases instead of dropping nodes that supply multiple aliases.
+- Non-Linux builds of `honk-core` no longer compile `libsystemd` for daemon notifications.
+- Held-first-packet UDP is no longer disabled at startup when the `nfnetlink_queue` module is built but not loaded, as on Debian 13: honk binds the queue and the kernel loads the module. When the module cannot be loaded, the startup warning says so.
+- A `routing` line holding only a vertical tab is ignored with a warning instead of crashing the parser.
+- The native API accepts provider names outside `[A-Za-z0-9_.-]`, such as `机场`, and writes them quoted.
+- After a userspace TCP relay reads EOF, its 30-second idle timeout covers the final flush and write-side shutdown. Delayed polling no longer extends an idle drain. On timeout, the returned byte totals count only bytes accepted by the destination.
+- Subscription connection and HTTP status failures name the selected node and group in the log. Classified fetch failures report their stage and available outbound attribution in native API provider `last_error.details`, including completed failures retained during shutdown; unusable subscription content reports `parse_failed`.
+- XHTTP nodes now dial through a group detour instead of silently dropping it: a flow riding a group detour gets a private carrier session of its own, so it rides the named front and never shares a session with a flow on another path; a flow riding the node's own detour keeps the node's pooled carriers.
+- XHTTP legs join the detour's shared deadline instead of resetting it: a carrier dial that runs out of the caller's remaining budget fails with the leg's hop tag, the same as every other transport.
+
+### Security
+
+- Update `url` to 2.5.9 for RUSTSEC-2026-0592, a stack overflow in `Url::origin()` on nested `blob:` URLs.
+
+### Internal
+
+- Pin the reload behavior for a bad hosts alias chain: the reload is rejected and the previous hosts snapshot keeps serving.
+- Share one port-range grammar between `parse_port_hopping` and `port_hopping_ranges`; both decoders keep their own result shape and behavior.
+- Pin the fallback for an unrecognised per-node TLS fingerprint: it behaves exactly like no fingerprint (global default, hybrid-first REALITY, mask-certificate retry allowed).
+- Correct the recorded aya versions in AGENTS.md to userspace `aya` 0.16 and kernel-side `aya-ebpf` 0.3, matching the migration already present in the tree, and note the audited `Pod` payload rule.
+- Name jemalloc as the shipped default allocator in the release guide.
+
 ## [0.2.2-rc.1] - 2026-11-22
 
 ### Added
@@ -220,7 +281,8 @@ Summarised from the [release notes](https://github.com/daeuniverse/honk/releases
 - Shared UDP sources survive malformed SOCKS5, Trojan and Juicity datagrams.
 - QUIC session tickets honour `skip_cert_verify`, and a reload restores warm carriers and probes.
 
-[Unreleased]: https://github.com/daeuniverse/honk/compare/v0.2.2-rc.1...HEAD
+[Unreleased]: https://github.com/daeuniverse/honk/compare/v0.2.2-rc.2...HEAD
+[0.2.2-rc.2]: https://github.com/daeuniverse/honk/compare/v0.2.2-rc.1...v0.2.2-rc.2
 [0.2.2-rc.1]: https://github.com/daeuniverse/honk/compare/v0.2.1...v0.2.2-rc.1
 [0.2.1]: https://github.com/daeuniverse/honk/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/daeuniverse/honk/compare/v0.1.0-beta.4...v0.2.0
