@@ -487,36 +487,41 @@ fn detour_cycle(
         return None;
     }
     path.push(name.to_string());
-    // A group reached this way carries whatever its own detour names, so the
-    // chain continues through it exactly as it would through a member.
-    let target = groups
+    // A group reached by any edge carries its members and its detour, so
+    // the chain continues through them exactly as it would through a
+    // member: a group entered through a nested group or a fallback is
+    // expanded the same way as one named by a detour. Members only a filter
+    // expression names need the resolver, which is where the group breaks
+    // its cycles.
+    if let Some(group) = groups.iter().find(|group| group.name == name) {
+        for member in group
+            .groups
+            .iter()
+            .chain(group.final_outbound.iter())
+            .chain(group.detour.iter())
+        {
+            if let Some(cycle) = detour_cycle(nodes, groups, member, path, settled) {
+                return Some(cycle);
+            }
+        }
+        for member in &group.nodes {
+            if let Some(node) = nodes.iter().find(|node| node.id == *member)
+                && let Some(cycle) = detour_cycle(nodes, groups, &node.name, path, settled)
+            {
+                return Some(cycle);
+            }
+        }
+        settled.insert(name.to_string());
+        path.pop();
+        return None;
+    }
+    // A node reached by any edge carries whatever its detour names.
+    let target = nodes
         .iter()
-        .find(|group| group.name == name)
-        .and_then(|group| group.detour.as_deref())
-        .or_else(|| {
-            nodes
-                .iter()
-                .find(|node| node.name == name)
-                .and_then(Node::detour_name)
-        });
+        .find(|node| node.name == name)
+        .and_then(Node::detour_name);
     if let Some(target) = target {
         if matches!(target, Config::BUILTIN_DIRECT_NODE) {
-            settled.insert(name.to_string());
-        } else if let Some(group) = groups.iter().find(|group| group.name == target) {
-            // A group detour leads wherever the group can lead: its nested
-            // groups, its fallback, and its own detour. Members only a filter
-            // expression names need the resolver, which is where the group
-            // breaks its cycles.
-            for member in group
-                .groups
-                .iter()
-                .chain(group.final_outbound.iter())
-                .chain(group.detour.iter())
-            {
-                if let Some(cycle) = detour_cycle(nodes, groups, member, path, settled) {
-                    return Some(cycle);
-                }
-            }
             settled.insert(name.to_string());
         } else if let Some(cycle) = detour_cycle(nodes, groups, target, path, settled) {
             return Some(cycle);
