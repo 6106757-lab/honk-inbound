@@ -168,6 +168,58 @@ fn patch_keeps_a_retained_unschedulable_schedule() {
 }
 
 #[test]
+fn a_retained_warning_fires_once_for_an_unrelated_patch() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    if run_local_schedule_test(concat!(
+        module_path!(),
+        "::a_retained_warning_fires_once_for_an_unrelated_patch"
+    )) {
+        return;
+    }
+    struct Warnings(Arc<AtomicUsize>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    let warnings = Arc::new(AtomicUsize::new(0));
+    let subscriber = tracing_subscriber::registry().with(Warnings(Arc::clone(&warnings)));
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    let directory = tempfile::tempdir().unwrap();
+    let sources = open(db(directory.path()), &settings("")).unwrap();
+    assert!(!sources.status.lock().schedule_unavailable);
+    // Model a retained plan that became unavailable without a reschedule
+    // (for example a zone change): the flag is still false.
+    sources.stored.lock().auto_update = Some(StoredAutoUpdate::new(
+        AutoUpdate {
+            enabled: true,
+            schedule: cron(GAP_CRON),
+        },
+        false,
+    ));
+    // An unrelated patch must warn once through the shared flag, and the
+    // schedule itself does not change, so reschedule() never runs.
+    let changed = sources
+        .apply(patch(json!({"verify_checksum": true})))
+        .unwrap();
+    assert_eq!(changed.auto_update.schedule, cron(GAP_CRON));
+    assert!(sources.status.lock().schedule_unavailable);
+    assert_eq!(warnings.load(Ordering::Relaxed), 1);
+    sources
+        .apply(patch(json!({"verify_checksum": false})))
+        .unwrap();
+    assert_eq!(warnings.load(Ordering::Relaxed), 1);
+}
+
+#[test]
 fn unavailable_runtime_schedule_preserves_retries_and_reports_one_warning_per_episode() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tracing_subscriber::layer::SubscriberExt as _;
