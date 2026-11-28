@@ -424,6 +424,53 @@ fn phase_timeout(message: &'static str) -> anyhow::Error {
     std::io::Error::new(std::io::ErrorKind::TimedOut, message).into()
 }
 
+/// Which half of a probe attempt the work died in. A dial that never
+/// finishes means the node never answered; an exchange that stalls only
+/// means it is slow. The probe layer reads this after the future is gone
+/// to decide whether a deadline deserves an unavailable observation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbePhase {
+    Dial,
+    Exchange,
+}
+
+/// Shareable probe-phase cell: the dial future flips it once the node
+/// connection is up, and the outcome reader reads it after the future was
+/// dropped by the deadline. The phase lives outside the future so a
+/// deadline drop cannot take the last written phase with it.
+#[derive(Clone, Debug)]
+pub struct ProbePhaseCell {
+    phase: Arc<std::sync::atomic::AtomicU8>,
+}
+
+impl ProbePhaseCell {
+    pub fn new() -> Self {
+        Self {
+            phase: Arc::new(std::sync::atomic::AtomicU8::new(ProbePhase::Dial as u8)),
+        }
+    }
+
+    pub fn phase(&self) -> ProbePhase {
+        match self.phase.load(std::sync::atomic::Ordering::SeqCst) {
+            1 => ProbePhase::Exchange,
+            _ => ProbePhase::Dial,
+        }
+    }
+
+    pub fn mark_exchange(&self) {
+        self.phase.store(
+            ProbePhase::Exchange as u8,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+}
+
+impl Default for ProbePhaseCell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Dial and perform two bounded HTTP exchanges, returning the warm-path RTT.
 /// Uses the request's URI and method; probe headers and the empty body are fixed.
 #[allow(clippy::too_many_arguments)]
@@ -449,6 +496,7 @@ pub async fn measure_http_probe(
         feedback,
         false,
         detour,
+        None,
     )
     .await
 }
@@ -465,6 +513,7 @@ async fn measure_http_probe_mode(
     feedback: Option<ScoreFeedback>,
     cold: bool,
     detour: Option<Arc<DetourPath>>,
+    phase: Option<ProbePhaseCell>,
 ) -> anyhow::Result<ProbeMeasurement> {
     validate_runtime(runtime)?;
     let target = request_target(request)?;
@@ -503,6 +552,12 @@ async fn measure_http_probe_mode(
             .await
             .map_err(|_| phase_timeout("HTTP probe dial timed out"))??;
         reporter_setup(&reporter);
+        // The node connection is up from here on: the target TLS handshake
+        // and the exchanges stall only when the node is slow, not when it
+        // never answered.
+        if let Some(phase) = &phase {
+            phase.mark_exchange();
+        }
         tracing::debug!(node = %node.name, %addr, "HTTP probe dial established");
         let stream = proxy.stream;
         if is_https {
@@ -552,6 +607,7 @@ async fn measure_http_probe_mode(
 /// cancellation and runtime teardown. HTTP/2 is driven inline, so dropping this
 /// future releases its connection without a detached driver task.
 #[cfg(feature = "flow-observation")]
+#[allow(clippy::too_many_arguments)]
 pub async fn measure_pinned_http_probe(
     runtime: &Arc<crate::runtime::NodeRuntime>,
     handler: &dyn TcpOutbound,
@@ -560,9 +616,10 @@ pub async fn measure_pinned_http_probe(
     cold: bool,
     timeout: Duration,
     detour: Option<Arc<DetourPath>>,
+    phase: Option<ProbePhaseCell>,
 ) -> anyhow::Result<ProbeMeasurement> {
     measure_http_probe_mode(
-        runtime, handler, request, addr, None, timeout, timeout, None, cold, detour,
+        runtime, handler, request, addr, None, timeout, timeout, None, cold, detour, phase,
     )
     .await
 }
