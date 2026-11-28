@@ -53,6 +53,7 @@ impl GroupManager {
         self.node_carries_udp(front)
             && self.is_node_selectable_for_domain(front.id, ProbeDomain::DataUdp, IpVersion::V4)
             && crate::descriptor::udp_target_allowed(front, target_port)
+            && !crate::descriptor::own_detour_blocks_udp_front(front)
     }
 
     /// Keep only capable, alive leaves; absent health tracking skips only health.

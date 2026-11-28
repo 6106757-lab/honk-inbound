@@ -241,6 +241,20 @@ pub fn udp_target_allowed(node: &Node, port: u16) -> bool {
         .is_none_or(|vless| !vless.udp_enabled() || vless.udp_path(port).is_some())
 }
 
+/// Whether the node names its own detour and so cannot serve as a UDP
+/// detour front.
+///
+/// Shadowsocks and SOCKS5 refuse a UDP dial up front when the node names a
+/// detour (see the guards in the Shadowsocks UDP transport and the SOCKS5
+/// UDP opener): the packet would leave the real interface while the TCP
+/// path rides the front. `direct` names no detour and is exempt, exactly
+/// like the leaf guards; every other protocol rides its own detour, so only
+/// these two are excluded.
+pub fn own_detour_blocks_udp_front(node: &Node) -> bool {
+    matches!(node.protocol(), NodeProtocol::SS | NodeProtocol::Socks5)
+        && node.detour_name().is_some_and(|name| name != "direct")
+}
+
 pub fn descriptor(protocol: NodeProtocol) -> &'static ProtocolDescriptor {
     DESCRIPTORS
         .iter()

@@ -980,6 +980,133 @@ mod tests {
         );
     }
 
+    /// An SS front that names its own detour cannot carry UDP as a detour
+    /// front — its leaf refuses the dial — so the screen skips it for the
+    /// next member. A front naming `direct`, or none at all, still carries.
+    #[test]
+    fn udp_carrier_skips_a_front_naming_its_own_detour() {
+        use honk_config::node::{Group, GroupPolicy};
+
+        let socks = Node::from_share_link("socks5://127.0.0.1:1080#socks").unwrap();
+        let resolve = |front: Node| {
+            let nodes = vec![front, socks.clone()];
+            let group = Group {
+                name: "fronts".into(),
+                policy: GroupPolicy::URLTest,
+                nodes: nodes.iter().map(|node| node.id).collect(),
+                ..Default::default()
+            };
+            let manager = Arc::new(GroupManager::new(std::slice::from_ref(&group), &nodes));
+            let path = DetourPath::to_group(
+                Arc::new(ProxyRegistry::new()),
+                Arc::new(OutboundRuntimeRegistry::build(&[]).unwrap()),
+                "fronts",
+                Arc::clone(&manager),
+                NodeProtocol::Hysteria2,
+            );
+            path.resolve_udp_carrier("1.2.3.4:443".parse().unwrap())
+        };
+
+        let mut ss =
+            Node::from_share_link("ss://aes-128-gcm:test-password@127.0.0.1:8388#ss-a").unwrap();
+        ss.detour = Some("socks".into());
+        ss.id = ss.derive_id();
+        assert_eq!(
+            resolve(ss).unwrap(),
+            socks.id,
+            "the SS front naming a detour is skipped for the next member"
+        );
+
+        let mut ss_direct =
+            Node::from_share_link("ss://aes-128-gcm:test-password@127.0.0.1:8388#ss-a").unwrap();
+        ss_direct.detour = Some("direct".into());
+        ss_direct.id = ss_direct.derive_id();
+        assert_eq!(
+            resolve(ss_direct.clone()).unwrap(),
+            ss_direct.id,
+            "naming `direct` is no detour, so the front still carries"
+        );
+
+        let ss_plain =
+            Node::from_share_link("ss://aes-128-gcm:test-password@127.0.0.1:8388#ss-a").unwrap();
+        assert_eq!(
+            resolve(ss_plain.clone()).unwrap(),
+            ss_plain.id,
+            "an SS front with no detour still carries"
+        );
+    }
+
+    /// When the only member is screened out for naming its own detour the
+    /// dial fails at resolution, with the same wording as any other screened
+    /// front — only sooner.
+    #[test]
+    fn udp_carrier_fails_fast_when_the_only_front_names_a_detour() {
+        use honk_config::node::{Group, GroupPolicy};
+
+        let mut ss =
+            Node::from_share_link("ss://aes-128-gcm:test-password@127.0.0.1:8388#ss-a").unwrap();
+        ss.detour = Some("front".into());
+        ss.id = ss.derive_id();
+        let group = Group {
+            name: "fronts".into(),
+            policy: GroupPolicy::URLTest,
+            nodes: vec![ss.id],
+            ..Default::default()
+        };
+        let manager = Arc::new(GroupManager::new(
+            std::slice::from_ref(&group),
+            std::slice::from_ref(&ss),
+        ));
+        let path = DetourPath::to_group(
+            Arc::new(ProxyRegistry::new()),
+            Arc::new(OutboundRuntimeRegistry::build(&[]).unwrap()),
+            "fronts",
+            Arc::clone(&manager),
+            NodeProtocol::Hysteria2,
+        );
+        let error = path
+            .resolve_udp_carrier("1.2.3.4:443".parse().unwrap())
+            .expect_err("no member can carry UDP past its own detour")
+            .to_string();
+        assert!(
+            error.contains("detour could not carry UDP to 1.2.3.4:443"),
+            "{error}"
+        );
+    }
+
+    /// Same skip as T1 for the other leaf-guarded protocol: a SOCKS5 front
+    /// naming its own detour is skipped for the next member.
+    #[test]
+    fn udp_carrier_skips_a_socks5_front_naming_its_own_detour() {
+        use honk_config::node::{Group, GroupPolicy};
+
+        let socks = Node::from_share_link("socks5://127.0.0.1:1080#socks").unwrap();
+        let mut detoured = Node::from_share_link("socks5://127.0.0.1:1081#socks-detour").unwrap();
+        detoured.detour = Some("socks".into());
+        detoured.id = detoured.derive_id();
+        let nodes = vec![detoured.clone(), socks.clone()];
+        let group = Group {
+            name: "fronts".into(),
+            policy: GroupPolicy::URLTest,
+            nodes: nodes.iter().map(|node| node.id).collect(),
+            ..Default::default()
+        };
+        let manager = Arc::new(GroupManager::new(std::slice::from_ref(&group), &nodes));
+        let path = DetourPath::to_group(
+            Arc::new(ProxyRegistry::new()),
+            Arc::new(OutboundRuntimeRegistry::build(&[]).unwrap()),
+            "fronts",
+            Arc::clone(&manager),
+            NodeProtocol::Hysteria2,
+        );
+        assert_eq!(
+            path.resolve_udp_carrier("1.2.3.4:443".parse().unwrap())
+                .unwrap(),
+            socks.id,
+            "the SOCKS5 front naming a detour is skipped for the next member"
+        );
+    }
+
     /// Fake DNS wire reply: echo the query, answer with `ips` in the queried family.
     fn fake_dns_response(query: &[u8], ips: &[IpAddr]) -> Vec<u8> {
         let qtype = u16::from_be_bytes([query[query.len() - 4], query[query.len() - 3]]);

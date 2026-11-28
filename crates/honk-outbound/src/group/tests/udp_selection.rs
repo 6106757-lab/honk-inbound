@@ -95,6 +95,38 @@ fn front_carries_udp_for_screens_capability_liveness_and_port() {
     assert!(manager.front_carries_udp_for(&vless_reject, 53));
 }
 
+/// An SS/Socks5 front that names its own detour cannot carry UDP as a
+/// detour front: its leaf refuses the dial, so the screen excludes it.
+/// Naming `direct`, or nothing at all, still carries.
+#[test]
+fn front_carries_udp_for_screens_a_front_naming_its_own_detour() {
+    let mut ss =
+        Node::from_share_link("ss://aes-128-gcm:test-password@127.0.0.1:8388#ss-a").unwrap();
+    ss.detour = Some("front".into());
+    ss.id = ss.derive_id();
+    let mut ss_direct =
+        Node::from_share_link("ss://aes-128-gcm:test-password@127.0.0.1:8388#ss-a").unwrap();
+    ss_direct.detour = Some("direct".into());
+    ss_direct.id = ss_direct.derive_id();
+    let ss_plain =
+        Node::from_share_link("ss://aes-128-gcm:test-password@127.0.0.1:8388#ss-a").unwrap();
+    let mut socks_detour = Node::from_share_link("socks5://127.0.0.1:1080#socks-detour").unwrap();
+    socks_detour.detour = Some("front".into());
+    socks_detour.id = socks_detour.derive_id();
+
+    let nodes = vec![
+        ss.clone(),
+        ss_direct.clone(),
+        ss_plain.clone(),
+        socks_detour.clone(),
+    ];
+    let manager = GroupManager::new(&[], &nodes);
+    assert!(!manager.front_carries_udp_for(&ss, 443));
+    assert!(!manager.front_carries_udp_for(&socks_detour, 443));
+    assert!(manager.front_carries_udp_for(&ss_direct, 443));
+    assert!(manager.front_carries_udp_for(&ss_plain, 443));
+}
+
 #[test]
 fn udp_pick_prefers_node_with_udp_latency_over_mirror() {
     let (t, a) = (nid("trojan"), nid("anytls"));
