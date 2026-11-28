@@ -421,7 +421,19 @@ impl DnsController {
             28 => Some(IpVersion::V6),
             _ => None,
         };
-        let observation = if crate::dns::response::is_truncated(outcome.reusable()) {
+        // Only outcomes that can change the projection pay for the wire checks.
+        let projects = outcome.status() == OutcomeStatus::Accepted
+            && matches!(
+                (outcome.response_class(), family),
+                (ResponseClass::Positive | ResponseClass::Nodata, Some(_))
+                    | (ResponseClass::Nxdomain, _)
+            );
+        let observation = if projects
+            && (crate::dns::response::is_truncated(outcome.reusable())
+                || !matches!(
+                    crate::dns::response::response_rcode(outcome.reusable()),
+                    Ok(0 | 3)
+                )) {
             ProjectionObservation::Retain
         } else {
             match (outcome.status(), outcome.response_class(), family) {
