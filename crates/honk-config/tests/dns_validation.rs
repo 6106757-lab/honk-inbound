@@ -388,6 +388,15 @@ fn qname_regexes_are_compiled_by_validation() {
         error.diagnostic.setting.to_string(),
         "dns.routing.request.rules[2].conditions"
     );
+    // Negation does not excuse an invalid regex: the pattern itself must compile.
+    let error = config("!qname(regex:() -> providerdoh")
+        .validate_detailed()
+        .expect_err("invalid negated qname regex must fail validation");
+    assert_eq!(error.diagnostic.code, "qname-dns-regex");
+    assert_eq!(
+        error.diagnostic.setting.to_string(),
+        "dns.routing.request.rules[1].conditions"
+    );
     // Controls: a valid regex and non-regex matchers validate fine.
     config("qname(regex:^a{1,2}$) -> providerdoh")
         .validate()
