@@ -171,7 +171,8 @@ fn node_with_fp(fp: &str) -> Node {
 }
 
 /// An unrecognised stored fingerprint behaves exactly like no fingerprint:
-/// the global default applies, and both REALITY gates stay open.
+/// the global default applies, the hybrid-first default stands, and the
+/// mask-certificate retry stays allowed.
 #[test]
 fn unknown_fingerprint_behaves_like_no_fingerprint() {
     set_tls_mode("utls");
@@ -212,6 +213,12 @@ fn known_fingerprint_pins_the_node() {
     assert_eq!(fingerprint_for_node(&chrome), TlsFingerprint::Chrome);
     assert!(reality_hybrid_first(&chrome));
     assert!(!reality_key_share_fallback(&chrome));
+
+    // Android is the third Chromium-family profile: hybrid-first, gate shut.
+    let android = node_with_fp("android");
+    assert_eq!(fingerprint_for_node(&android), TlsFingerprint::Android);
+    assert!(reality_hybrid_first(&android));
+    assert!(!reality_key_share_fallback(&android));
 }
 
 #[test]
