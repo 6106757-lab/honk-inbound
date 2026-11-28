@@ -239,13 +239,15 @@ vless://00000000-0000-4000-8000-000000000000@example.com:443?security=tls#edge
 
 | 协议 | 导入的选项 |
 | --- | --- |
-| Hysteria2 | `password`/`auth`，以及 `obfs: salamander` 与 `obfs-password`。支持上传/下载带宽、`ports`/`mport` 跳跃端口范围、`hop-interval`/`mhop`、接收窗口、MTU 与 MTU 发现设置。 |
+| Hysteria2 | `password`/`auth`，以及 `obfs: salamander` 与 `obfs-password`。支持上传/下载带宽、`ports`/`mport`/`port-hopping`/`port_hopping` 跳跃端口范围、`hop-interval`/`mhop`、接收窗口、MTU 与 MTU 发现设置。 |
 | TUIC | UUID/密码、拥塞控制、ALPN、接收窗口、MTU。 |
 | AnyTLS | `idle-session-check-interval`、`idle-session-timeout`、`min-idle-session`。 |
 
 显式关闭的功能块按禁用处理，不会误判为启用未支持功能。原生支持 UDP 的协议接受 `udp: true`，包括使用 command-UDP 承载 UDP 的 VMess。节点模型无法保留显式 UDP 限制时会拒绝导入。
 
 TUIC 允许省略密码或使用空密码。Hysteria2 和 Juicity 接受与运行时固定选择一致的 `h3` ALPN。
+
+Hysteria2 端口跳跃别名按 `ports`、`mport`、`port-hopping`、`port_hopping` 的顺序解析。null、空字符串或纯空白文本，以及空数组不提供声明。已提供的字符串、有限数字或数组会把范围分隔符 `:` 规范化为 `-`，再按规范的非零端口集合比较，因此 `["4000:5000", 6000]` 与 `6000,4000-5000` 或相邻区间这类等价写法会视为一致，并保留第一个非空别名的规范化拼写。范围冲突，或者任意别名无效、规范化后为空或包含重复端口时，即使同时存在有效别名，条目也会被拒绝。
 
 Juicity 的流和连接接收窗口初始均为 8 MiB，自适应流控可将两者分别调高至最多 32 MiB。导入的初始窗口字段接受缺失值、`0` 或 `8388608`，拒绝其他覆盖值。
 
