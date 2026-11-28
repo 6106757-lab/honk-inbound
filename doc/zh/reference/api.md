@@ -994,7 +994,7 @@ HTTPS 验证证书。直连请求只用配置的数字地址 `global.bootstrap_r
 
 `auto_update` 单独存储。`interval_hours`（6–168）切换为间隔计划，`cron` 切换为 cron 计划；同一请求同时带两者返回 400，只带 `enabled` 时保留当前计划。cron 计划读作 `interval_hours: 24`，`cron` 为表达式；间隔计划的 `cron` 为 null。`assets.geodata.auto_update` 与 `cron` 在启动时写入它（见 [Assets 参考](./assets.md)）。`download` 单独存储。`group` 路由必须带 `group_id`，其他路由不能带。
 
-Cron 语法与日历解析不依赖时区。Geodata 所有者启动与 PATCH 还会拒绝在实际本地时区中没有未来触发时间的显式 cron，即使 `enabled: false`。保留的计划在启用时接受此检查：不可用的计划仍可通过 PATCH 禁用或修复，有效的文件覆盖值也可以在启动时修复旧的已存储计划。不可用的计划不会被替换为默认值。
+Cron 语法与日历解析不依赖时区。Geodata 所有者启动时不再拒绝在实际本地时区中没有未来触发时间的显式 cron：不可用的保留计划只警告，更新循环保留重试退避。PATCH 仍拒绝新提交的无未来触发时间的显式 cron，即使 `enabled: false`。保留的计划在启用时接受此检查：不可用的计划仍可通过 PATCH 禁用或修复，有效的文件覆盖值也可以在启动时修复旧的已存储计划。不可用的计划不会被替换为默认值。
 
 ID 不对应当前任何组时返回 `409 state_conflict`。已存储的组被后续激活删除后，`group_id` 读作 null，下载以 `group_unavailable` 失败，直到修改路由。`verify_checksum` 单独存储，`assets.geodata.checksum` 在启动时写入它。
 
