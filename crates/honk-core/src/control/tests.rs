@@ -2970,6 +2970,16 @@ fn tripwire_test_handle(
             honk_config::types::NodeProtocol::Socks5,
             handler.clone(),
         )
+        .with_packet(handler.clone()),
+    );
+    // Shadowsocks rides the same tripwire: its TCP can detour since
+    // Tier 4-2, but its UDP has no detoured dial and is still refused
+    // before dialing by the same guard.
+    registry.register(
+        honk_outbound::proxy::ProtocolEntry::new(
+            honk_config::types::NodeProtocol::SS,
+            handler.clone(),
+        )
         .with_packet(handler),
     );
     // The production endpoint pool binds real UDP reply sockets, which the
@@ -2998,6 +3008,20 @@ fn tripwire_socks5_node(name: &str, port: u16) -> Node {
         name: name.into(),
         outbound: honk_config::node::OutboundConfig::from_protocol(
             honk_config::types::NodeProtocol::Socks5,
+        ),
+        address: "127.0.0.1".into(),
+        port,
+        ..Default::default()
+    };
+    node.id = node.derive_id();
+    node
+}
+
+fn tripwire_ss_node(name: &str, port: u16) -> Node {
+    let mut node = Node {
+        name: name.into(),
+        outbound: honk_config::node::OutboundConfig::from_protocol(
+            honk_config::types::NodeProtocol::SS,
         ),
         address: "127.0.0.1".into(),
         port,
@@ -3072,6 +3096,74 @@ async fn udp_group_detour_refuses_non_riding_protocol_before_dialing() {
         dials.load(std::sync::atomic::Ordering::Relaxed),
         1,
         "the rider dials when no detour applies"
+    );
+    assert_eq!(
+        detoured_dials.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "no detoured dial without a detour"
+    );
+
+    // Shadowsocks is refused the same way: its TCP can ride a detour, but
+    // its UDP has no detoured dial, so the guard still refuses it before
+    // any dial is attempted.
+    let ss_ride = tripwire_ss_node("ride-ss", 11);
+    let ss_front = tripwire_ss_node("front-ss", 12);
+    let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let detoured_dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut ss_ride_group = Group {
+        name: "ride".into(),
+        policy: honk_config::group::GroupPolicy::Selector,
+        nodes: vec![ss_ride.id],
+        ..Default::default()
+    };
+    ss_ride_group.detour = Some("front".into());
+    let mut config = udp_test_config(
+        "ride",
+        vec![ss_ride.clone(), ss_front.clone()],
+        vec![
+            ss_ride_group,
+            Group {
+                name: "front".into(),
+                policy: honk_config::group::GroupPolicy::Selector,
+                nodes: vec![ss_front.id],
+                ..Default::default()
+            },
+        ],
+    );
+    config.ensure_builtin_nodes();
+    let handle = tripwire_test_handle(config, dials.clone(), detoured_dials.clone());
+    serve_test_udp(&handle).await.unwrap();
+    assert_eq!(
+        dials.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "no protocol dial is attempted for a refused SS rider"
+    );
+    assert_eq!(
+        detoured_dials.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the detoured dial is never attempted for a refused SS rider"
+    );
+
+    // Control: the same SS rider without a detour dials normally.
+    let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let detoured_dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut config = udp_test_config(
+        "ride",
+        vec![ss_ride.clone(), ss_front.clone()],
+        vec![Group {
+            name: "ride".into(),
+            policy: honk_config::group::GroupPolicy::Selector,
+            nodes: vec![ss_ride.id],
+            ..Default::default()
+        }],
+    );
+    config.ensure_builtin_nodes();
+    let handle = tripwire_test_handle(config, dials.clone(), detoured_dials.clone());
+    serve_test_udp(&handle).await.unwrap();
+    assert_eq!(
+        dials.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the SS rider dials when no detour applies"
     );
     assert_eq!(
         detoured_dials.load(std::sync::atomic::Ordering::Relaxed),
