@@ -34,7 +34,7 @@ routing {
 
 | Function | Accepted arguments | Internal `RoutingCondition` field |
 | --- | --- | --- |
-| `domain(...)` | Bare value or `suffix:` for a suffix; `keyword:` for a substring; `full:` for an exact name; `regex:` for a regular expression; `geosite:` for a geosite code | `domain_suffix`, `domain_keyword`, `domain`, `domain_regex`, `geosite` |
+| `domain(...)` | Bare value or `suffix:` for a suffix; `keyword:` for a substring; `full:` for an exact name; `regex:` for a regular expression (an invalid one fails config validation with `domain-routing-regex`); `geosite:` for a geosite code | `domain_suffix`, `domain_keyword`, `domain`, `domain_regex`, `geosite` |
 | `dip(...)` | Destination IP/CIDR; `geoip: code` | `ip`, `geo_ip` |
 | `sip(...)` | Source IP/CIDR | `source_ip` |
 | `dport(...)` | Destination port or inclusive `start-end` range | `port` |

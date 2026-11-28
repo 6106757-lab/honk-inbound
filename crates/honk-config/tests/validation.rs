@@ -31,6 +31,62 @@ mod traffic_and_dns_rules {
     }
 
     #[test]
+    fn routing_domain_regex_is_compiled_by_validation() {
+        let config = |rule: &str| {
+            honk_config::parser::parse_dae_config(&format!(
+                "routing {{\n {rule}\n fallback: direct\n}}\n"
+            ))
+            .unwrap()
+        };
+        // An invalid regex fails validation now, not at router construction.
+        let error = config("domain(regex:^a{1) -> direct")
+            .validate_detailed()
+            .expect_err("invalid routing domain regex must fail validation");
+        assert_eq!(error.diagnostic.code, "domain-routing-regex");
+        assert_eq!(
+            error.diagnostic.setting.to_string(),
+            "routing.rules[1].domain_regex"
+        );
+        // The entry index follows the offending rule, not the first rule.
+        let error = config("domain(full:example.com) -> direct\n domain(regex:^a{1) -> direct")
+            .validate_detailed()
+            .expect_err("invalid routing domain regex in the second rule must fail validation");
+        assert_eq!(error.diagnostic.code, "domain-routing-regex");
+        assert_eq!(
+            error.diagnostic.setting.to_string(),
+            "routing.rules[2].domain_regex"
+        );
+        // Controls: a valid regex and non-regex domains validate fine.
+        config("domain(regex:^a{1,2}$) -> direct")
+            .validate()
+            .unwrap();
+        config("domain(full:example.com) -> direct")
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn routing_negated_domain_regex_is_compiled_by_validation() {
+        let config = |rule: &str| {
+            honk_config::parser::parse_dae_config(&format!(
+                "routing {{\n {rule}\n fallback: direct\n}}\n"
+            ))
+            .unwrap()
+        };
+        let error = config("!domain(regex:^a{1) -> direct")
+            .validate_detailed()
+            .expect_err("invalid negated routing domain regex must fail validation");
+        assert_eq!(error.diagnostic.code, "domain-routing-regex");
+        assert_eq!(
+            error.diagnostic.setting.to_string(),
+            "routing.rules[1].not.domain_regex"
+        );
+        config("!domain(regex:^a{1,2}$) -> direct")
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
     fn invalid_dns_conjunct_omits_whole_rule() {
         for (matcher, code) in [
             ("", "invalid-dns-rule"),

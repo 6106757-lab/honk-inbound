@@ -1098,6 +1098,27 @@ impl Config {
         };
         for (index, rule) in self.routing.rules.iter().enumerate() {
             check_outbound(rule.outbound.as_str(), Some(index))?;
+            // A domain regex compiles at router construction; check it here
+            // so an invalid one fails validation instead of startup/reload.
+            // Positive first, then negated: both reach DomainMatcher::new.
+            for (values, field) in [
+                (&rule.condition.domain_regex, "domain_regex"),
+                (&rule.condition.not.domain_regex, "not.domain_regex"),
+            ] {
+                for pattern in values {
+                    if regex::Regex::new(pattern).is_err() {
+                        return Err(config_validation_error(
+                            source,
+                            SettingPath::new("routing")
+                                .field("rules")
+                                .index(index + 1)
+                                .field(field),
+                            "domain-routing-regex",
+                            "a domain() regex: value is not a valid regular expression",
+                        ));
+                    }
+                }
+            }
         }
         check_outbound(&self.routing.default_outbound, None)?;
         self.validate_node_detours_detailed(source)?;

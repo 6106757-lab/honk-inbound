@@ -34,7 +34,7 @@ routing {
 
 | 函数 | 接受的参数 | 内部 `RoutingCondition` 字段 |
 | --- | --- | --- |
-| `domain(...)` | 裸值或 `suffix:` 表示后缀；`keyword:` 表示子串；`full:` 表示完整名称；`regex:` 表示正则表达式；`geosite:` 表示 geosite 代码 | `domain_suffix`, `domain_keyword`, `domain`, `domain_regex`, `geosite` |
+| `domain(...)` | 裸值或 `suffix:` 表示后缀；`keyword:` 表示子串；`full:` 表示完整名称；`regex:` 表示正则表达式（无效值在配置校验时报 `domain-routing-regex`）；`geosite:` 表示 geosite 代码 | `domain_suffix`, `domain_keyword`, `domain`, `domain_regex`, `geosite` |
 | `dip(...)` | 目的 IP/CIDR；`geoip: code` | `ip`, `geo_ip` |
 | `sip(...)` | 源 IP/CIDR | `source_ip` |
 | `dport(...)` | 目的端口或闭区间 `start-end` | `port` |
