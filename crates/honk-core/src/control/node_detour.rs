@@ -69,7 +69,12 @@ pub(crate) fn bind_node_detours(
                     continue;
                 }
                 tracing::info!(node = %node.name, detour = %name, "detour bound to node");
-                DetourPath::new(Arc::clone(proxies), Arc::clone(registry), target.id)
+                DetourPath::new(
+                    Arc::clone(proxies),
+                    Arc::clone(registry),
+                    target.id,
+                    node.protocol(),
+                )
             }
             (None, Some(_)) => {
                 tracing::info!(node = %node.name, detour = %name, "detour bound to group");
@@ -170,6 +175,7 @@ pub(crate) fn group_detour(
             Arc::clone(proxies),
             Arc::clone(generation),
             node.id,
+            rider,
         )));
     }
     if let Some(node) = config.nodes.iter().find(|node| node.name == name) {
@@ -177,6 +183,7 @@ pub(crate) fn group_detour(
             Arc::clone(proxies),
             Arc::clone(generation),
             node.id,
+            rider,
         )));
     }
     if config.groups.iter().any(|group| group.name == name) {
@@ -231,10 +238,11 @@ mod tests {
     //! a test built on one that does not would pass whatever the chain did.
 
     use super::*;
-    use honk_config::node::{OutboundConfig, TrojanConfig};
+    use honk_config::node::{MasqueConfig, OutboundConfig, TrojanConfig};
     use honk_config::types::{NodeProtocol, SubscriptionType};
     use honk_outbound::group::GroupManager;
     use honk_outbound::proxy::ProtocolEntry;
+    use honk_outbound::proxy::detour::DetourDialCtx;
     use honk_outbound::proxy::socks5::Socks5Handler;
     use honk_outbound::proxy::trojan::TrojanHandler;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -735,6 +743,65 @@ mod tests {
         assert!(
             format!("{path:?}").contains(&front_id.to_string()),
             "the path must name the node the group pointed at: {path:?}"
+        );
+    }
+
+    /// A group detour naming a MASQUE node refuses a MASQUE rider at dial
+    /// time instead of nesting tunnels. The rider reaches `group_detour`
+    /// as an explicit argument, so the node front is judged like the group
+    /// front is; the group itself needs no MASQUE member for this.
+    #[tokio::test]
+    async fn group_detour_passes_the_rider_to_a_node_front() {
+        let mut config = honk_config::Config::default();
+        let mut front = Node {
+            name: "masque-front".into(),
+            address: "127.0.0.1:443".into(),
+            host: "127.0.0.1".into(),
+            port: 443,
+            outbound: OutboundConfig::Masque(MasqueConfig {
+                network: Some("quic".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        front.id = front.derive_id();
+        config.nodes.push(front);
+        config.groups.push(honk_config::group::Group {
+            name: "wallet".into(),
+            policy: honk_config::group::GroupPolicy::Selector,
+            detour: Some("masque-front".into()),
+            ..Default::default()
+        });
+
+        let (generation, _) =
+            OutboundRuntimeRegistry::build_reusing(&config.nodes, 4, None).unwrap();
+        let manager = Arc::new(GroupManager::new(&config.groups, &config.nodes));
+        let path = group_detour(
+            &config,
+            &Arc::new(ProxyRegistry::new()),
+            &Arc::new(generation),
+            &manager,
+            "wallet",
+            NodeProtocol::Masque,
+        )
+        .expect("a node name must resolve");
+        // Any target works: resolution refuses before any dial. The short
+        // timeout only bounds the pre-fix failure, where the dial falls
+        // through to the ADDRESS_ASSIGN bail (no `ip` configured) or the
+        // closed loopback port.
+        let target: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let error = path
+            .connect(
+                target,
+                Duration::from_secs(1),
+                &DetourDialCtx::root(Duration::from_secs(1)),
+            )
+            .await
+            .expect_err("a MASQUE node front cannot carry a MASQUE rider")
+            .to_string();
+        assert!(
+            error.contains("would nest tunnels"),
+            "the refusal names the nest ban: {error}"
         );
     }
 
