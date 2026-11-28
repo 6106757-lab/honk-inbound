@@ -164,6 +164,74 @@ fn test_node() -> Node {
     }
 }
 
+fn node_with_fp(fp: &str) -> Node {
+    let mut node = test_node();
+    node.tls_mut().unwrap().fingerprint = Some(fp.to_string());
+    node
+}
+
+/// An unrecognised stored fingerprint behaves exactly like no fingerprint:
+/// the global default applies, and both REALITY gates stay open.
+#[test]
+fn unknown_fingerprint_behaves_like_no_fingerprint() {
+    set_tls_mode("utls");
+    set_utls_imitate("firefox");
+    for fp in ["foobar", "plain", "PLAIN", " chrome2 "] {
+        let node = node_with_fp(fp);
+        assert_eq!(
+            fingerprint_for_node(&node),
+            TlsFingerprint::Firefox,
+            "{fp:?} should fall back to the global default"
+        );
+        assert_eq!(
+            fingerprint_for_node(&node),
+            fingerprint_for_node(&test_node()),
+            "{fp:?} should behave like no fingerprint"
+        );
+        assert!(
+            reality_hybrid_first(&node),
+            "{fp:?} should keep the hybrid-first default"
+        );
+        assert!(
+            reality_key_share_fallback(&node),
+            "{fp:?} should keep the mask-certificate retry allowed"
+        );
+    }
+}
+
+/// A recognised stored fingerprint pins the node: it decides the hello and
+/// both REALITY gates.
+#[test]
+fn known_fingerprint_pins_the_node() {
+    let ios = node_with_fp("ios");
+    assert_eq!(fingerprint_for_node(&ios), TlsFingerprint::Ios);
+    assert!(!reality_hybrid_first(&ios));
+    assert!(!reality_key_share_fallback(&ios));
+
+    let chrome = node_with_fp("chrome");
+    assert_eq!(fingerprint_for_node(&chrome), TlsFingerprint::Chrome);
+    assert!(reality_hybrid_first(&chrome));
+    assert!(!reality_key_share_fallback(&chrome));
+}
+
+#[test]
+fn fingerprint_parse_table() {
+    for (name, expected) in [
+        ("chrome", Some(TlsFingerprint::Chrome)),
+        ("chrome_auto", Some(TlsFingerprint::Chrome)),
+        ("firefox", Some(TlsFingerprint::Firefox)),
+        ("safari", Some(TlsFingerprint::Safari)),
+        ("ios", Some(TlsFingerprint::Ios)),
+        ("android", Some(TlsFingerprint::Android)),
+        ("edge", Some(TlsFingerprint::Edge)),
+        ("plain", None),
+        ("foobar", None),
+        ("", None),
+    ] {
+        assert_eq!(TlsFingerprint::parse(name), expected, "{name:?}");
+    }
+}
+
 #[tokio::test]
 async fn handshake_standard_and_chrome() {
     for chrome in [false, true] {
