@@ -5,10 +5,10 @@ const GAP_CRON: &str = "30 2 8-14 3 */7";
 const INVALID_STORED: &str = r#"{"urls":[{"urls":["https://mirror.example/geosite.dat"]},null],"auto_update":{"enabled":true,"cron":"30 2 8-14 3 */7"},"download":{"route":{"route":"direct"}},"verify_checksum":false}"#;
 
 #[test]
-fn unavailable_file_and_retained_schedules_leave_storage_unchanged() {
+fn unavailable_file_and_retained_schedules_are_kept_at_startup() {
     if run_local_schedule_test(concat!(
         module_path!(),
-        "::unavailable_file_and_retained_schedules_leave_storage_unchanged"
+        "::unavailable_file_and_retained_schedules_are_kept_at_startup"
     )) {
         return;
     }
@@ -17,27 +17,49 @@ fn unavailable_file_and_retained_schedules_leave_storage_unchanged() {
         if let Some(record) = record {
             store_settings(directory.path(), record);
         }
-        let before = stored_record(directory.path());
         for enabled in [true, false] {
             let mut file = schedule_file(Some(enabled), Some(GAP_CRON));
             file.checksum = Some(false);
-            assert!(matches!(
-                Sources::open(
-                    db(directory.path()),
-                    &settings("https://config.example/geosite.dat"),
-                    &file,
-                ),
-                Err(Error::ScheduleUnavailable)
-            ));
-            assert_eq!(stored_record(directory.path()), before);
+            let sources = Sources::open(
+                db(directory.path()),
+                &settings("https://config.example/geosite.dat"),
+                &file,
+            )
+            .unwrap();
+            assert_eq!(
+                sources.effective().auto_update,
+                AutoUpdate {
+                    enabled,
+                    schedule: cron(GAP_CRON),
+                }
+            );
+            if enabled {
+                assert!(sources.status.lock().schedule_unavailable);
+            } else {
+                // A disabled schedule is off, not unavailable.
+                assert!(!sources.status.lock().schedule_unavailable);
+                assert_eq!(sources.next_check_at(), None);
+            }
+            assert!(
+                stored_record(directory.path())
+                    .as_deref()
+                    .unwrap()
+                    .contains(GAP_CRON),
+                "the file plan is stored, not dropped"
+            );
         }
     }
     let directory = tempfile::tempdir().unwrap();
     store_settings(directory.path(), INVALID_STORED);
-    assert!(matches!(
-        open(db(directory.path()), &settings("")),
-        Err(Error::ScheduleUnavailable)
-    ));
+    let sources = open(db(directory.path()), &settings("")).unwrap();
+    assert_eq!(
+        sources.effective().auto_update,
+        AutoUpdate {
+            enabled: true,
+            schedule: cron(GAP_CRON),
+        }
+    );
+    assert!(sources.status.lock().schedule_unavailable);
     assert_eq!(
         stored_record(directory.path()).as_deref(),
         Some(INVALID_STORED)
@@ -54,10 +76,15 @@ fn a_valid_file_schedule_repairs_an_unavailable_stored_schedule() {
     }
     let directory = tempfile::tempdir().unwrap();
     store_settings(directory.path(), INVALID_STORED);
-    assert!(matches!(
-        open(db(directory.path()), &settings("")),
-        Err(Error::ScheduleUnavailable)
-    ));
+    // Startup keeps the retained plan; a valid file schedule repairs it.
+    let sources = open(db(directory.path()), &settings("")).unwrap();
+    assert_eq!(
+        sources.effective().auto_update,
+        AutoUpdate {
+            enabled: true,
+            schedule: cron(GAP_CRON),
+        }
+    );
     let sources = open_with(directory.path(), &schedule_file(None, Some("0 4 * * *")));
     let repaired = sources.effective();
     assert_eq!(repaired.auto_update.schedule, cron("0 4 * * *"));
@@ -92,14 +119,17 @@ fn explicit_unavailable_cron_is_refused_while_disabled_records_remain_repairable
         )),
         Err(Error::ScheduleUnavailable)
     ));
-    assert!(matches!(
-        sources.apply(patch(json!({"auto_update": {"enabled": true}}))),
-        Err(Error::ScheduleUnavailable)
-    ));
-    assert_eq!(sources.effective(), before);
-    assert_eq!(
+    // Enabling a retained unavailable schedule only warns; it is kept.
+    let enabled = sources
+        .apply(patch(json!({"auto_update": {"enabled": true}})))
+        .unwrap();
+    assert!(enabled.auto_update.enabled);
+    assert_eq!(enabled.auto_update.schedule, cron(GAP_CRON));
+    assert!(sources.status.lock().schedule_unavailable);
+    assert_ne!(
         stored_record(directory.path()).as_deref(),
-        Some(record.as_str())
+        Some(record.as_str()),
+        "the enable is stored"
     );
     assert_eq!(
         sources
@@ -112,6 +142,81 @@ fn explicit_unavailable_cron_is_refused_while_disabled_records_remain_repairable
         .unwrap();
     assert_eq!(changed.auto_update, before.auto_update);
     assert!(changed.verify_checksum);
+}
+
+#[test]
+fn patch_keeps_a_retained_unschedulable_schedule() {
+    if run_local_schedule_test(concat!(
+        module_path!(),
+        "::patch_keeps_a_retained_unschedulable_schedule"
+    )) {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    store_settings(directory.path(), INVALID_STORED);
+    let sources = open(db(directory.path()), &settings("")).unwrap();
+    let before = sources.effective();
+    assert!(before.auto_update.enabled);
+    assert_eq!(before.auto_update.schedule, cron(GAP_CRON));
+    // An unrelated patch must not fail on the retained schedule.
+    let changed = sources
+        .apply(patch(json!({"verify_checksum": true})))
+        .unwrap();
+    assert_eq!(changed.auto_update, before.auto_update);
+    assert!(changed.verify_checksum);
+    assert!(sources.status.lock().schedule_unavailable);
+}
+
+#[test]
+fn a_retained_warning_fires_once_for_an_unrelated_patch() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    if run_local_schedule_test(concat!(
+        module_path!(),
+        "::a_retained_warning_fires_once_for_an_unrelated_patch"
+    )) {
+        return;
+    }
+    struct Warnings(Arc<AtomicUsize>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    let warnings = Arc::new(AtomicUsize::new(0));
+    let subscriber = tracing_subscriber::registry().with(Warnings(Arc::clone(&warnings)));
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    let directory = tempfile::tempdir().unwrap();
+    let sources = open(db(directory.path()), &settings("")).unwrap();
+    assert!(!sources.status.lock().schedule_unavailable);
+    // Model a retained plan that became unavailable without a reschedule
+    // (for example a zone change): the flag is still false.
+    sources.stored.lock().auto_update = Some(StoredAutoUpdate::new(
+        AutoUpdate {
+            enabled: true,
+            schedule: cron(GAP_CRON),
+        },
+        false,
+    ));
+    // An unrelated patch must warn once through the shared flag, and the
+    // schedule itself does not change, so reschedule() never runs.
+    let changed = sources
+        .apply(patch(json!({"verify_checksum": true})))
+        .unwrap();
+    assert_eq!(changed.auto_update.schedule, cron(GAP_CRON));
+    assert!(sources.status.lock().schedule_unavailable);
+    assert_eq!(warnings.load(Ordering::Relaxed), 1);
+    sources
+        .apply(patch(json!({"verify_checksum": false})))
+        .unwrap();
+    assert_eq!(warnings.load(Ordering::Relaxed), 1);
 }
 
 #[test]
@@ -218,13 +323,13 @@ fn unavailable_runtime_schedule_preserves_retries_and_reports_one_warning_per_ep
 }
 
 #[tokio::test]
-async fn native_startup_rejects_an_unavailable_schedule_instead_of_dropping_the_owner() {
+async fn native_startup_keeps_an_unavailable_schedule_instead_of_dropping_the_owner() {
     use crate::control::ControlPlane;
     use crate::native_api::NativeState;
 
     if run_local_schedule_test(concat!(
         module_path!(),
-        "::native_startup_rejects_an_unavailable_schedule_instead_of_dropping_the_owner"
+        "::native_startup_keeps_an_unavailable_schedule_instead_of_dropping_the_owner"
     )) {
         return;
     }
@@ -250,18 +355,20 @@ async fn native_startup_rejects_an_unavailable_schedule_instead_of_dropping_the_
     control
         .init_cache_db(Some(db(directory.path())), None)
         .await;
-    let result = NativeState::new(
+    let state = NativeState::new(
         &mut control,
         "127.0.0.1:9527".parse().unwrap(),
         SystemTime::now(),
         std::time::Instant::now(),
     )
-    .await;
-    let error = result.err().expect("startup must refuse the schedule");
+    .await
+    .expect("startup must keep the schedule");
+    drop(state);
     assert!(
-        error
-            .to_string()
-            .contains("geodata cron has no future occurrence")
+        stored_record(directory.path())
+            .as_deref()
+            .unwrap()
+            .contains(GAP_CRON),
+        "the file plan is stored, not dropped"
     );
-    assert_eq!(stored_record(directory.path()), None);
 }
