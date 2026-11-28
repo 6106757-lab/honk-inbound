@@ -1,8 +1,41 @@
 use super::{
-    DnsCond, DnsConfig, DnsRequestAction, DnsResponseAction, DnsTagMatcher, RequestSource,
+    DnsCond, DnsConfig, DnsDomainMatcher, DnsRequestAction, DnsResponseAction, DnsTagMatcher,
+    RequestSource,
 };
 use crate::diagnostic::{SettingPath, SourceRef};
 use crate::error::{DetailedConfigError, ErrorCategory};
+
+/// A qname regex compiles at router construction; check it here so an
+/// invalid one fails validation instead of startup/reload.
+fn check_qname_regexes(
+    conditions: &[DnsCond],
+    source: &SourceRef,
+    index: usize,
+    setting: SettingPath,
+) -> Result<(), DetailedConfigError> {
+    for condition in conditions {
+        let DnsCond::Qname { matchers, .. } = condition else {
+            continue;
+        };
+        for matcher in matchers {
+            let DnsDomainMatcher::Regex(value) = matcher else {
+                continue;
+            };
+            if regex::Regex::new(value).is_err() {
+                let mut error = DetailedConfigError::new(
+                    ErrorCategory::Validation,
+                    "qname-dns-regex",
+                    source.clone(),
+                    setting,
+                    "a qname() regex: value is not a valid regular expression",
+                );
+                error.diagnostic.entry_index = Some(index + 1);
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
 
 impl DnsConfig {
     fn check_upstream_reference(
@@ -44,6 +77,17 @@ impl DnsConfig {
                                 .field("action")
                         })?;
                     }
+                    check_qname_regexes(
+                        &rule.conditions,
+                        source,
+                        index,
+                        SettingPath::new("dns")
+                            .field("routing")
+                            .field("request")
+                            .field("rules")
+                            .index(index + 1)
+                            .field("conditions"),
+                    )?;
                 }
                 if let DnsRequestAction::Upstream(target) = &routing.request.fallback {
                     self.check_upstream_reference(target, source, None, || {
@@ -63,6 +107,23 @@ impl DnsConfig {
                             .index(index + 1)
                             .field("upstream")
                     })?;
+                    if let Some(pattern) = rule.domain.strip_prefix("regex:")
+                        && regex::Regex::new(pattern).is_err()
+                    {
+                        let mut error = DetailedConfigError::new(
+                            ErrorCategory::Validation,
+                            "qname-dns-regex",
+                            source.clone(),
+                            SettingPath::new("dns")
+                                .field("routing")
+                                .field("rules")
+                                .index(index + 1)
+                                .field("domain"),
+                            "a qname() regex: value is not a valid regular expression",
+                        );
+                        error.diagnostic.entry_index = Some(index + 1);
+                        return Err(error);
+                    }
                 }
                 self.check_upstream_reference(&routing.fallback, source, None, || {
                     SettingPath::new("dns").field("routing").field("fallback")
@@ -96,6 +157,17 @@ impl DnsConfig {
                         .field("action")
                 })?;
             }
+            check_qname_regexes(
+                &rule.conditions,
+                source,
+                index,
+                SettingPath::new("dns")
+                    .field("routing")
+                    .field("response")
+                    .field("rules")
+                    .index(index + 1)
+                    .field("conditions"),
+            )?;
         }
         if let DnsResponseAction::Upstream(target) = &routing.response.fallback {
             self.check_upstream_reference(target, source, None, || {
