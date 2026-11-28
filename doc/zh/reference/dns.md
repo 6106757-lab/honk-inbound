@@ -167,7 +167,7 @@ cloudflare_dot: 'tls://1.1.1.1:853?tls_server_name=cloudflare-dns.com'
 | `qname(suffix: example.com)` | Request 与 response | 点边界后缀；裸参数也表示后缀。 |
 | `qname(keyword: ads)` | Request 与 response | 子串匹配。 |
 | `qname(full: api.example.com)` | Request 与 response | 精确域名匹配。 |
-| `qname(regex: ...)` | Request 与 response | Rust 正则表达式匹配。 |
+| `qname(regex: ...)` | Request 与 response | Rust 正则表达式匹配。无效的 `regex:` 在校验时报 `qname-dns-regex`。 |
 | `qname(geosite: cn)` | Request 与 response | 匹配由指定 geosite 代码展开的域名。 |
 | `qtype(a, aaaa, ...)` | Request 与 response | 匹配 QTYPE 名称或数字 `u16`。可识别名称为 `A`、`AAAA`、`CNAME`、`MX`、`TXT`、`NS`、`PTR`、`SOA`、`SRV`、`HTTPS`、`SVCB`、`ANY` 和 `*`。 |
 | `sip(192.168.50.1, 100.64.0.0/10, 2001:db8::/32)` | 仅 request | 将逻辑客户端来源与任一所列 IP 主机地址或 CIDR 匹配。 |

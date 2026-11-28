@@ -361,3 +361,92 @@ fn subtag_regexes_are_compiled_by_validation() {
         .validate()
         .unwrap();
 }
+
+#[test]
+fn qname_regexes_are_compiled_by_validation() {
+    let config = |rule: &str| {
+        honk_config::parser::parse_dae_config(&format!(
+            "dns {{\n upstream {{\n  providerdoh: 'https://203.0.113.1/dns-query' -> direct\n }}\n routing {{\n  request {{\n   {rule}\n   fallback: providerdoh\n  }}\n }}\n}}\n"
+        ))
+        .unwrap()
+    };
+    // An invalid regex fails validation now, not at router construction.
+    let error = config("qname(regex:() -> providerdoh")
+        .validate_detailed()
+        .expect_err("invalid qname regex must fail validation");
+    assert_eq!(error.diagnostic.code, "qname-dns-regex");
+    assert_eq!(
+        error.diagnostic.setting.to_string(),
+        "dns.routing.request.rules[1].conditions"
+    );
+    // The entry index follows the offending rule, not the first rule.
+    let error = config("qname(full:example.com) -> providerdoh\n   qname(regex:() -> providerdoh")
+        .validate_detailed()
+        .expect_err("invalid qname regex in the second rule must fail validation");
+    assert_eq!(error.diagnostic.code, "qname-dns-regex");
+    assert_eq!(
+        error.diagnostic.setting.to_string(),
+        "dns.routing.request.rules[2].conditions"
+    );
+    // Negation does not excuse an invalid regex: the pattern itself must compile.
+    let error = config("!qname(regex:() -> providerdoh")
+        .validate_detailed()
+        .expect_err("invalid negated qname regex must fail validation");
+    assert_eq!(error.diagnostic.code, "qname-dns-regex");
+    assert_eq!(
+        error.diagnostic.setting.to_string(),
+        "dns.routing.request.rules[1].conditions"
+    );
+    // Controls: a valid regex and non-regex matchers validate fine.
+    config("qname(regex:^a{1,2}$) -> providerdoh")
+        .validate()
+        .unwrap();
+    config("qname(full:example.com) -> providerdoh")
+        .validate()
+        .unwrap();
+    config("qname(keyword:foo) -> providerdoh")
+        .validate()
+        .unwrap();
+}
+
+#[test]
+fn legacy_qname_regex_is_compiled_by_validation() {
+    let config = |domain: &str| {
+        honk_config::Config::from_json_str(&format!(
+            r#"{{"dns": {{"upstream": [{{"name": "default", "address": "192.0.2.1:53"}}], "routing": {{"rules": [{{"domain": "{domain}", "upstream": "default"}}], "fallback": "default"}}}}}}"#
+        ))
+        .unwrap()
+    };
+    let error = config("regex:(")
+        .validate_detailed()
+        .expect_err("invalid legacy qname regex must fail validation");
+    assert_eq!(error.diagnostic.code, "qname-dns-regex");
+    assert_eq!(
+        error.diagnostic.setting.to_string(),
+        "dns.routing.rules[1].domain"
+    );
+    // Controls: a valid regex and non-regex domains validate fine.
+    config("regex:^a{1,2}$").validate().unwrap();
+    config("example.com").validate().unwrap();
+}
+
+#[test]
+fn response_qname_regex_is_compiled_by_validation() {
+    let config = |rule: &str| {
+        honk_config::parser::parse_dae_config(&format!(
+            "dns {{\n upstream {{\n  providerdoh: 'https://203.0.113.1/dns-query' -> direct\n }}\n routing {{\n  request {{\n   fallback: providerdoh\n  }}\n  response {{\n   {rule}\n   fallback: accept\n  }}\n }}\n}}\n"
+        ))
+        .unwrap()
+    };
+    let error = config("qname(regex:() -> reject")
+        .validate_detailed()
+        .expect_err("invalid response qname regex must fail validation");
+    assert_eq!(error.diagnostic.code, "qname-dns-regex");
+    assert_eq!(
+        error.diagnostic.setting.to_string(),
+        "dns.routing.response.rules[1].conditions"
+    );
+    config("qname(regex:^a{1,2}$) -> reject")
+        .validate()
+        .unwrap();
+}
