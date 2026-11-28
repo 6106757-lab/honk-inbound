@@ -137,6 +137,12 @@ Nested selection is depth-capped at 8. When the group manager builds the graph, 
 
 Clash-facing group output preserves member tags: the `all` field lists direct node names and nested group tags rather than expanding nested groups. Leaf-facing health and connectivity traversal expands the real nodes below those tags.
 
+## Group detour
+
+`detour:` names the front (a node, a group, or `direct`) traffic through this group dials through; it is resolved on every dial, so switching the front takes effect without a restart. A group that does not set `detour:` inherits one through its `filter: group(X)` reference edges (first match in declaration order); an explicit value, including `direct`, wins and stops the search.
+
+For UDP, the front is screened before dialing: group members are checked in order against the rider's UDP need, each front's UDP capability, and the target port, and a front that cannot carry the dial is skipped for the next member. If no member can carry it, the dial fails immediately with `detour could not carry UDP to …` instead of burning the dial timeout.
+
 ## Related docs
 
 - [Node reference](./nodes.md)

@@ -234,6 +234,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
 pub fn node_carries_udp(node: &Node) -> bool {
     (descriptor(node.protocol()).supports_udp)(node)
 }
+
 /// Target policy only; absent UDP capability is handled separately by callers.
 pub fn udp_target_allowed(node: &Node, port: u16) -> bool {
     node.vless()

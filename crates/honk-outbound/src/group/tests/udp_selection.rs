@@ -5,6 +5,97 @@ use std::time::Duration;
 /// good UDP latency (trojan) and another (anytls, UoT-blackhole) has
 /// none. The UDP pick must choose the trojan node, not mirror TCP.
 #[test]
+fn front_carries_udp_for_screens_capability_liveness_and_port() {
+    use honk_config::node::{
+        OutboundConfig, TrojanConfig, Udp443Policy, VlessConfig, VlessMultiplex,
+    };
+
+    let uuid = "00000000-0000-0000-0000-000000000001";
+    let mut trojan_tcp = Node {
+        name: "trojan-tcp".into(),
+        address: "127.0.0.1:443".into(),
+        host: "127.0.0.1".into(),
+        port: 443,
+        outbound: OutboundConfig::Trojan(TrojanConfig {
+            network: Some("tcp".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    trojan_tcp.id = trojan_tcp.derive_id();
+    let mut vless_tcp = Node {
+        name: "vless-tcp".into(),
+        address: "127.0.0.1:443".into(),
+        host: "127.0.0.1".into(),
+        port: 443,
+        outbound: OutboundConfig::Vless(VlessConfig {
+            uuid: Some(uuid.into()),
+            network: Some("tcp".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    vless_tcp.id = vless_tcp.derive_id();
+    let block = honk_config::Config::builtin_block_node();
+    let socks = Node::from_share_link("socks5://127.0.0.1:1080#socks").unwrap();
+    let socks_udp = Node::from_share_link("socks5://127.0.0.1:1081#socks-udp").unwrap();
+    let socks_dead = Node::from_share_link("socks5://127.0.0.1:1082#socks-dead").unwrap();
+    let mut vless_reject = Node::from_share_link(
+        "vless://00000000-0000-0000-0000-000000000002@127.0.0.1:443#vless-reject",
+    )
+    .unwrap();
+    vless_reject.vless_mut().unwrap().multiplex = VlessMultiplex::xray(8, 0, Udp443Policy::Reject);
+    vless_reject.id = vless_reject.derive_id();
+
+    let nodes = vec![
+        trojan_tcp.clone(),
+        vless_tcp.clone(),
+        block.clone(),
+        socks.clone(),
+        socks_udp.clone(),
+        socks_dead.clone(),
+        vless_reject.clone(),
+    ];
+    let alive = Arc::new(AliveDialerSet::new());
+    let manager = GroupManager::with_alive_set(&[], &nodes, Some(alive.clone()));
+    for node in [&socks, &socks_udp, &socks_dead, &vless_reject] {
+        alive.record_probe_latency(
+            node.id,
+            ProbeDomain::Tcp,
+            IpVersion::V4,
+            Duration::from_millis(50),
+        );
+    }
+    alive.record_probe_latency(
+        socks_udp.id,
+        ProbeDomain::DataUdp,
+        IpVersion::V4,
+        Duration::from_millis(20),
+    );
+    // UDP dead: both UDP domains forced unavailable, so the "either UDP
+    // domain alive" check in is_node_selectable_for_domain fails. Forcing
+    // only DataUdp would leave DnsUdp unknown, which reads as alive.
+    for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
+        alive.report_unavailable_forced(socks_dead.id, domain, IpVersion::V4);
+    }
+
+    // Static capability: a front that cannot carry UDP never passes.
+    assert!(!manager.front_carries_udp_for(&trojan_tcp, 443));
+    assert!(!manager.front_carries_udp_for(&trojan_tcp, 53));
+    assert!(!manager.front_carries_udp_for(&vless_tcp, 443));
+    assert!(!manager.front_carries_udp_for(&block, 443));
+    // Liveness: capable with no UDP state yet inherits TCP liveness.
+    assert!(manager.front_carries_udp_for(&socks, 443));
+    // Liveness: capable with live UDP state passes.
+    assert!(manager.front_carries_udp_for(&socks_udp, 443));
+    // Liveness: capable with dead UDP state fails.
+    assert!(!manager.front_carries_udp_for(&socks_dead, 443));
+    // Port policy: a VLESS front refusing UDP to 443 fails for 443 only.
+    assert!(!manager.front_carries_udp_for(&vless_reject, 443));
+    assert!(manager.front_carries_udp_for(&vless_reject, 53));
+}
+
+#[test]
 fn udp_pick_prefers_node_with_udp_latency_over_mirror() {
     let (t, a) = (nid("trojan"), nid("anytls"));
     let nodes = vec![make_node(t, "trojan"), make_node(a, "anytls")];

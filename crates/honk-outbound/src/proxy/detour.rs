@@ -211,7 +211,7 @@ impl DetourPath {
     /// once and every later flow rides that same carrier. A group's current
     /// member can therefore change while the tunnel is still alive, and the
     /// cache must notice that the tunnel belongs to the old front.
-    /// `connect_udp` selects with `ProbeDomain::DataUdp` while a TCP dial uses
+    /// `resolve_udp_carrier` selects with `ProbeDomain::DataUdp` while a TCP dial uses
     /// `Tcp`, so both have to take part in that comparison.
     pub(crate) fn carrier_signature(&self) -> CarrierSignature {
         match &self.target {
@@ -250,6 +250,55 @@ impl DetourPath {
                     );
                 }
                 Ok(node.id)
+            }
+        }
+    }
+
+    /// The front that carries this UDP dial, screened before dialing.
+    ///
+    /// A group front is picked from the group's ordered DataUdp plan: the
+    /// first member passing the composed UDP screen (front capability,
+    /// liveness, and target port policy). A front that cannot hand the rider
+    /// a working UDP transport is skipped for the next member; when none
+    /// passes, the dial fails here instead of burning the dial timeout on a
+    /// front that was never going to answer.
+    ///
+    /// One dial resolves once: the plan is taken a single time, so one dial
+    /// is one selection even when several members are screened.
+    pub(crate) fn resolve_udp_carrier(&self, target: SocketAddr) -> anyhow::Result<uuid::Uuid> {
+        match &self.target {
+            DetourTarget::Node(node_id) => {
+                // No GroupManager on a node-target path, so liveness is not
+                // screened here; the static capability and port policy are,
+                // and a dial failure still teaches the alive set.
+                let runtime = self.generation.get(node_id).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "detour node {node_id} is not in the captured runtime generation"
+                    )
+                })?;
+                let front = &runtime.node;
+                if !crate::descriptor::node_carries_udp(front)
+                    || !crate::descriptor::udp_target_allowed(front, target.port())
+                {
+                    anyhow::bail!("{}", udp_carry_context(target));
+                }
+                Ok(*node_id)
+            }
+            DetourTarget::Group { name, manager } => {
+                let plan =
+                    manager.selection_plan_for_domain(name, ProbeDomain::DataUdp, IpVersion::V4);
+                if plan.nodes.is_empty() {
+                    anyhow::bail!("detour group {name:?} has no node that can carry this dial");
+                }
+                for front in plan.nodes {
+                    if self.rider_is_masque && front.protocol() == NodeProtocol::Masque {
+                        continue;
+                    }
+                    if manager.front_carries_udp_for(front, target.port()) {
+                        return Ok(front.id);
+                    }
+                }
+                anyhow::bail!("{}", udp_carry_context(target));
             }
         }
     }
@@ -307,18 +356,6 @@ impl DetourPath {
         })
         .await
         .ok_or_else(|| anyhow::anyhow!("no resolved address to dial"))?
-    }
-
-    /// Open a framed UDP transport to `target` through the detour node.
-    pub async fn connect_udp(
-        &self,
-        target: SocketAddr,
-        target_domain: Option<&str>,
-        timeout: Duration,
-    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        let node_id = self.resolve(ProbeDomain::DataUdp)?;
-        self.connect_udp_via(node_id, target, target_domain, timeout)
-            .await
     }
 
     /// Open a framed UDP transport to `target` through the already-resolved
@@ -512,6 +549,233 @@ mod tests {
             .set_selector_choice("fronts", "front-b", crate::group::SelectorNetworks::Both)
             .unwrap();
         assert_eq!(path.carrier_signature().tcp, Some(second));
+    }
+
+    /// A VLESS front that refuses UDP to 443 is screened out for 443 but not
+    /// for 53: the port policy is part of the UDP screen, so a group detour
+    /// must try the next member instead of burning the dial timeout on a
+    /// front that was never going to answer.
+    #[test]
+    fn udp_carrier_skips_a_front_that_refuses_the_target_port() {
+        use honk_config::node::{Group, GroupPolicy, Udp443Policy, VlessMultiplex};
+
+        let mut reject = Node::from_share_link(
+            "vless://00000000-0000-0000-0000-000000000002@127.0.0.1:443#vless-reject",
+        )
+        .unwrap();
+        reject.vless_mut().unwrap().multiplex = VlessMultiplex::xray(8, 0, Udp443Policy::Reject);
+        reject.id = reject.derive_id();
+        let socks = Node::from_share_link("socks5://127.0.0.1:1080#socks").unwrap();
+        let nodes = vec![reject.clone(), socks.clone()];
+        let group = Group {
+            name: "fronts".into(),
+            policy: GroupPolicy::URLTest,
+            nodes: nodes.iter().map(|node| node.id).collect(),
+            ..Default::default()
+        };
+        let manager = Arc::new(GroupManager::new(std::slice::from_ref(&group), &nodes));
+        // A cold URLTest plan lists every eligible leaf in declaration
+        // order, so the screened-out front is provably first.
+        let plan = manager.selection_plan_for_domain("fronts", ProbeDomain::DataUdp, IpVersion::V4);
+        assert_eq!(
+            plan.nodes.iter().map(|node| node.id).collect::<Vec<_>>(),
+            vec![reject.id, socks.id]
+        );
+        let path = DetourPath::to_group(
+            Arc::new(ProxyRegistry::new()),
+            Arc::new(OutboundRuntimeRegistry::build(&[]).unwrap()),
+            "fronts",
+            Arc::clone(&manager),
+            NodeProtocol::Hysteria2,
+        );
+        assert_eq!(
+            path.resolve_udp_carrier("1.2.3.4:443".parse().unwrap())
+                .unwrap(),
+            socks.id,
+            "the 443-rejecting front is skipped for the next member"
+        );
+        assert_eq!(
+            path.resolve_udp_carrier("1.2.3.4:53".parse().unwrap())
+                .unwrap(),
+            reject.id,
+            "the same front carries UDP to a port it allows"
+        );
+    }
+
+    /// When every member is screened out the dial fails at resolution, with
+    /// the same wording a failed dial reports — only sooner. An empty group
+    /// keeps the older wording: nothing was screened, there was nothing.
+    #[test]
+    fn udp_carrier_fails_fast_when_no_member_can_carry_it() {
+        use honk_config::node::{Group, GroupPolicy, Udp443Policy, VlessMultiplex};
+
+        let mut reject = Node::from_share_link(
+            "vless://00000000-0000-0000-0000-000000000002@127.0.0.1:443#vless-reject",
+        )
+        .unwrap();
+        reject.vless_mut().unwrap().multiplex = VlessMultiplex::xray(8, 0, Udp443Policy::Reject);
+        reject.id = reject.derive_id();
+        let group = Group {
+            name: "fronts".into(),
+            policy: GroupPolicy::URLTest,
+            nodes: vec![reject.id],
+            ..Default::default()
+        };
+        let manager = Arc::new(GroupManager::new(
+            std::slice::from_ref(&group),
+            std::slice::from_ref(&reject),
+        ));
+        let path = DetourPath::to_group(
+            Arc::new(ProxyRegistry::new()),
+            Arc::new(OutboundRuntimeRegistry::build(&[]).unwrap()),
+            "fronts",
+            Arc::clone(&manager),
+            NodeProtocol::Hysteria2,
+        );
+        let error = path
+            .resolve_udp_carrier("1.2.3.4:443".parse().unwrap())
+            .expect_err("no member can carry UDP to 443")
+            .to_string();
+        assert!(
+            error.contains("detour could not carry UDP to 1.2.3.4:443"),
+            "{error}"
+        );
+
+        let empty = DetourPath::to_group(
+            Arc::new(ProxyRegistry::new()),
+            Arc::new(OutboundRuntimeRegistry::build(&[]).unwrap()),
+            "empty",
+            Arc::new(GroupManager::new(&[], &[])),
+            NodeProtocol::Hysteria2,
+        );
+        let error = empty
+            .resolve_udp_carrier("1.2.3.4:443".parse().unwrap())
+            .expect_err("an empty group carries nothing")
+            .to_string();
+        assert!(
+            error.contains("has no node that can carry this dial"),
+            "{error}"
+        );
+    }
+
+    /// A MASQUE rider must not nest tunnels: a MASQUE front is skipped for
+    /// the next member, and when it is the only member the dial fails fast.
+    #[test]
+    fn udp_carrier_skips_a_masque_front_for_a_masque_rider() {
+        use honk_config::node::{Group, GroupPolicy, MasqueConfig, OutboundConfig};
+
+        let masque = Node {
+            name: "masque-front".into(),
+            address: "127.0.0.1:443".into(),
+            host: "127.0.0.1".into(),
+            port: 443,
+            outbound: OutboundConfig::Masque(MasqueConfig {
+                network: Some("quic".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let masque = {
+            let mut node = masque;
+            node.id = node.derive_id();
+            node
+        };
+        let socks = Node::from_share_link("socks5://127.0.0.1:1080#socks").unwrap();
+        let nodes = vec![masque.clone(), socks.clone()];
+        let group = Group {
+            name: "fronts".into(),
+            policy: GroupPolicy::URLTest,
+            nodes: nodes.iter().map(|node| node.id).collect(),
+            ..Default::default()
+        };
+        let manager = Arc::new(GroupManager::new(std::slice::from_ref(&group), &nodes));
+        let path = DetourPath::to_group(
+            Arc::new(ProxyRegistry::new()),
+            Arc::new(OutboundRuntimeRegistry::build(&[]).unwrap()),
+            "fronts",
+            Arc::clone(&manager),
+            NodeProtocol::Masque,
+        );
+        assert_eq!(
+            path.resolve_udp_carrier("1.2.3.4:443".parse().unwrap())
+                .unwrap(),
+            socks.id,
+            "a MASQUE front is skipped, not nested"
+        );
+
+        let only_masque = Group {
+            name: "only-masque".into(),
+            policy: GroupPolicy::URLTest,
+            nodes: vec![masque.id],
+            ..Default::default()
+        };
+        let manager = Arc::new(GroupManager::new(
+            std::slice::from_ref(&only_masque),
+            std::slice::from_ref(&masque),
+        ));
+        let path = DetourPath::to_group(
+            Arc::new(ProxyRegistry::new()),
+            Arc::new(OutboundRuntimeRegistry::build(&[]).unwrap()),
+            "only-masque",
+            Arc::clone(&manager),
+            NodeProtocol::Masque,
+        );
+        let error = path
+            .resolve_udp_carrier("1.2.3.4:443".parse().unwrap())
+            .expect_err("a lone MASQUE front cannot carry a MASQUE rider")
+            .to_string();
+        assert!(
+            error.contains("detour could not carry UDP to 1.2.3.4:443"),
+            "{error}"
+        );
+    }
+
+    /// A node front has no next member: a screened-out front fails the dial
+    /// at resolution, a capable one is returned as-is.
+    #[test]
+    fn udp_carrier_screens_a_single_node_front() {
+        use honk_config::node::{Udp443Policy, VlessMultiplex};
+
+        let mut reject = Node::from_share_link(
+            "vless://00000000-0000-0000-0000-000000000002@127.0.0.1:443#vless-reject",
+        )
+        .unwrap();
+        reject.vless_mut().unwrap().multiplex = VlessMultiplex::xray(8, 0, Udp443Policy::Reject);
+        reject.id = reject.derive_id();
+        let generation =
+            Arc::new(OutboundRuntimeRegistry::build(std::slice::from_ref(&reject)).unwrap());
+        let path = DetourPath::new(
+            Arc::new(ProxyRegistry::new()),
+            Arc::clone(&generation),
+            reject.id,
+        );
+        let error = path
+            .resolve_udp_carrier("1.2.3.4:443".parse().unwrap())
+            .expect_err("the lone front refuses UDP to 443")
+            .to_string();
+        assert!(
+            error.contains("detour could not carry UDP to 1.2.3.4:443"),
+            "{error}"
+        );
+        assert_eq!(
+            path.resolve_udp_carrier("1.2.3.4:53".parse().unwrap())
+                .unwrap(),
+            reject.id
+        );
+
+        let socks = Node::from_share_link("socks5://127.0.0.1:1080#socks").unwrap();
+        let generation =
+            Arc::new(OutboundRuntimeRegistry::build(std::slice::from_ref(&socks)).unwrap());
+        let path = DetourPath::new(
+            Arc::new(ProxyRegistry::new()),
+            Arc::clone(&generation),
+            socks.id,
+        );
+        assert_eq!(
+            path.resolve_udp_carrier("1.2.3.4:443".parse().unwrap())
+                .unwrap(),
+            socks.id
+        );
     }
 
     /// Fake DNS wire reply: echo the query, answer with `ips` in the queried family.

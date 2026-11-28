@@ -284,7 +284,7 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
                 // Resolve the front once for the whole race: a group front
                 // selected per attempt would burn one round-robin turn per
                 // address tried, and the attempts could ride different fronts.
-                let carrier = path.resolve(crate::alive::ProbeDomain::DataUdp)?;
+                let carrier = path.resolve_udp_carrier(addrs[0])?;
                 let raced = crate::address_race::race_resolved_addrs(&addrs, |server_addr| {
                     let selection = selection.as_ref();
                     async move {

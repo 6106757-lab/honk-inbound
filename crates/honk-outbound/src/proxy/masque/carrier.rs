@@ -49,7 +49,8 @@ pub async fn open_tunnel(
 /// QUIC + WARP TLS + HTTP/3 CONNECT-IP.
 ///
 /// A detour carries QUIC over the framed UDP transport its front node hands
-/// back (`DetourPath::connect_udp`), not over a TCP stream. That transport is
+/// back (`DetourPath::resolve_udp_carrier` picks the front, `connect_udp_via`
+/// opens the transport), not over a TCP stream. That transport is
 /// adapted into a quinn endpoint in `http3::open_h3`, so a fronted h3 node
 /// takes the same path as every other detoured QUIC protocol.
 async fn open_quic(
