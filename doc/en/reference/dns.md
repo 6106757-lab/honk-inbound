@@ -143,7 +143,7 @@ Put each complete call and action on one physical line. Incomplete nonblank line
 | `qname(suffix: example.com)` | Request and response | Dot-boundary suffix; a bare argument also means suffix. |
 | `qname(keyword: ads)` | Request and response | Substring match. |
 | `qname(full: api.example.com)` | Request and response | Exact domain match. |
-| `qname(regex: ...)` | Request and response | Rust regular expression match. |
+| `qname(regex: ...)` | Request and response | Rust regular expression match. An invalid `regex:` fails validation with `qname-dns-regex`. |
 | `qname(geosite: cn)` | Request and response | Match domains expanded from the named geosite code. |
 | `qtype(a, aaaa, ...)` | Request and response | Match QTYPE names or a numeric `u16`. Recognized names are `A`, `AAAA`, `CNAME`, `MX`, `TXT`, `NS`, `PTR`, `SOA`, `SRV`, `HTTPS`, `SVCB`, `ANY`, and `*`. |
 | `sip(192.168.50.1, 100.64.0.0/10, 2001:db8::/32)` | Request only | Match the logical client source against any listed IP host or CIDR. |
