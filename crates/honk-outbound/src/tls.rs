@@ -580,8 +580,9 @@ pub fn fingerprint_for_node(node: &Node) -> TlsFingerprint {
 
 /// Whether the first REALITY attempt leads with the MLKEM hybrid key share.
 /// An explicit per-node fingerprint decides (Chromium leads hybrid, others
-/// lead X25519-only); without one, the historical hybrid-first default
-/// stands, since new REALITY servers require the hybrid share first.
+/// lead X25519-only); without one, or with one the parser does not
+/// recognise, the historical hybrid-first default stands, since new REALITY
+/// servers require the hybrid share first.
 pub fn reality_hybrid_first(node: &Node) -> bool {
     node.tls()
         .and_then(|tls| tls.fingerprint.as_deref())
