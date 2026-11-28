@@ -548,6 +548,19 @@ impl PacketOutbound for VLessHandler {
             .await
     }
 
+    async fn dial_udp_transport_runtime_ctx(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        let path = Self::udp_path(&runtime.node, target.port())?;
+        self.open_udp(runtime, path, target, target_domain, connect_timeout, ctx)
+            .await
+    }
+
     async fn dial_udp_transport_speculative_runtime(
         &self,
         runtime: Arc<crate::runtime::NodeRuntime>,

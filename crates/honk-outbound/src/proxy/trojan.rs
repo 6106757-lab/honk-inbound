@@ -446,6 +446,25 @@ impl PacketOutbound for TrojanHandler {
         .await
     }
 
+    async fn dial_udp_transport_runtime_ctx(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        Self::dial_udp_stream(
+            &runtime.node,
+            Some(&runtime),
+            target,
+            target_domain,
+            connect_timeout,
+            ctx,
+        )
+        .await
+    }
+
     async fn dial_udp_transport_runtime_detoured(
         &self,
         runtime: Arc<crate::runtime::NodeRuntime>,
