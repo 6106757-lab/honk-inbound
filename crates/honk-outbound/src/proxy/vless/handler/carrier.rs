@@ -22,7 +22,7 @@ impl VLessHandler {
         header: Vec<u8>,
         tcp: Option<TcpStream>,
         connect_timeout: std::time::Duration,
-        detour: Option<&crate::proxy::detour::DetourPath>,
+        detour: Option<&Arc<crate::proxy::detour::DetourPath>>,
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
         ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
@@ -44,7 +44,7 @@ impl VLessHandler {
                     node,
                     tcp,
                     connect_timeout,
-                    detour,
+                    detour.map(|d| d.as_ref()),
                     ctx,
                 )
                 .await?
@@ -68,9 +68,14 @@ impl VLessHandler {
             });
         }
 
-        let stream =
-            crate::proxy::transport::maybe_tls_wrap(node, tcp, connect_timeout, detour, ctx)
-                .await?;
+        let stream = crate::proxy::transport::maybe_tls_wrap(
+            node,
+            tcp,
+            connect_timeout,
+            detour.map(|d| d.as_ref()),
+            ctx,
+        )
+        .await?;
         let stream: Box<dyn AsyncReadWrite> = match permit {
             Some(permit) => Box::new(crate::proxy::RuntimeOwnedIo {
                 inner: stream,
@@ -121,7 +126,7 @@ impl VLessHandler {
         target: SocketAddr,
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
-        detour: &crate::proxy::detour::DetourPath,
+        detour: &Arc<crate::proxy::detour::DetourPath>,
         ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<ProxyStream> {
         let vless = node.vless().unwrap();
@@ -178,14 +183,14 @@ impl VLessHandler {
         uuid: [u8; 16],
         header: Vec<u8>,
         timeout: std::time::Duration,
-        detour: Option<&crate::proxy::detour::DetourPath>,
+        detour: Option<&Arc<crate::proxy::detour::DetourPath>>,
         ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<(
         Box<dyn AsyncReadWrite>,
         crate::proxy::transport::TransportPreparation,
     )> {
         let bound = runtime.detour();
-        let detour = detour.or(bound.as_deref());
+        let detour = detour.or(bound.as_ref());
         if runtime.xhttp.is_none() {
             let permit = runtime.acquire_vless_carrier()?;
             let stream = runtime
@@ -248,7 +253,7 @@ impl VLessHandler {
         target: SocketAddr,
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
-        detour: Option<&crate::proxy::detour::DetourPath>,
+        detour: Option<&Arc<crate::proxy::detour::DetourPath>>,
         ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<(ProxyStream, crate::proxy::transport::TransportPreparation)> {
         let vless = runtime.node.vless().unwrap();

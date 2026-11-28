@@ -4,6 +4,7 @@ use super::response::{ResponseReader, clone_error};
 use super::session::{QueueProgress, QueuedData, Request, RequestOwner};
 use super::stream::Flow;
 use super::{MAX_PIPELINE, XhttpSession};
+use crate::proxy::detour::{DetourDialCtx, DetourPath};
 use crate::runtime::NodeRuntime;
 use crate::session::{ManagedSession, OpenError, SessionPermit};
 use bytes::Bytes;
@@ -265,6 +266,10 @@ pub(super) async fn streaming_upload(mut upload: UploadRequest, flow: Arc<Flow>)
     std::future::pending().await
 }
 
+// The detour and ctx are the eighth and ninth arguments; every one of them
+// is a distinct input to the upload driver, and grouping them would only move
+// the count.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn packet_upload(
     runtime: Arc<NodeRuntime>,
     tcp: Arc<Mutex<Option<TcpStream>>>,
@@ -273,6 +278,8 @@ pub(super) async fn packet_upload(
     flow: Arc<Flow>,
     first_upload: Arc<UploadLane>,
     preparation: Arc<PreparationState>,
+    detour: Option<Arc<DetourPath>>,
+    ctx: DetourDialCtx,
 ) -> io::Result<()> {
     let transport = runtime
         .xhttp
@@ -312,6 +319,8 @@ pub(super) async fn packet_upload(
             tcp: tcp.clone(),
             timeout,
             preparation: &preparation,
+            detour: detour.clone(),
+            ctx,
         };
         let request = drive_with(&mut responses, async {
             context
@@ -382,12 +391,20 @@ pub(super) struct RequestContext<'a> {
     pub(super) tcp: Arc<Mutex<Option<TcpStream>>>,
     pub(super) timeout: Duration,
     pub(super) preparation: &'a Arc<PreparationState>,
+    pub(super) detour: Option<Arc<DetourPath>>,
+    pub(super) ctx: DetourDialCtx,
 }
 
 impl RequestContext<'_> {
     async fn reserve(&self) -> anyhow::Result<(Arc<XhttpSession>, SessionPermit<XhttpSession>)> {
         self.preparation
-            .reserve(self.runtime, self.tcp.clone(), self.timeout)
+            .reserve(
+                self.runtime,
+                self.tcp.clone(),
+                self.timeout,
+                self.detour.clone(),
+                self.ctx,
+            )
             .await
     }
     async fn reserve_request(

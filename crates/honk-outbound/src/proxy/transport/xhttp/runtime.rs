@@ -7,6 +7,7 @@ use super::upload::{
     streaming_upload,
 };
 use super::{MAX_CARRIERS, MAX_REQUESTS, STREAM_WRITE, XhttpPreparation, XhttpSession};
+use crate::proxy::detour::{DetourDialCtx, DetourPath};
 use crate::proxy::{AsyncReadWrite, transport::maybe_tls_wrap};
 use crate::runtime::NodeRuntime;
 use crate::session::{OpenError, SessionPermit, SessionPool, SessionPoolConfig};
@@ -75,6 +76,8 @@ impl Peer {
         runtime: &Arc<NodeRuntime>,
         tcp: Arc<Mutex<Option<TcpStream>>>,
         timeout: Duration,
+        detour: Option<Arc<DetourPath>>,
+        ctx: DetourDialCtx,
     ) -> anyhow::Result<(Arc<XhttpSession>, SessionPermit<XhttpSession>)> {
         let runtime = runtime.clone();
         let node = self.node.clone();
@@ -84,7 +87,7 @@ impl Peer {
             .unwrap_or_else(crate::runtime::capture_dial_admission);
         admission
             .scope(self.pool.open_with(
-                move || XhttpRuntime::dial(runtime, node, tcp, timeout),
+                move || XhttpRuntime::dial(runtime, node, tcp, timeout, detour, ctx),
                 |session, permit| std::future::ready(Ok::<_, OpenError>((session, permit))),
             ))
             .await
@@ -206,6 +209,8 @@ impl XhttpRuntime {
         node: Arc<Node>,
         tcp: Arc<Mutex<Option<TcpStream>>>,
         timeout: Duration,
+        detour: Option<Arc<DetourPath>>,
+        ctx: DetourDialCtx,
     ) -> Pin<Box<impl Future<Output = anyhow::Result<Arc<XhttpSession>>> + Send>> {
         // TLS/ECH setup otherwise copies a large future through each generic pool frame.
         Box::pin(async move {
@@ -216,15 +221,12 @@ impl XhttpRuntime {
             let setup = scope.scope(quality.scope(async move {
                 let permit = runtime.acquire_carrier_permit()?;
                 let tcp = tcp.lock().take();
-                let detour = runtime.detour();
-                let stream = maybe_tls_wrap(
-                    &node,
-                    tcp,
-                    timeout,
-                    detour.as_deref(),
-                    &crate::proxy::detour::DetourDialCtx::root(timeout),
-                )
-                .await?;
+                // The caller's detour wins over the node's own, the same rule
+                // the VLESS carrier merge applies; the shared deadline ctx
+                // replaces the fresh root this dial used to build.
+                let bound = runtime.detour();
+                let detour = detour.as_deref().or(bound.as_deref());
+                let stream = maybe_tls_wrap(&node, tcp, timeout, detour, &ctx).await?;
                 let stream: Box<dyn AsyncReadWrite> = match permit {
                     Some(permit) => Box::new(crate::proxy::RuntimeOwnedIo {
                         inner: stream,
@@ -263,7 +265,14 @@ impl XhttpRuntime {
                 .scope_tasks(
                     peer.pool
                         .offer(move || {
-                            Self::dial(dial_runtime, node, Arc::new(Mutex::new(None)), timeout)
+                            Self::dial(
+                                dial_runtime,
+                                node,
+                                Arc::new(Mutex::new(None)),
+                                timeout,
+                                None,
+                                DetourDialCtx::root(timeout),
+                            )
                         })
                         .boxed(),
                 )
@@ -289,6 +298,8 @@ impl XhttpRuntime {
         runtime: &Arc<NodeRuntime>,
         tcp: Option<TcpStream>,
         timeout: Duration,
+        detour: Option<Arc<DetourPath>>,
+        ctx: DetourDialCtx,
     ) -> anyhow::Result<(Box<dyn AsyncReadWrite>, XhttpPreparation)> {
         let state = PreparationState::new(self.clone(), self.upload.clone());
         let download = self
@@ -303,7 +314,7 @@ impl XhttpRuntime {
             .scope_tasks(
                 async {
                     tokio::select! {
-                        result = self.open_inner(runtime, tcp, timeout, state, download) => result,
+                        result = self.open_inner(runtime, tcp, timeout, state, download, detour, ctx) => result,
                         _ = self.retired() => anyhow::bail!("XHTTP runtime retired"),
                     }
                 }
@@ -313,6 +324,10 @@ impl XhttpRuntime {
         Ok((stream, preparation))
     }
 
+    // The detour and ctx are the seventh and eighth arguments; every one of
+    // them is a distinct input to the dial, and grouping them would only move
+    // the count.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn open_inner(
         self: &Arc<Self>,
         runtime: &Arc<NodeRuntime>,
@@ -320,6 +335,8 @@ impl XhttpRuntime {
         timeout: Duration,
         preparation: Arc<PreparationState>,
         download_preparation: Option<Arc<PreparationState>>,
+        detour: Option<Arc<DetourPath>>,
+        ctx: DetourDialCtx,
     ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
         // GET plus its reserved upload lane are one logical admission unit.
         let admission_guard = self.admission.lock().await;
@@ -344,6 +361,8 @@ impl XhttpRuntime {
             tcp: tcp.clone(),
             timeout,
             preparation: &preparation,
+            detour: detour.clone(),
+            ctx,
         };
         // The GET template and carriers come from one peer. A supplied socket reaches the upload
         // endpoint, so the download peer dials its own.
@@ -357,6 +376,8 @@ impl XhttpRuntime {
             tcp: get_tcp,
             timeout,
             preparation: get_preparation,
+            detour: detour.clone(),
+            ctx,
         };
         let (download, upload) = match template.mode {
             ResolvedMode::StreamOne => {
@@ -384,7 +405,9 @@ impl XhttpRuntime {
                     .await?;
                 let download = Upload::download(download);
                 // Reserve alongside GET so one-request peers cannot strand the upload.
-                let (session, permit) = preparation.reserve(runtime, tcp.clone(), timeout).await?;
+                let (session, permit) = preparation
+                    .reserve(runtime, tcp.clone(), timeout, detour.clone(), ctx)
+                    .await?;
                 (download, Upload::Packet(UploadLane::new(session, permit)))
             }
         };
@@ -415,6 +438,8 @@ impl XhttpRuntime {
                             driver_flow.clone(),
                             lane,
                             preparation,
+                            detour,
+                            ctx,
                         )
                         .await
                     }

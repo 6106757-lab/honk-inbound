@@ -65,7 +65,7 @@ pub(crate) async fn wrap_transport(
     node: &Node,
     tcp: Option<TcpStream>,
     connect_timeout: std::time::Duration,
-    detour: Option<&DetourPath>,
+    detour: Option<&std::sync::Arc<DetourPath>>,
     ctx: &crate::proxy::detour::DetourDialCtx,
 ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
     if node.is_xhttp() {
@@ -77,7 +77,8 @@ pub(crate) async fn wrap_transport(
             _owner: owner,
         }));
     }
-    let stream = maybe_tls_wrap(node, tcp, connect_timeout, detour, ctx).await?;
+    let stream =
+        maybe_tls_wrap(node, tcp, connect_timeout, detour.map(|d| d.as_ref()), ctx).await?;
     wrap_after_tls(node, stream).await
 }
 
@@ -86,7 +87,7 @@ pub(crate) async fn wrap_transport_runtime(
     runtime: &std::sync::Arc<crate::runtime::NodeRuntime>,
     tcp: Option<TcpStream>,
     connect_timeout: std::time::Duration,
-    detour: Option<&DetourPath>,
+    detour: Option<&std::sync::Arc<DetourPath>>,
     ctx: &crate::proxy::detour::DetourDialCtx,
 ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
     let (stream, preparation) =
@@ -101,14 +102,49 @@ pub(crate) async fn prepare_transport_runtime(
     runtime: &std::sync::Arc<crate::runtime::NodeRuntime>,
     tcp: Option<TcpStream>,
     connect_timeout: std::time::Duration,
-    detour: Option<&DetourPath>,
+    detour: Option<&std::sync::Arc<DetourPath>>,
     ctx: &crate::proxy::detour::DetourDialCtx,
 ) -> anyhow::Result<(Box<dyn AsyncReadWrite>, TransportPreparation)> {
     if let Some(xhttp) = &runtime.xhttp {
-        let (stream, preparation) = xhttp.prepare(runtime, tcp, connect_timeout).await?;
+        // A flow riding a detour other than the node's own must not use the
+        // node's shared carriers: a session opened through one front would
+        // serve a flow meant for another path. Give it a private runtime
+        // with fresh pools, the same shape AnyTLS uses for its detoured
+        // dials. A flow riding the node's own bound detour follows the same
+        // fixed front the shared pool already uses, so it keeps pooling.
+        // The private runtime's pools never get bind_dial_admission, so its
+        // demand dials fall back to ambient admission; harmless here, the
+        // same shape as the AnyTLS private pool.
+        let bound = runtime.detour();
+        let own_detour = detour.is_some_and(|d| {
+            bound
+                .as_ref()
+                .is_some_and(|bound| std::sync::Arc::ptr_eq(d, bound))
+        });
+        let transport = match detour {
+            Some(_) if !own_detour => xhttp::XhttpRuntime::new(&runtime.node)
+                .expect("an XHTTP runtime implies an XHTTP node"),
+            _ => std::sync::Arc::clone(xhttp),
+        };
+        let (stream, preparation) = transport
+            .prepare(
+                runtime,
+                tcp,
+                connect_timeout,
+                detour.map(std::sync::Arc::clone),
+                *ctx,
+            )
+            .await?;
         return Ok((stream, TransportPreparation(Some(preparation))));
     }
-    let stream = maybe_tls_wrap(&runtime.node, tcp, connect_timeout, detour, ctx).await?;
+    let stream = maybe_tls_wrap(
+        &runtime.node,
+        tcp,
+        connect_timeout,
+        detour.map(|d| d.as_ref()),
+        ctx,
+    )
+    .await?;
     Ok((
         wrap_after_tls(&runtime.node, stream).await?,
         TransportPreparation::none(),

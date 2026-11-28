@@ -42,6 +42,7 @@ fn cool_node(name: &str) -> Node {
     node
 }
 
+mod detour;
 mod interop;
 mod pools;
 mod protocol;

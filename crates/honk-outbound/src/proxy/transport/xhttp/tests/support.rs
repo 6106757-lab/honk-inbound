@@ -175,7 +175,15 @@ impl XhttpRuntime {
         tcp: Option<TcpStream>,
         timeout: Duration,
     ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
-        let (stream, preparation) = self.prepare(runtime, tcp, timeout).await?;
+        let (stream, preparation) = self
+            .prepare(
+                runtime,
+                tcp,
+                timeout,
+                None,
+                crate::proxy::detour::DetourDialCtx::root(timeout),
+            )
+            .await?;
         preparation.commit()?;
         Ok(stream)
     }

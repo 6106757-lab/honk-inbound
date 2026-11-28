@@ -150,7 +150,13 @@ async fn closed_private_upload_carrier_releases_its_slot_before_winner_commit() 
         let mut requests = Vec::new();
         for post in [false, true] {
             let (session, permit) = state
-                .reserve(&runtime, tcp.clone(), DEADLINE)
+                .reserve(
+                    &runtime,
+                    tcp.clone(),
+                    DEADLINE,
+                    None,
+                    crate::proxy::detour::DetourDialCtx::root(DEADLINE),
+                )
                 .await
                 .unwrap();
             let mut request = Some(
@@ -181,7 +187,13 @@ async fn closed_private_upload_carrier_releases_its_slot_before_winner_commit() 
         sessions[1].close();
         let (replacement, permit) = tokio::time::timeout(
             Duration::from_secs(1),
-            state.reserve(&runtime, tcp, DEADLINE),
+            state.reserve(
+                &runtime,
+                tcp,
+                DEADLINE,
+                None,
+                crate::proxy::detour::DetourDialCtx::root(DEADLINE),
+            ),
         )
         .await
         .expect("closed private carrier retained its provisional slot")
