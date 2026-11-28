@@ -142,6 +142,7 @@ async fn stalled_tls_session_dial_respects_its_own_deadline() {
             Arc::new(PaddingState::default()),
             InboundPayloadBudget::new(INBOUND_PAYLOAD_BUDGET),
             None,
+            &crate::proxy::detour::DetourDialCtx::root(Duration::from_millis(50)),
         ),
     )
     .await;

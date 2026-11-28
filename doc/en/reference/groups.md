@@ -143,6 +143,8 @@ Clash-facing group output preserves member tags: the `all` field lists direct no
 
 For UDP, the front is screened before dialing: group members are checked in order against the rider's UDP need, each front's UDP capability, and the target port, and a front that cannot carry the dial is skipped for the next member. If no member can carry it, the dial fails immediately with `detour could not carry UDP to …` instead of burning the dial timeout. A Shadowsocks member can ride a group detour over TCP; its UDP is still refused before dialing.
 
+Dial failures name the failing hop — `detour hop 0 (socks-a): …` counts legs outward from the rider — and share one deadline across the chain, so each leg waits at most `min(connect_timeout, time left)`; a detour cycle fails fast at 4 hops with `detour depth exceeds 4`, and the failure is charged to the front that actually failed, not the rider.
+
 ## Related docs
 
 - [Node reference](./nodes.md)

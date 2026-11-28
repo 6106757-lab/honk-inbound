@@ -38,7 +38,7 @@ async fn udp_preparation_deadline_drains_pending_candidate() {
         is_eligible: Arc::new(|_| true),
         on_dial_error: {
             let errors = Arc::clone(&errors);
-            Arc::new(move |_| {
+            Arc::new(move |_, _| {
                 errors.fetch_add(1, Ordering::Relaxed);
             })
         },
@@ -87,7 +87,7 @@ async fn udp_preparation_deadline_prevents_future_stagger_start() {
         is_eligible: Arc::new(|_| true),
         on_dial_error: {
             let errors = Arc::clone(&errors);
-            Arc::new(move |_| {
+            Arc::new(move |_, _| {
                 errors.fetch_add(1, Ordering::SeqCst);
             })
         },
@@ -133,7 +133,7 @@ async fn udp_preparation_deadline_drains_three_pending_candidates() {
     let callbacks = UdpStaggerCallbacks {
         allows_target: Arc::new(|_| true),
         is_eligible: Arc::new(|_| true),
-        on_dial_error: Arc::new(|_| panic!("cancellation is health-neutral")),
+        on_dial_error: Arc::new(|_, _| panic!("cancellation is health-neutral")),
         on_attempt: Arc::new(|| {}),
         on_winner: Arc::new(|| {}),
         on_cancellation: {
@@ -195,7 +195,7 @@ async fn udp_policy_preflight_does_not_prepare_or_report_failure() {
         is_eligible: Arc::new(|_| true),
         on_dial_error: {
             let errors = Arc::clone(&errors);
-            Arc::new(move |_| {
+            Arc::new(move |_, _| {
                 errors.fetch_add(1, Ordering::SeqCst);
             })
         },
@@ -241,7 +241,7 @@ async fn completed_udp_policy_rejection_does_not_fail_over_or_report_failure() {
         is_eligible: Arc::new(|_| true),
         on_dial_error: {
             let errors = Arc::clone(&errors);
-            Arc::new(move |_| {
+            Arc::new(move |_, _| {
                 errors.fetch_add(1, Ordering::SeqCst);
             })
         },
@@ -277,7 +277,7 @@ async fn unscheduled_policy_denial_does_not_veto_an_earlier_winner() {
     let callbacks = UdpStaggerCallbacks {
         allows_target: Arc::new(|node| node.name != "later-denied"),
         is_eligible: Arc::new(|_| true),
-        on_dial_error: Arc::new(|_| panic!("no candidate failed")),
+        on_dial_error: Arc::new(|_, _| panic!("no candidate failed")),
         on_attempt: Arc::new(|| {}),
         on_winner: Arc::new(|| {}),
         on_cancellation: Arc::new(|| {}),
@@ -357,7 +357,7 @@ async fn udp_disabled_capability_falls_back_but_explicit_policy_is_terminal() {
             is_eligible: Arc::new(|_| true),
             on_dial_error: {
                 let errors = errors.clone();
-                Arc::new(move |_| {
+                Arc::new(move |_, _| {
                     errors.fetch_add(1, Ordering::SeqCst);
                 })
             },
@@ -421,7 +421,7 @@ async fn unpolled_loser_is_cancelled_without_vetoing_ready_winner() {
             true
         }),
         is_eligible: Arc::new(|_| true),
-        on_dial_error: Arc::new(|_| panic!("cancellation is health-neutral")),
+        on_dial_error: Arc::new(|_, _| panic!("cancellation is health-neutral")),
         on_attempt: Arc::new(|| {}),
         on_winner: Arc::new(|| {}),
         on_cancellation: {

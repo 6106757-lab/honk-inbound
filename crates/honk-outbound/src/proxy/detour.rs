@@ -59,6 +59,67 @@ pub(crate) fn transport_error_context(cause: impl std::fmt::Display) -> String {
     format!("QUIC transport error: {cause}")
 }
 
+/// Per-dial detour context: which leg this dial is, and when the whole chain
+/// runs out of time. Created once at the dial entry, threaded down, never
+/// stored on a shared struct (a runtime is shared across concurrent dials;
+/// a dial's hop is not a property of the node). Public because honk-core
+/// constructs a root ctx at its dial entries.
+#[derive(Clone, Copy, Debug)]
+pub struct DetourDialCtx {
+    /// Zero-based detour leg: 0 is the rider's own leg, 1 the front's, …
+    pub hop: usize,
+    /// Absolute deadline for the whole detour dial; every leg waits at most
+    /// what is left of it.
+    pub deadline: tokio::time::Instant,
+}
+
+/// Deepest a detour may nest: four legs, the same cap upstream puts on its
+/// static chains. A cycle past this fails fast instead of burning the dial
+/// timeout one leg at a time.
+pub(crate) const MAX_DETOUR_HOPS: usize = 4;
+
+impl DetourDialCtx {
+    /// A root context for a dial that enters without one (probes, one-shot
+    /// dials): hop 0, deadline three connect timeouts out — the same horizon
+    /// the per-candidate dial timeout and the REALITY setup deadline already
+    /// use, so a leg entered this way is bounded exactly as its caller is.
+    ///
+    /// Public because the control plane (another crate) roots its dial race
+    /// here; the leg-local helpers stay crate-private.
+    pub fn root(connect_timeout: Duration) -> Self {
+        Self {
+            hop: 0,
+            deadline: tokio::time::Instant::now() + connect_timeout * 3,
+        }
+    }
+
+    /// A root context on a deadline the caller already owns: hop 0, the
+    /// caller's overall dial deadline. The control plane roots its race
+    /// here, so every leg of the race shares the one deadline the race
+    /// itself is bounded by.
+    pub fn root_at(deadline: tokio::time::Instant) -> Self {
+        Self { hop: 0, deadline }
+    }
+
+    /// The context the next leg down dials with: one hop further out, the
+    /// same deadline.
+    pub(crate) fn child(&self) -> Self {
+        Self {
+            hop: self.hop + 1,
+            deadline: self.deadline,
+        }
+    }
+
+    /// What this leg may still wait: the nominal timeout, capped at the time
+    /// left on the dial — upstream's `budget()` formula, verbatim.
+    pub(crate) fn budget(&self, connect_timeout: Duration) -> Duration {
+        connect_timeout.min(
+            self.deadline
+                .saturating_duration_since(tokio::time::Instant::now()),
+        )
+    }
+}
+
 /// Which group member carries a detour, on each network a MASQUE tunnel can be
 /// dialled on. The tunnel cache compares the whole signature.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -204,6 +265,19 @@ impl DetourPath {
         }
     }
 
+    /// A human name for what this path points at, for error reports that
+    /// fail before any front is chosen: the group name, or the node's name.
+    pub(crate) fn target_description(&self) -> String {
+        match &self.target {
+            DetourTarget::Node(node_id) => self
+                .generation
+                .get(node_id)
+                .map(|runtime| runtime.node.name.clone())
+                .unwrap_or_else(|| format!("node:{node_id}")),
+            DetourTarget::Group { name, .. } => name.clone(),
+        }
+    }
+
     /// The member carrying this path on each network, read without advancing
     /// group state (round-robin cursors, URLTest caches, marks).
     ///
@@ -312,22 +386,104 @@ impl DetourPath {
         &self,
         target: SocketAddr,
         timeout: Duration,
+        ctx: &DetourDialCtx,
     ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
-        let node_id = self.resolve(ProbeDomain::Tcp)?;
-        self.connect_via(node_id, target, timeout).await
+        let node_id = self
+            .resolve(ProbeDomain::Tcp)
+            .map_err(|error| self.wrap_setup_error(error, ctx.hop))?;
+        self.connect_via(node_id, target, timeout, ctx).await
+    }
+
+    /// Wrap a front dial failure per the leg rules: an error that already
+    /// names its hop, or a target refusal, passes through untouched; anything
+    /// else is this leg's failure, tagged with its hop and its front.
+    fn wrap_leg_error(
+        &self,
+        error: anyhow::Error,
+        hop: usize,
+        node_id: uuid::Uuid,
+    ) -> anyhow::Error {
+        if crate::proxy::failed_hop(&error).is_some() || crate::proxy::target_failure(&error) {
+            return error;
+        }
+        let node_name = self
+            .generation
+            .get(&node_id)
+            .map(|runtime| runtime.node.name.clone())
+            .unwrap_or_else(|| node_id.to_string());
+        crate::proxy::DetourHopFailure {
+            hop,
+            node: Some(node_id),
+            node_name,
+            error,
+        }
+        .into()
+    }
+
+    /// Wrap a failure that happened before any front was chosen: the leg
+    /// never started, so there is no node to blame, but the hop still says
+    /// where in the chain the setup gave up.
+    pub(crate) fn wrap_setup_error(&self, error: anyhow::Error, hop: usize) -> anyhow::Error {
+        if crate::proxy::failed_hop(&error).is_some() {
+            return error;
+        }
+        crate::proxy::DetourHopFailure {
+            hop,
+            node: None,
+            node_name: self.target_description(),
+            error,
+        }
+        .into()
     }
 
     /// Open a stream to `target` through the already-resolved front node.
+    ///
+    /// This is the one TCP leg point: `connect` and `connect_raced` both
+    /// funnel through here, so the depth cap, the shared-deadline budget and
+    /// the hop tagging each live in exactly one place. The leg dial is
+    /// wrapped in its budget as a hard timeout — the timeout parameter alone
+    /// cannot bound a front that accepts the connection and then goes silent
+    /// (a SOCKS5 handshake, for one, has fixed per-step timeouts of its own).
     pub(crate) async fn connect_via(
         &self,
         node_id: uuid::Uuid,
         target: SocketAddr,
         timeout: Duration,
+        ctx: &DetourDialCtx,
     ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
-        let stream = self
-            .proxies
-            .dial_runtime(Arc::clone(&self.generation), node_id, target, None, timeout)
-            .await?;
+        if ctx.hop >= MAX_DETOUR_HOPS {
+            anyhow::bail!(crate::proxy::DetourHopFailure {
+                hop: ctx.hop,
+                node: None,
+                node_name: self.target_description(),
+                error: anyhow::anyhow!("detour depth exceeds {MAX_DETOUR_HOPS}"),
+            });
+        }
+        let budget = ctx.budget(timeout);
+        let timed_out = || {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("detour leg dial timed out after {budget:?}"),
+            )
+        };
+        if budget.is_zero() {
+            return Err(self.wrap_leg_error(timed_out().into(), ctx.hop, node_id));
+        }
+        let child = ctx.child();
+        let dial = self.proxies.dial_runtime_ctx(
+            Arc::clone(&self.generation),
+            node_id,
+            target,
+            None,
+            budget,
+            &child,
+        );
+        let stream = match tokio::time::timeout(budget, dial).await {
+            Ok(result) => result.map_err(|error| self.wrap_leg_error(error, ctx.hop, node_id))?,
+            Err(_elapsed) => {
+                return Err(self.wrap_leg_error(timed_out().into(), ctx.hop, node_id));
+            }
+        };
         Ok(stream.stream)
     }
 
@@ -344,18 +500,24 @@ impl DetourPath {
         &self,
         endpoints: &[SocketAddr],
         timeout: Duration,
+        ctx: &DetourDialCtx,
     ) -> anyhow::Result<(Box<dyn AsyncReadWrite>, SocketAddr)> {
-        let node_id = self.resolve(ProbeDomain::Tcp)?;
+        let node_id = self
+            .resolve(ProbeDomain::Tcp)
+            .map_err(|error| self.wrap_setup_error(error, ctx.hop))?;
         crate::address_race::race_resolved_addrs(endpoints, |endpoint| {
             let this = self;
+            let ctx = *ctx;
             async move {
-                this.connect_via(node_id, endpoint, timeout)
+                this.connect_via(node_id, endpoint, timeout, &ctx)
                     .await
                     .map(|stream| (stream, endpoint))
             }
         })
         .await
-        .ok_or_else(|| anyhow::anyhow!("no resolved address to dial"))?
+        .ok_or_else(|| {
+            self.wrap_setup_error(anyhow::anyhow!("no resolved address to dial"), ctx.hop)
+        })?
     }
 
     /// Open a framed UDP transport to `target` through the already-resolved
@@ -367,17 +529,43 @@ impl DetourPath {
         target: SocketAddr,
         target_domain: Option<&str>,
         timeout: Duration,
+        ctx: &DetourDialCtx,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        self.proxies
-            .dial_udp_transport_runtime(
-                Arc::clone(&self.generation),
-                node_id,
-                target,
-                target_domain,
-                timeout,
+        let budget = ctx.budget(timeout);
+        let timed_out = || {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("detour leg dial timed out after {budget:?}"),
             )
-            .await
+        };
+        if budget.is_zero() {
+            return Err(self.wrap_leg_error(timed_out().into(), ctx.hop, node_id));
+        }
+        let dial = self.proxies.dial_udp_transport_runtime(
+            Arc::clone(&self.generation),
+            node_id,
+            target,
+            target_domain,
+            budget,
+        );
+        match tokio::time::timeout(budget, dial).await {
+            Ok(result) => result.map_err(|error| self.wrap_leg_error(error, ctx.hop, node_id)),
+            Err(_elapsed) => Err(self.wrap_leg_error(timed_out().into(), ctx.hop, node_id)),
+        }
     }
+}
+
+/// Wrap a named-but-unbound detour refusal as a setup failure of this leg:
+/// the dial never started, so there is no front to blame, but the hop still
+/// says where in the chain the setup gave up.
+pub(crate) fn wrap_unbound_detour(error: anyhow::Error, node: &Node, hop: usize) -> anyhow::Error {
+    crate::proxy::DetourHopFailure {
+        hop,
+        node: None,
+        node_name: node.detour_name().unwrap_or("detour").to_string(),
+        error,
+    }
+    .into()
 }
 
 /// Open the connection to a node's own server: through its detour when the
@@ -392,23 +580,27 @@ pub(crate) async fn connect_server(
     node: &Node,
     detour: Option<&DetourPath>,
     connect_timeout: Duration,
+    ctx: &DetourDialCtx,
 ) -> anyhow::Result<crate::transport_quality::tcp::Carrier> {
-    ensure_bound(node, detour)?;
+    ensure_bound(node, detour).map_err(|error| wrap_unbound_detour(error, node, ctx.hop))?;
     let address = crate::proxy::transport::endpoint_address(node);
     let Some(path) = detour else {
         return Ok(crate::transport_quality::tcp::Carrier::Socket(
             crate::util::connect_outbound(&address, connect_timeout).await?,
         ));
     };
-    let endpoints = resolve_endpoints(&address).await?;
+    let endpoints = resolve_endpoints(&address)
+        .await
+        .map_err(|error| path.wrap_setup_error(error, ctx.hop))?;
     let (stream, _) = path
-        .connect_raced(&endpoints, connect_timeout)
+        .connect_raced(&endpoints, connect_timeout, ctx)
         .await
         .map_err(|error| {
-            anyhow::anyhow!(
+            let context = format!(
                 "node {}: detour could not reach {address}: {error}",
                 node.name
-            )
+            );
+            error.context(context)
         })?;
     Ok(crate::transport_quality::tcp::Carrier::Chained(stream))
 }
@@ -999,7 +1191,13 @@ mod tests {
         back.detour = Some("direct".into());
         back.id = back.derive_id();
 
-        let dialed = connect_server(&back, Some(&path), Duration::from_secs(5)).await;
+        let dialed = connect_server(
+            &back,
+            Some(&path),
+            Duration::from_secs(5),
+            &DetourDialCtx::root(Duration::from_secs(5)),
+        )
+        .await;
         crate::bootstrap::set_global(None);
         let mut carrier = dialed
             .expect("detour dial reaches the live address although the first resolved one refuses");
@@ -1076,7 +1274,13 @@ mod tests {
             back.protocol(),
         );
 
-        let dialed = connect_server(&back, Some(&path), Duration::from_secs(5)).await;
+        let dialed = connect_server(
+            &back,
+            Some(&path),
+            Duration::from_secs(5),
+            &DetourDialCtx::root(Duration::from_secs(5)),
+        )
+        .await;
         crate::bootstrap::set_global(None);
         let mut carrier = dialed.expect(
             "detour dial through a group front reaches the live address although the first resolved one refuses",
@@ -1086,5 +1290,188 @@ mod tests {
         // The race tried two addresses but the group was selected once: the
         // next pick is the second member, not the first one again.
         assert_eq!(manager.select_node("front").unwrap().name, "socks-b");
+    }
+
+    /// A port nothing listens on: bind, take the address, drop the listener.
+    async fn closed_port() -> SocketAddr {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap()
+    }
+
+    /// A TCP listener that accepts connections and then stays silent forever:
+    /// the peer's handshake waits until its own timeout fires.
+    async fn spawn_silent_tcp() -> SocketAddr {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let _stream = stream;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// A dial that dies on its front reports the front, not the rider: the
+    /// error names hop 0 and the front's id, and a direct dial of the same
+    /// node carries no hop tag at all.
+    #[tokio::test]
+    async fn detour_hop_failure_names_the_failing_front() {
+        let mut front = socks5_node("socks-a", closed_port().await);
+        front.id = front.derive_id();
+        let mut rider = socks5_node("rider", spawn_fake_socks5().await);
+        rider.detour = Some("socks-a".into());
+        rider.id = rider.derive_id();
+        let generation =
+            Arc::new(OutboundRuntimeRegistry::build(&[front.clone(), rider.clone()]).unwrap());
+        let path = DetourPath::new(
+            Arc::new(ProxyRegistry::default_resolver().unwrap()),
+            Arc::clone(&generation),
+            front.id,
+        );
+
+        let error = connect_server(
+            &rider,
+            Some(&path),
+            Duration::from_secs(5),
+            &DetourDialCtx::root(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap_err();
+        let hop = crate::proxy::failed_hop(&error).expect("a front failure is hop-tagged");
+        assert_eq!(hop.hop, 0);
+        assert_eq!(hop.node, Some(front.id));
+        let text = error.to_string();
+        assert!(
+            text.contains("detour hop 0") && text.contains("socks-a"),
+            "{text}"
+        );
+
+        // The same dead node dialled direct carries no hop tag: the tag is a
+        // detour-leg fact, not a property of the failure itself.
+        let direct = connect_server(
+            &front,
+            None,
+            Duration::from_secs(5),
+            &DetourDialCtx::root(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap_err();
+        assert!(crate::proxy::failed_hop(&direct).is_none());
+    }
+
+    /// A second hop that goes silent fails on the shared deadline, not on the
+    /// front's own handshake timeout: the whole two-hop dial returns in well
+    /// under the five seconds the silent leg would otherwise burn.
+    #[tokio::test]
+    async fn detour_second_hop_does_not_wait_out_its_full_timeout() {
+        let mut f2 = socks5_node("f2", spawn_silent_tcp().await);
+        f2.id = f2.derive_id();
+        let mut f1 = socks5_node("f1", spawn_fake_socks5().await);
+        f1.detour = Some("f2".into());
+        f1.id = f1.derive_id();
+        let mut rider = socks5_node("rider", spawn_fake_socks5().await);
+        rider.detour = Some("f1".into());
+        rider.id = rider.derive_id();
+        let generation = Arc::new(
+            OutboundRuntimeRegistry::build(&[f1.clone(), f2.clone(), rider.clone()]).unwrap(),
+        );
+        let proxies = Arc::new(ProxyRegistry::default_resolver().unwrap());
+        let path_to_f2 = Arc::new(DetourPath::new(
+            Arc::clone(&proxies),
+            Arc::clone(&generation),
+            f2.id,
+        ));
+        assert!(generation.bind_detour(f1.id, Arc::clone(&path_to_f2)));
+        let path_to_f1 = DetourPath::new(proxies, Arc::clone(&generation), f1.id);
+
+        let started = std::time::Instant::now();
+        let error = connect_server(
+            &rider,
+            Some(&path_to_f1),
+            Duration::from_secs(5),
+            &DetourDialCtx::root_at(tokio::time::Instant::now() + Duration::from_secs(2)),
+        )
+        .await
+        .unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "a silent second hop waited {elapsed:?}"
+        );
+        let hop = crate::proxy::failed_hop(&error).expect("a silent second hop is hop-tagged");
+        assert_eq!(hop.hop, 1);
+        assert_eq!(hop.node, Some(f2.id));
+        let timed_out = error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
+        });
+        assert!(
+            timed_out,
+            "the second hop failed on the shared deadline: {error}"
+        );
+    }
+
+    /// A detour that points back at itself fails fast on the depth cap: two
+    /// nodes naming each other as detours stop at hop 4, long before the dial
+    /// timeout — the cycle never even opens a socket, it just descends.
+    #[tokio::test]
+    async fn detour_depth_cap_rejects_a_cycle_fast() {
+        let mut a = socks5_node("a", spawn_fake_socks5().await);
+        a.detour = Some("b".into());
+        a.id = a.derive_id();
+        let mut b = socks5_node("b", spawn_fake_socks5().await);
+        b.detour = Some("a".into());
+        b.id = b.derive_id();
+        let mut rider = socks5_node("rider", spawn_fake_socks5().await);
+        rider.detour = Some("a".into());
+        rider.id = rider.derive_id();
+        let generation = Arc::new(
+            OutboundRuntimeRegistry::build(&[a.clone(), b.clone(), rider.clone()]).unwrap(),
+        );
+        let proxies = Arc::new(ProxyRegistry::default_resolver().unwrap());
+        let path_to_a = Arc::new(DetourPath::new(
+            Arc::clone(&proxies),
+            Arc::clone(&generation),
+            a.id,
+        ));
+        let path_to_b = Arc::new(DetourPath::new(
+            Arc::clone(&proxies),
+            Arc::clone(&generation),
+            b.id,
+        ));
+        assert!(generation.bind_detour(a.id, Arc::clone(&path_to_b)));
+        assert!(generation.bind_detour(b.id, Arc::clone(&path_to_a)));
+
+        let started = std::time::Instant::now();
+        let error = connect_server(
+            &rider,
+            Some(&path_to_a),
+            Duration::from_secs(12),
+            &DetourDialCtx::root(Duration::from_secs(12)),
+        )
+        .await
+        .unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "a detour cycle burned {elapsed:?}"
+        );
+        let hop = crate::proxy::failed_hop(&error).expect("a cycle failure is hop-tagged");
+        assert_eq!(hop.hop, 4);
+        assert!(
+            error.to_string().contains("detour depth exceeds 4"),
+            "{error}"
+        );
     }
 }

@@ -128,9 +128,15 @@ async fn ws_transport_roundtrip(path: &str, expected: &str, with_headers: bool) 
             .insert("x-test".into(), "ws-header".into());
     }
 
-    let mut stream = wrap_transport(&node, None, std::time::Duration::from_secs(3), None)
-        .await
-        .unwrap();
+    let mut stream = wrap_transport(
+        &node,
+        None,
+        std::time::Duration::from_secs(3),
+        None,
+        &crate::proxy::detour::DetourDialCtx::root(std::time::Duration::from_secs(3)),
+    )
+    .await
+    .unwrap();
     stream.write_all(b"ping").await.unwrap();
     stream.flush().await.unwrap();
 

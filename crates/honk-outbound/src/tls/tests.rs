@@ -202,8 +202,14 @@ async fn xhttp_tls_rejects_missing_h2_but_raw_tls_preserves_no_alpn() {
             let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
                 .await
                 .unwrap();
-            let result =
-                maybe_tls_wrap_concrete(&node, Some(tcp), Duration::from_secs(1), None).await;
+            let result = maybe_tls_wrap_concrete(
+                &node,
+                Some(tcp),
+                Duration::from_secs(1),
+                None,
+                &crate::proxy::detour::DetourDialCtx::root(Duration::from_secs(1)),
+            )
+            .await;
             if xhttp {
                 let Err(error) = result else {
                     panic!("XHTTP accepted TLS without negotiated h2");
@@ -298,9 +304,15 @@ async fn ws_tls_dial_offers_the_host_header_as_sni() {
         let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .unwrap();
-        let stream = maybe_tls_wrap_concrete(&node, Some(tcp), Duration::from_secs(3), None)
-            .await
-            .unwrap();
+        let stream = maybe_tls_wrap_concrete(
+            &node,
+            Some(tcp),
+            Duration::from_secs(3),
+            None,
+            &crate::proxy::detour::DetourDialCtx::root(Duration::from_secs(3)),
+        )
+        .await
+        .unwrap();
         assert_eq!(server.join().unwrap().as_deref(), Some("cdn.example"));
         drop(stream);
     })
@@ -331,9 +343,15 @@ async fn xhttp_tls_dial_offers_the_host_header_as_sni() {
         let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .unwrap();
-        let stream = maybe_tls_wrap_concrete(&node, Some(tcp), Duration::from_secs(3), None)
-            .await
-            .unwrap();
+        let stream = maybe_tls_wrap_concrete(
+            &node,
+            Some(tcp),
+            Duration::from_secs(3),
+            None,
+            &crate::proxy::detour::DetourDialCtx::root(Duration::from_secs(3)),
+        )
+        .await
+        .unwrap();
         assert_eq!(server.join().unwrap().as_deref(), Some("cdn.example"));
         drop(stream);
     })

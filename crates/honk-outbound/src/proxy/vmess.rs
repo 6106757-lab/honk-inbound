@@ -500,6 +500,7 @@ impl VmessHandler {
         target: SocketAddr,
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         Self::require_udp(node)?;
         let uuid = uuid(node)?;
@@ -511,10 +512,13 @@ impl VmessHandler {
                     None,
                     connect_timeout,
                     detour.as_deref(),
+                    ctx,
                 )
                 .await?
             }
-            None => super::transport::wrap_transport(node, None, connect_timeout, None).await?,
+            None => {
+                super::transport::wrap_transport(node, None, connect_timeout, None, ctx).await?
+            }
         };
         Self::open_udp_stream(uuid.as_bytes(), stream, target, target_domain).await
     }
@@ -529,12 +533,18 @@ impl VmessHandler {
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
         detour: &Arc<crate::proxy::detour::DetourPath>,
+        ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         Self::require_udp(node)?;
         let uuid = uuid(node)?;
-        let stream =
-            super::transport::wrap_transport_runtime(runtime, None, connect_timeout, Some(detour))
-                .await?;
+        let stream = super::transport::wrap_transport_runtime(
+            runtime,
+            None,
+            connect_timeout,
+            Some(detour),
+            ctx,
+        )
+        .await?;
         Self::open_udp_stream(uuid.as_bytes(), stream, target, target_domain).await
     }
 
@@ -600,7 +610,14 @@ impl TcpOutbound for VmessHandler {
     ) -> anyhow::Result<ProxyStream> {
         let uuid = uuid(node)?;
 
-        let stream = super::transport::wrap_transport(node, None, connect_timeout, None).await?;
+        let stream = super::transport::wrap_transport(
+            node,
+            None,
+            connect_timeout,
+            None,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await?;
         Self::perform_handshake(uuid.as_bytes(), stream, target, target_domain)
     }
 
@@ -614,8 +631,14 @@ impl TcpOutbound for VmessHandler {
     ) -> anyhow::Result<ProxyStream> {
         let uuid = uuid(node)?;
 
-        let stream =
-            super::transport::wrap_transport(node, Some(tcp), connect_timeout, None).await?;
+        let stream = super::transport::wrap_transport(
+            node,
+            Some(tcp),
+            connect_timeout,
+            None,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await?;
         Self::perform_handshake(uuid.as_bytes(), stream, target, target_domain)
     }
 
@@ -626,6 +649,24 @@ impl TcpOutbound for VmessHandler {
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<ProxyStream> {
+        self.dial_runtime_ctx(
+            runtime,
+            target,
+            target_domain,
+            connect_timeout,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
+    }
+
+    async fn dial_runtime_ctx(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<ProxyStream> {
         let uuid = uuid(&runtime.node)?;
         let detour = runtime.detour();
         let stream = super::transport::wrap_transport_runtime(
@@ -633,6 +674,7 @@ impl TcpOutbound for VmessHandler {
             None,
             connect_timeout,
             detour.as_deref(),
+            ctx,
         )
         .await?;
         Self::perform_handshake(uuid.as_bytes(), stream, target, target_domain)
@@ -646,10 +688,35 @@ impl TcpOutbound for VmessHandler {
         connect_timeout: std::time::Duration,
         detour: &Arc<crate::proxy::detour::DetourPath>,
     ) -> anyhow::Result<ProxyStream> {
+        self.dial_runtime_detoured_ctx(
+            runtime,
+            target,
+            target_domain,
+            connect_timeout,
+            detour,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
+    }
+
+    async fn dial_runtime_detoured_ctx(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+        detour: &Arc<crate::proxy::detour::DetourPath>,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<ProxyStream> {
         let uuid = uuid(&runtime.node)?;
-        let stream =
-            super::transport::wrap_transport_runtime(&runtime, None, connect_timeout, Some(detour))
-                .await?;
+        let stream = super::transport::wrap_transport_runtime(
+            &runtime,
+            None,
+            connect_timeout,
+            Some(detour),
+            ctx,
+        )
+        .await?;
         Self::perform_handshake(uuid.as_bytes(), stream, target, target_domain)
     }
 }
@@ -663,7 +730,15 @@ impl PacketOutbound for VmessHandler {
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        Self::dial_udp_stream(node, None, target, target_domain, connect_timeout).await
+        Self::dial_udp_stream(
+            node,
+            None,
+            target,
+            target_domain,
+            connect_timeout,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
     }
 
     async fn dial_udp_transport_runtime(
@@ -679,6 +754,7 @@ impl PacketOutbound for VmessHandler {
             target,
             target_domain,
             connect_timeout,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
         )
         .await
     }
@@ -691,6 +767,26 @@ impl PacketOutbound for VmessHandler {
         connect_timeout: std::time::Duration,
         detour: &Arc<crate::proxy::detour::DetourPath>,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        self.dial_udp_transport_runtime_detoured_ctx(
+            runtime,
+            target,
+            target_domain,
+            connect_timeout,
+            detour,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
+    }
+
+    async fn dial_udp_transport_runtime_detoured_ctx(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+        detour: &Arc<crate::proxy::detour::DetourPath>,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         Self::dial_udp_stream_detoured(
             &runtime.node,
             &runtime,
@@ -698,6 +794,7 @@ impl PacketOutbound for VmessHandler {
             target_domain,
             connect_timeout,
             detour,
+            ctx,
         )
         .await
     }

@@ -8,6 +8,24 @@ pub struct TargetFailure(#[source] pub anyhow::Error);
 #[error("{0}")]
 pub struct NodeFailure(#[source] pub anyhow::Error);
 
+/// A detour leg that failed: which leg, and which front it was dialling.
+/// Display keeps the inner error readable for humans; the hop and the node
+/// stay machine-readable through [`failed_hop`].
+#[derive(Debug, thiserror::Error)]
+#[error("detour hop {hop} ({node_name}): {error}")]
+pub struct DetourHopFailure {
+    /// Zero-based detour leg: 0 is the rider's own leg, 1 the front's, …
+    pub hop: usize,
+    /// The front this leg was dialling; `None` when the leg never got a node
+    /// (resolve/setup failed before any front was chosen).
+    pub node: Option<uuid::Uuid>,
+    /// Display name of that front; for a setup failure the detour target
+    /// description (group name or node name) instead.
+    pub node_name: String,
+    #[source]
+    pub error: anyhow::Error,
+}
+
 fn next_cause<'a>(
     error: &'a (dyn std::error::Error + 'static),
 ) -> Option<&'a (dyn std::error::Error + 'static)> {
@@ -62,6 +80,11 @@ pub(crate) fn io_target_failure(error: &std::io::Error) -> bool {
 /// Recover explicit carrier provenance without inferring it from error text.
 pub fn node_failure(error: &anyhow::Error) -> bool {
     find_cause::<NodeFailure>(error.as_ref()).is_some()
+}
+
+/// The detour leg that failed, through any error wrappers.
+pub fn failed_hop(error: &anyhow::Error) -> Option<&DetourHopFailure> {
+    find_cause::<DetourHopFailure>(error.as_ref())
 }
 
 pub(crate) fn io_node_failure(error: &std::io::Error) -> bool {

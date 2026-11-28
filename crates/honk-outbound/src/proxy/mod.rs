@@ -28,9 +28,9 @@ mod registry;
 
 pub use direct::DirectMark;
 pub use error::{
-    FrameInterrupted, NodeFailure, PacketErrorClass, PacketRejection, TargetFailure,
-    is_frame_interrupted, is_packet_rejection, node_failure, packet_error_class, packet_rejection,
-    target_failure,
+    DetourHopFailure, FrameInterrupted, NodeFailure, PacketErrorClass, PacketRejection,
+    TargetFailure, failed_hop, is_frame_interrupted, is_packet_rejection, node_failure,
+    packet_error_class, packet_rejection, target_failure,
 };
 pub(crate) use error::{
     io_packet_rejection, io_target_failure, node_failure_episode, quic_carrier_error,

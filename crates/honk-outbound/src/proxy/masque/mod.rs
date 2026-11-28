@@ -145,9 +145,10 @@ impl MasqueRuntime {
         &self,
         runtime: &NodeRuntime,
         connect_timeout: Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<Arc<tunnel::MasqueTunnel>> {
         let detour = runtime.detour();
-        self.tunnel_for(runtime, connect_timeout, detour.as_deref())
+        self.tunnel_for(runtime, connect_timeout, detour.as_deref(), ctx)
             .await
     }
 
@@ -161,6 +162,7 @@ impl MasqueRuntime {
         runtime: &NodeRuntime,
         connect_timeout: Duration,
         detour: Option<&crate::proxy::detour::DetourPath>,
+        ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<Arc<tunnel::MasqueTunnel>> {
         let key = detour.map(|path| path.key());
         let carrier = detour.map(|path| path.carrier_signature());
@@ -201,6 +203,7 @@ impl MasqueRuntime {
                 detour,
                 slot,
                 device::masque_tunnel_backend(),
+                ctx,
             )
             .await?,
         );
@@ -297,8 +300,28 @@ impl TcpOutbound for MasqueHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
+        self.dial_runtime_ctx(
+            runtime,
+            target,
+            target_domain,
+            connect_timeout,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
+    }
+
+    async fn dial_runtime_ctx(
+        &self,
+        runtime: Arc<NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<ProxyStream> {
         let masque = masque_runtime(runtime.as_ref())?;
-        let tunnel = masque.tunnel(runtime.as_ref(), connect_timeout).await?;
+        let tunnel = masque
+            .tunnel(runtime.as_ref(), connect_timeout, ctx)
+            .await?;
         let stream = tunnel
             .dial(target, connect_timeout)
             .await
@@ -338,9 +361,34 @@ impl TcpOutbound for MasqueHandler {
         connect_timeout: Duration,
         detour: &Arc<crate::proxy::detour::DetourPath>,
     ) -> anyhow::Result<ProxyStream> {
+        self.dial_runtime_detoured_ctx(
+            runtime,
+            target,
+            target_domain,
+            connect_timeout,
+            detour,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
+    }
+
+    async fn dial_runtime_detoured_ctx(
+        &self,
+        runtime: Arc<NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        detour: &Arc<crate::proxy::detour::DetourPath>,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<ProxyStream> {
         let masque = masque_runtime(runtime.as_ref())?;
         let tunnel = masque
-            .tunnel_for(runtime.as_ref(), connect_timeout, Some(detour.as_ref()))
+            .tunnel_for(
+                runtime.as_ref(),
+                connect_timeout,
+                Some(detour.as_ref()),
+                ctx,
+            )
             .await?;
         let stream = tunnel
             .dial(target, connect_timeout)
@@ -378,15 +426,20 @@ impl MasqueHandler {
         target: SocketAddr,
         connect_timeout: Duration,
         detour: Option<&crate::proxy::detour::DetourPath>,
+        ctx: &crate::proxy::detour::DetourDialCtx,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         let masque = masque_runtime(runtime.as_ref())?;
         let tunnel = match detour {
             Some(detour) => {
                 masque
-                    .tunnel_for(runtime.as_ref(), connect_timeout, Some(detour))
+                    .tunnel_for(runtime.as_ref(), connect_timeout, Some(detour), ctx)
                     .await?
             }
-            None => masque.tunnel(runtime.as_ref(), connect_timeout).await?,
+            None => {
+                masque
+                    .tunnel(runtime.as_ref(), connect_timeout, ctx)
+                    .await?
+            }
         };
         let transport = tunnel
             .dial_udp(target, connect_timeout)
@@ -427,7 +480,25 @@ impl PacketOutbound for MasqueHandler {
         _target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        self.dial_udp_via_tunnel(runtime, target, connect_timeout, None)
+        self.dial_udp_transport_runtime_ctx(
+            runtime,
+            target,
+            _target_domain,
+            connect_timeout,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
+    }
+
+    async fn dial_udp_transport_runtime_ctx(
+        &self,
+        runtime: Arc<NodeRuntime>,
+        target: SocketAddr,
+        _target_domain: Option<&str>,
+        connect_timeout: Duration,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        self.dial_udp_via_tunnel(runtime, target, connect_timeout, None, ctx)
             .await
     }
 
@@ -439,9 +510,29 @@ impl PacketOutbound for MasqueHandler {
         connect_timeout: Duration,
         detour: &Arc<crate::proxy::detour::DetourPath>,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        self.dial_udp_transport_runtime_detoured_ctx(
+            runtime,
+            target,
+            _target_domain,
+            connect_timeout,
+            detour,
+            &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+        )
+        .await
+    }
+
+    async fn dial_udp_transport_runtime_detoured_ctx(
+        &self,
+        runtime: Arc<NodeRuntime>,
+        target: SocketAddr,
+        _target_domain: Option<&str>,
+        connect_timeout: Duration,
+        detour: &Arc<crate::proxy::detour::DetourPath>,
+        ctx: &crate::proxy::detour::DetourDialCtx,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         // The tunnel *is* the path for MASQUE: every flow on a node shares one
         // carrier, so a detoured flow cannot join the generation's own tunnel.
-        self.dial_udp_via_tunnel(runtime, target, connect_timeout, Some(detour.as_ref()))
+        self.dial_udp_via_tunnel(runtime, target, connect_timeout, Some(detour.as_ref()), ctx)
             .await
     }
 }
@@ -457,7 +548,13 @@ impl WarmableOutbound for MasqueHandler {
         _requirement: WarmRequirement,
     ) -> anyhow::Result<()> {
         let masque = masque_runtime(runtime.as_ref())?;
-        masque.tunnel(runtime.as_ref(), connect_timeout).await?;
+        masque
+            .tunnel(
+                runtime.as_ref(),
+                connect_timeout,
+                &crate::proxy::detour::DetourDialCtx::root(connect_timeout),
+            )
+            .await?;
         Ok(())
     }
 }

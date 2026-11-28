@@ -75,6 +75,10 @@ impl ControlPlaneHandle {
             ..
         } = plan;
         let target_is_domain = target_domain.is_some();
+        // One shared deadline for the whole preparation: every leg of every
+        // candidate dial waits at most what is left of it, so a detour
+        // chain cannot outlive the preparation that started it.
+        let dial_ctx = honk_outbound::proxy::detour::DetourDialCtx::root_at(transport_deadline);
         // Only a literal direct route keeps a mark, and Cold URLTest is always
         // a group route, so speculative preparation never needs one.
         debug_assert!(plan_mode != SelectionPlanMode::ColdUrlTest || mark.is_none());
@@ -170,13 +174,14 @@ impl ControlPlaneHandle {
                     let flow_transport = async {
                         let transport = if let Some(detour) = &detour {
                             registry
-                                .dial_udp_transport_runtime_detoured(
+                                .dial_udp_transport_runtime_detoured_ctx(
                                     Arc::clone(&runtime_generation),
                                     node.id,
                                     original_dst,
                                     target_domain.as_deref(),
                                     connect_timeout,
                                     Arc::clone(detour),
+                                    &dial_ctx,
                                 )
                                 .await
                         } else if let Some(mark) = mark {
@@ -192,12 +197,13 @@ impl ControlPlaneHandle {
                                 .await
                         } else {
                             registry
-                                .dial_udp_transport_runtime(
+                                .dial_udp_transport_runtime_ctx(
                                     Arc::clone(&runtime_generation),
                                     node.id,
                                     original_dst,
                                     target_domain.as_deref(),
                                     connect_timeout,
+                                    &dial_ctx,
                                 )
                                 .await
                         };
@@ -312,15 +318,34 @@ impl ControlPlaneHandle {
             on_dial_error: {
                 let alive_set = self.alive_set.clone();
                 let runtime_generation = Arc::clone(runtime_generation);
-                Arc::new(move |node| {
-                    report_dial_failure_if_current(
-                        &runtime_generation,
-                        &alive_set,
-                        node.id,
-                        ProbeDomain::DataUdp,
-                        scheduler_ipver,
-                    );
-                })
+                // A hop-tagged failure blames the front that actually
+                // failed, not the rider that asked for the dial; a setup
+                // failure names no node at all, so nobody's liveness is
+                // charged for it.
+                Arc::new(
+                    move |node, error| match honk_outbound::proxy::failed_hop(error) {
+                        Some(hop) => {
+                            if let Some(front) = hop.node {
+                                report_dial_failure_if_current(
+                                    &runtime_generation,
+                                    &alive_set,
+                                    front,
+                                    ProbeDomain::DataUdp,
+                                    scheduler_ipver,
+                                );
+                            }
+                        }
+                        None => {
+                            report_dial_failure_if_current(
+                                &runtime_generation,
+                                &alive_set,
+                                node.id,
+                                ProbeDomain::DataUdp,
+                                scheduler_ipver,
+                            );
+                        }
+                    },
+                )
             },
             on_attempt: {
                 let stats = self.stats.clone();

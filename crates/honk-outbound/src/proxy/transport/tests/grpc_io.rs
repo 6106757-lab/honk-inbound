@@ -382,9 +382,15 @@ async fn grpc_transport_roundtrip_through_dialer() {
         });
     };
     let consume = async {
-        let mut stream = wrap_transport(&node, None, Duration::from_secs(3), None)
-            .await
-            .unwrap();
+        let mut stream = wrap_transport(
+            &node,
+            None,
+            Duration::from_secs(3),
+            None,
+            &crate::proxy::detour::DetourDialCtx::root(Duration::from_secs(3)),
+        )
+        .await
+        .unwrap();
         stream.write_all(b"hello").await.unwrap();
         stream.shutdown().await.unwrap();
         let mut response = Vec::new();

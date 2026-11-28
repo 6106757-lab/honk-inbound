@@ -288,11 +288,12 @@ async fn udp_carrier_close_is_node_failure() {
         let client = handler.build_client(&node, None, None).await.unwrap();
         let timeout = Duration::from_secs(5);
         let transport = handler
-            .udp_transport_via_client(
+            .udp_transport_via_client_ctx(
                 Arc::clone(&client),
                 "192.0.2.53:53".parse().unwrap(),
                 None,
                 timeout,
+                &crate::proxy::detour::DetourDialCtx::root(timeout),
             )
             .await
             .unwrap();
@@ -321,7 +322,13 @@ async fn assert_udp_session_id_rotation(datagrams: bool) {
     let timeout = Duration::from_secs(5);
 
     let old = handler
-        .udp_transport_via_client(Arc::clone(&client), target, None, timeout)
+        .udp_transport_via_client_ctx(
+            Arc::clone(&client),
+            target,
+            None,
+            timeout,
+            &crate::proxy::detour::DetourDialCtx::root(timeout),
+        )
         .await
         .unwrap();
     let (old_conn, old_state) = client.connection(timeout).await.unwrap();
@@ -331,7 +338,13 @@ async fn assert_udp_session_id_rotation(datagrams: bool) {
         .next_session
         .store(u16::MAX.into(), Ordering::Relaxed);
     let _last = handler
-        .udp_transport_via_client(Arc::clone(&client), target, None, timeout)
+        .udp_transport_via_client_ctx(
+            Arc::clone(&client),
+            target,
+            None,
+            timeout,
+            &crate::proxy::detour::DetourDialCtx::root(timeout),
+        )
         .await
         .unwrap();
     assert!(old_state.sessions.lock().contains_key(&u16::MAX));
@@ -357,7 +370,9 @@ async fn assert_udp_session_id_rotation(datagrams: bool) {
             }),
         )
     };
-    let fresh = handler.udp_transport_via_client(Arc::clone(&client), target, None, timeout);
+    let ctx = crate::proxy::detour::DetourDialCtx::root(timeout);
+    let fresh =
+        handler.udp_transport_via_client_ctx(Arc::clone(&client), target, None, timeout, &ctx);
     #[cfg(feature = "flow-observation")]
     let fresh = observer.scope(fresh);
     let fresh = fresh.await.unwrap();

@@ -66,17 +66,18 @@ pub(crate) async fn wrap_transport(
     tcp: Option<TcpStream>,
     connect_timeout: std::time::Duration,
     detour: Option<&DetourPath>,
+    ctx: &crate::proxy::detour::DetourDialCtx,
 ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
     if node.is_xhttp() {
         let owner = crate::runtime::NodeRuntime::try_ephemeral_guarded(node)?;
         let runtime = owner.runtime();
-        let stream = wrap_transport_runtime(&runtime, tcp, connect_timeout, detour).await?;
+        let stream = wrap_transport_runtime(&runtime, tcp, connect_timeout, detour, ctx).await?;
         return Ok(Box::new(crate::proxy::RuntimeOwnedIo {
             inner: stream,
             _owner: owner,
         }));
     }
-    let stream = maybe_tls_wrap(node, tcp, connect_timeout, detour).await?;
+    let stream = maybe_tls_wrap(node, tcp, connect_timeout, detour, ctx).await?;
     wrap_after_tls(node, stream).await
 }
 
@@ -86,9 +87,10 @@ pub(crate) async fn wrap_transport_runtime(
     tcp: Option<TcpStream>,
     connect_timeout: std::time::Duration,
     detour: Option<&DetourPath>,
+    ctx: &crate::proxy::detour::DetourDialCtx,
 ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
     let (stream, preparation) =
-        prepare_transport_runtime(runtime, tcp, connect_timeout, detour).await?;
+        prepare_transport_runtime(runtime, tcp, connect_timeout, detour, ctx).await?;
     preparation.commit()?;
     Ok(stream)
 }
@@ -100,12 +102,13 @@ pub(crate) async fn prepare_transport_runtime(
     tcp: Option<TcpStream>,
     connect_timeout: std::time::Duration,
     detour: Option<&DetourPath>,
+    ctx: &crate::proxy::detour::DetourDialCtx,
 ) -> anyhow::Result<(Box<dyn AsyncReadWrite>, TransportPreparation)> {
     if let Some(xhttp) = &runtime.xhttp {
         let (stream, preparation) = xhttp.prepare(runtime, tcp, connect_timeout).await?;
         return Ok((stream, TransportPreparation(Some(preparation))));
     }
-    let stream = maybe_tls_wrap(&runtime.node, tcp, connect_timeout, detour).await?;
+    let stream = maybe_tls_wrap(&runtime.node, tcp, connect_timeout, detour, ctx).await?;
     Ok((
         wrap_after_tls(&runtime.node, stream).await?,
         TransportPreparation::none(),
@@ -142,8 +145,9 @@ pub(crate) async fn maybe_tls_wrap(
     tcp: Option<TcpStream>,
     connect_timeout: std::time::Duration,
     detour: Option<&DetourPath>,
+    ctx: &crate::proxy::detour::DetourDialCtx,
 ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
-    match maybe_tls_wrap_concrete(node, tcp, connect_timeout, detour).await? {
+    match maybe_tls_wrap_concrete(node, tcp, connect_timeout, detour, ctx).await? {
         MaybeTls::Tls(stream) => Ok(Box::new(crate::tls::BatchRead::new(stream))),
         MaybeTls::Plain(stream) => Ok(stream),
     }
@@ -162,6 +166,7 @@ pub(crate) async fn maybe_tls_wrap_concrete(
     tcp: Option<TcpStream>,
     connect_timeout: std::time::Duration,
     detour: Option<&DetourPath>,
+    ctx: &crate::proxy::detour::DetourDialCtx,
 ) -> anyhow::Result<MaybeTls> {
     let tls = node.tls().unwrap();
     if !tls.alpn.is_empty()
@@ -175,7 +180,8 @@ pub(crate) async fn maybe_tls_wrap_concrete(
     // A node that names a detour must ride it. Dialling the direct path
     // because the binding is missing would send its traffic out of the real
     // interface while looking like a normal connection.
-    crate::proxy::detour::ensure_bound(node, detour)?;
+    crate::proxy::detour::ensure_bound(node, detour)
+        .map_err(|error| crate::proxy::detour::wrap_unbound_detour(error, node, ctx.hop))?;
     let address = endpoint_address(node);
     // The dialled peer rides along with the carrier: a detour hands back a
     // chained carrier (a byte stream), not a socket, so `peer_addr()` cannot
@@ -185,13 +191,14 @@ pub(crate) async fn maybe_tls_wrap_concrete(
         if let Some(path) = detour {
             let endpoints = crate::proxy::detour::resolve_endpoints(&address).await?;
             let (stream, endpoint) = path
-                .connect_raced(&endpoints, connect_timeout)
+                .connect_raced(&endpoints, connect_timeout, ctx)
                 .await
                 .map_err(|error| {
-                    anyhow::anyhow!(
+                    let context = format!(
                         "node {}: detour could not reach {address}: {error}",
                         node.name
-                    )
+                    );
+                    error.context(context)
                 })?;
             // The block's error type has to be pinned here: the detour dial
             // returns before the surrounding `?` conversions have anything to
@@ -272,11 +279,12 @@ pub(crate) async fn maybe_tls_wrap_concrete(
                         let tcp = match detour {
                             Some(path) => ObservedTcp::new_carrier(
                                 crate::transport_quality::tcp::Carrier::Chained(
-                                    path.connect(peer, budget).await.map_err(|error| {
-                                        std::io::Error::other(format!(
+                                    path.connect(peer, budget, ctx).await.map_err(|error| {
+                                        let context = format!(
                                             "node {}: detour could not re-dial {peer}: {error}",
                                             node.name
-                                        ))
+                                        );
+                                        error.context(context)
                                     })?,
                                 ),
                             ),

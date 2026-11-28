@@ -133,6 +133,7 @@ impl ControlPlaneHandle {
         };
         let generation = self.runtime_registry.read().clone();
         let scope = generation.dial_scope(|| {});
+        let dial_ctx = honk_outbound::proxy::detour::DetourDialCtx::root(connect_timeout);
         let (stream, _fresh) = ControlPlaneHandle::dial_pooled(
             &self.proxy_registry,
             &self.connection_pool,
@@ -143,6 +144,7 @@ impl ControlPlaneHandle {
             mark,
             &scope,
             None,
+            &dial_ctx,
         )
         .await
         .map_err(InboundDialError::Failed)?;
